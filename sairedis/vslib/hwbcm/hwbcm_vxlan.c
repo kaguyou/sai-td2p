@@ -908,6 +908,15 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
 
     rv = hwbcm_vxlan_egress_create(intf_id, s_acc_dummy_mac, port, trunk_id, vid, &egr_id);
     if (BCM_FAILURE(rv)) {
+        if (rv == BCM_E_RESOURCE) {
+            /* bcm_td2_vxlan_next_hop_set(): EGR_PORT_TO_NHI_MAPPING holds one next hop per
+             * physical port on TD2/TD2+, so a port that already carries a VXLAN egress (as
+             * underlay toward a remote VTEP, or as another access VP) cannot take a second one.
+             * Seen on the AS5812-54T with the PC on one cable as both underlay and access. */
+            hwbcm_log(HWBCM_LOG_ERR, "hwbcm_vxlan: port %d already carries a VXLAN next hop; TD2/TD2+ allow one "
+                      "VXLAN egress per physical port (a port cannot be underlay and access at the same time)",
+                      port);
+        }
         hwbcm_vxlan_acc_intf_put(vid);
         return rv;
     }
