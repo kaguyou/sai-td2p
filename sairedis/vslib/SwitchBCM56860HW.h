@@ -152,6 +152,38 @@ namespace saivs
             /* Resolve SAI_INIT_CONFIG_FILE: switch config -> env -> sai.profile. */
             std::string resolveConfigBcm() const;
 
+            /* MAC learn/age events from the ASIC (hwbcm_l2_cb_t). The SDK
+             * thread queues them, the link thread turns each into a synthetic
+             * EVENT_TYPE_PACKET on the vslib event queue, and the overridden
+             * process_packet_for_fdb_event (API thread, under the mutex)
+             * either feeds the stock learning code or runs onFdbAged. */
+            struct L2Event
+            {
+                uint8_t mac[6];
+                int vid;
+                int port;   /* bcm port, or HWBCM_L2_CB_TRUNK_PORT(tid) */
+                int add;
+            };
+
+            static void l2CallbackC(const uint8_t mac[6], int vid, int port, int add, void *cookie);
+            void onL2Event(_In_ const L2Event &ev);
+
+            virtual void process_packet_for_fdb_event(
+                    _In_ sai_object_id_t portId,
+                    _In_ const std::string& name,
+                    _In_ const uint8_t *buffer,
+                    _In_ size_t size) override;
+
+            /* Hardware ages entries itself; disable the vslib timer ageing. */
+            virtual void processFdbEntriesForAging() override;
+
+            void onFdbAged(_In_ sai_object_id_t port_oid, _In_ const uint8_t mac[6], _In_ int vid);
+
+            /* vid -> VLAN oid from the object hash, SAI_NULL_OBJECT_ID if none. */
+            sai_object_id_t vlanOidOf(_In_ int vid);
+
+            std::vector<L2Event> m_l2Events;               /* guarded by m_linkMutex */
+
             static constexpr int LINK_IFINDEX_BASE = 0x40000000;
 
             // --- L3 (A3) ----------------------------------------------------
@@ -281,6 +313,15 @@ namespace saivs
              * resolved yet (their network VP is still pending). */
             sai_status_t hwVxlanRetryPending();
 
+            /* Hook for A2's L2 learn/age callback. MACs learned on a VNI-mapped
+             * VLAN come from the SDK as VFI events: vid = VPN id (> 4095) and
+             * port = VXLAN VP gport. Call this first; it rewrites vid/port to
+             * the real VLAN and physical port (trunk set, port -1, for a LAG)
+             * and returns true. Returns false when the event must be dropped:
+             * a remote MAC on a network VP (EVPN controlled, never report it)
+             * or an unknown VFI. Plain VLAN events pass through unchanged. */
+            bool hwVxlanTranslateL2Event(_Inout_ int &vid, _Inout_ int &port, _Out_ int &trunk);
+
         protected:
 
             struct VxlanMac
@@ -297,7 +338,8 @@ namespace saivs
                 int tunnelTerm = -1;                       /* bcm tunnel terminator gport */
                 int egr = -1;                              /* VXLAN-only L3 egress toward the VTEP */
                 int srcEgr = -1;                           /* A3 egress/ecmp id the clone was made from */
-                int vp = -1;                               /* network VP gport, -1 while pending */
+                int vp = -1;                               /* network VP gport (bit 31 set: never test its sign) */
+                bool vpReady = false;                      /* true once vp holds a live network VP */
                 int vpVpn = -1;                            /* VPN the VP was created in */
                 int port = -1;                             /* underlay bcm port (-1 = trunk) */
                 std::set<sai_object_id_t> tunnels;         /* P2P tunnel oids (normally one) */

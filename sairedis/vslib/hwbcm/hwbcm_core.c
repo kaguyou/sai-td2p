@@ -22,6 +22,13 @@
 #include <syslog.h>
 #include <pthread.h>
 #include <time.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include <sal/core/boot.h>
 #include <sal/core/libc.h>
@@ -48,6 +55,7 @@
 #include <bcm/port.h>
 #include <bcm/link.h>
 #include <bcm/stat.h>
+#include <bcm/stg.h>
 #include <bcm/stack.h>
 #include <bcm/switch.h>
 #include <bcm/l2.h>
@@ -221,10 +229,56 @@ static int g_ip2me_wanted = 0;
 /* knet netif -> filter(s) bookkeeping */
 #define HWBCM_KNET_MAX 256
 typedef struct {
-    int netif_id;   /* 0 = free slot */
-    int filter_id;  /* 0 = none */
+    int netif_id;        /* 0 = free slot */
+    int port;            /* bound front port, -1 for the CPU netif */
+    int filter_id;       /* ingress-port filter (prio 50, tag kept), 0 = none */
+    int pvid_filter_id;  /* ingress-port + PVID filter (prio 49, tag stripped), 0 = none */
+    int pvid;            /* PVID the strip filter was built for */
 } hwbcm_knet_slot_t;
 static hwbcm_knet_slot_t g_knet[HWBCM_KNET_MAX];
+
+static void knet_filter_destroy_quiet(int *fid)
+{
+    if (*fid != 0) {
+        int rv = bcm_knet_filter_destroy(HWBCM_UNIT, *fid);
+        if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+            HWBCM_LOGW("bcm_knet_filter_destroy(%d): %s", *fid, bcm_errmsg(rv));
+        }
+        *fid = 0;
+    }
+}
+
+/* Filter (a): frames that ingressed on `port` carrying the port's PVID are
+ * delivered with the VLAN tag stripped. The KNET driver strips only when
+ * the matching filter has STRIP_TAG (bcm-knet.c), so without this the Linux
+ * stack sees 802.1Q frames on a routed port and ignores them. Frames with
+ * other VLANs fall through to filter (b) and keep their tag. */
+static int knet_pvid_filter_create(hwbcm_knet_slot_t *slot, const char *name)
+{
+    bcm_knet_filter_t f;
+    int rv;
+
+    bcm_knet_filter_t_init(&f);
+    f.type = BCM_KNET_FILTER_T_RX_PKT;
+    f.priority = 49;
+    f.flags = BCM_KNET_FILTER_F_STRIP_TAG;
+    f.dest_type = BCM_KNET_DEST_T_NETIF;
+    f.dest_id = slot->netif_id;
+    f.match_flags = BCM_KNET_FILTER_M_INGPORT | BCM_KNET_FILTER_M_VLAN;
+    f.m_ingport = slot->port;
+    f.m_vlan = (bcm_vlan_t)slot->pvid;
+    snprintf(f.desc, BCM_KNET_FILTER_DESC_MAX, "%s pvid", name);
+    rv = bcm_knet_filter_create(HWBCM_UNIT, &f);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("bcm_knet_filter_create(port %d vlan %d strip -> netif %d): %s",
+                   slot->port, slot->pvid, slot->netif_id, bcm_errmsg(rv));
+        slot->pvid_filter_id = 0;
+        return rv;
+    }
+    slot->pvid_filter_id = f.id;
+    HWBCM_LOGI("knet: netif %d port %d pvid %d strip filter %d", slot->netif_id, slot->port, slot->pvid, f.id);
+    return 0;
+}
 
 /* l2 cache (L2 user entry) index per trap reason, -1 = none */
 static int g_trap_l2cache_idx[HWBCM_TRAP_STP + 1];
@@ -321,9 +375,16 @@ int hwbcm_link_callback_register(hwbcm_link_cb_t cb, void *cookie)
 /* init / deinit                                                            */
 /* ------------------------------------------------------------------------ */
 
+/* Serializes every use of the diag shell (C++ callers and the debug socket).
+ * sh_process_command mutates shell-global state (current unit, parse vars). */
+static pthread_mutex_t g_shell_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define HWBCM_SHELL_CMD_MAX 4096
+
+/* Caller holds g_shell_lock. */
 static int hwbcm_shell_cmd(const char *cmd)
 {
-    char buf[256];
+    char buf[HWBCM_SHELL_CMD_MAX];
     cmd_result_t cr;
 
     sal_strncpy(buf, cmd, sizeof(buf) - 1);
@@ -334,6 +395,172 @@ static int hwbcm_shell_cmd(const char *cmd)
         return BCM_E_FAIL;
     }
     return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* debug shell socket                                                       */
+/*                                                                          */
+/* One command per connection on a Unix stream socket. The command's        */
+/* stdout/stderr (diag shell cli_out goes through the console sink on fd 1) */
+/* are redirected to the client for the duration of the command.           */
+/* Host usage: echo "ps xe0" | socat - UNIX-CONNECT:/var/run/hwbcm/shell.sock */
+/* ------------------------------------------------------------------------ */
+
+#define HWBCM_SHELL_SOCK_DIR  "/var/run/hwbcm"
+#define HWBCM_SHELL_SOCK_PATH HWBCM_SHELL_SOCK_DIR "/shell.sock"
+
+static int g_shell_sock_fd = -1;
+static volatile int g_shell_sock_stop = 0;
+static pthread_t g_shell_sock_thread;
+static int g_shell_sock_started = 0;
+
+static void shell_sock_serve(int client)
+{
+    char line[HWBCM_SHELL_CMD_MAX];
+    size_t n = 0;
+    int saved_out, saved_err;
+    int rc;
+
+    /* Read one line (or until EOF / buffer full). */
+    while (n < sizeof(line) - 1) {
+        ssize_t r = read(client, line + n, 1);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (line[n] == '\n') {
+            break;
+        }
+        n++;
+    }
+    line[n] = '\0';
+    while (n > 0 && (line[n - 1] == '\r' || line[n - 1] == ' ' || line[n - 1] == '\t')) {
+        line[--n] = '\0';
+    }
+    if (n == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_shell_lock);
+    fflush(stdout);
+    fflush(stderr);
+    saved_out = dup(1);
+    saved_err = dup(2);
+    if (saved_out < 0 || saved_err < 0) {
+        pthread_mutex_unlock(&g_shell_lock);
+        if (saved_out >= 0) close(saved_out);
+        if (saved_err >= 0) close(saved_err);
+        HWBCM_LOGE("shell socket: dup failed: %s", strerror(errno));
+        return;
+    }
+    dup2(client, 1);
+    dup2(client, 2);
+
+    rc = hwbcm_shell_cmd(line);
+    printf("[hwbcm rc=%d]\n", rc);
+
+    fflush(stdout);
+    fflush(stderr);
+    dup2(saved_out, 1);
+    dup2(saved_err, 2);
+    close(saved_out);
+    close(saved_err);
+    pthread_mutex_unlock(&g_shell_lock);
+
+    HWBCM_LOGD("shell socket: \"%s\" -> %d", line, rc);
+}
+
+static void *shell_sock_main(void *arg)
+{
+    (void)arg;
+    while (!g_shell_sock_stop) {
+        int client = accept(g_shell_sock_fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (!g_shell_sock_stop) {
+                HWBCM_LOGW("shell socket: accept: %s", strerror(errno));
+                usleep(200 * 1000);
+            }
+            continue;
+        }
+        shell_sock_serve(client);
+        close(client);
+    }
+    return NULL;
+}
+
+static int shell_sock_start(void)
+{
+    struct sockaddr_un addr;
+    int fd;
+    pthread_attr_t attr;
+
+    if (g_shell_sock_started) {
+        return 0;
+    }
+    if (mkdir(HWBCM_SHELL_SOCK_DIR, 0750) < 0 && errno != EEXIST) {
+        HWBCM_LOGW("shell socket: mkdir %s: %s", HWBCM_SHELL_SOCK_DIR, strerror(errno));
+        return BCM_E_FAIL;
+    }
+    (void)unlink(HWBCM_SHELL_SOCK_PATH);
+
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        HWBCM_LOGW("shell socket: socket: %s", strerror(errno));
+        return BCM_E_FAIL;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, HWBCM_SHELL_SOCK_PATH, sizeof(addr.sun_path) - 1);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        HWBCM_LOGW("shell socket: bind %s: %s", HWBCM_SHELL_SOCK_PATH, strerror(errno));
+        close(fd);
+        return BCM_E_FAIL;
+    }
+    /* 0660 root; chmod after bind rather than touching the process umask. */
+    (void)chmod(HWBCM_SHELL_SOCK_PATH, 0660);
+    if (listen(fd, 4) < 0) {
+        HWBCM_LOGW("shell socket: listen: %s", strerror(errno));
+        close(fd);
+        (void)unlink(HWBCM_SHELL_SOCK_PATH);
+        return BCM_E_FAIL;
+    }
+
+    g_shell_sock_fd = fd;
+    g_shell_sock_stop = 0;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&g_shell_sock_thread, &attr, shell_sock_main, NULL) != 0) {
+        HWBCM_LOGW("shell socket: pthread_create: %s", strerror(errno));
+        pthread_attr_destroy(&attr);
+        close(fd);
+        g_shell_sock_fd = -1;
+        (void)unlink(HWBCM_SHELL_SOCK_PATH);
+        return BCM_E_FAIL;
+    }
+    pthread_attr_destroy(&attr);
+    g_shell_sock_started = 1;
+    HWBCM_LOGI("shell socket ready at %s (one diag command per connection)", HWBCM_SHELL_SOCK_PATH);
+    return 0;
+}
+
+static void shell_sock_stop(void)
+{
+    if (!g_shell_sock_started) {
+        return;
+    }
+    g_shell_sock_stop = 1;
+    if (g_shell_sock_fd >= 0) {
+        shutdown(g_shell_sock_fd, SHUT_RDWR);
+        close(g_shell_sock_fd);
+        g_shell_sock_fd = -1;
+    }
+    (void)unlink(HWBCM_SHELL_SOCK_PATH);
+    g_shell_sock_started = 0;
 }
 
 static void hwbcm_port_map_build(void)
@@ -485,6 +712,29 @@ int hwbcm_init(const char *config_bcm)
         }
     }
 
+    /* STP: 6.5.27 "init bcm" leaves every TD2+ front port in STP state
+     * DISABLE in the default STG, which drops all ingress (TX works, RX=0).
+     * We have no STP object support, so every port is always FORWARD. */
+    {
+        int nfwd = 0;
+        PBMP_PORT_ITER(unit, port) {
+            if (IS_CPU_PORT(unit, port) || IS_LB_PORT(unit, port)) {
+                continue;
+            }
+            rv = bcm_port_stp_set(unit, port, BCM_STG_STP_FORWARD);
+            if (BCM_FAILURE(rv)) {
+                HWBCM_LOGW("bcm_port_stp_set(%d, FORWARD): %s", port, bcm_errmsg(rv));
+            } else {
+                nfwd++;
+            }
+        }
+        HWBCM_LOGI("stp forward on %d ports", nfwd);
+    }
+
+    /* The default VLAN exists after init bcm; the CPU port must be in it
+     * (and in every VLAN, see hwbcm_vlan_cpu_add) for copies to CPU. */
+    (void)hwbcm_vlan_cpu_add(BCM_VLAN_DEFAULT);
+
     /* RX path: with KNET the kernel module owns the DMA channels but the
      * channel setup is still driven by rx start from user space. bcm_init
      * already ran bcm_esw_knet_init, so we do not call bcm_knet_init again
@@ -524,6 +774,9 @@ int hwbcm_init(const char *config_bcm)
     g_inited = 1;
     pthread_mutex_unlock(&g_lock);
     HWBCM_LOGI("hwbcm_init: done (%s)", soc_cm_get_name(unit));
+
+    /* Debug aid, failure is not fatal. */
+    (void)shell_sock_start();
     return 0;
 }
 
@@ -538,18 +791,18 @@ int hwbcm_deinit(void)
         return 0;
     }
 
+    shell_sock_stop();
+
     (void)bcm_linkscan_unregister(unit, hwbcm_linkscan_handler);
     (void)bcm_linkscan_enable_set(unit, 0);
     g_link_cb = NULL;
 
     for (i = 0; i < HWBCM_KNET_MAX; i++) {
         if (g_knet[i].netif_id != 0) {
-            if (g_knet[i].filter_id != 0) {
-                (void)bcm_knet_filter_destroy(unit, g_knet[i].filter_id);
-            }
+            knet_filter_destroy_quiet(&g_knet[i].pvid_filter_id);
+            knet_filter_destroy_quiet(&g_knet[i].filter_id);
             (void)bcm_knet_netif_destroy(unit, g_knet[i].netif_id);
-            g_knet[i].netif_id = 0;
-            g_knet[i].filter_id = 0;
+            memset(&g_knet[i], 0, sizeof(g_knet[i]));
         }
     }
 
@@ -661,6 +914,13 @@ int hwbcm_port_enable_set(int port, int enable)
         return BCM_E_PORT;
     }
     HWBCM_CHECK("bcm_port_enable_set", bcm_port_enable_set(HWBCM_UNIT, port, enable ? 1 : 0));
+    if (enable) {
+        /* No STP support: an admin-up port always forwards in every STG. */
+        int rv = bcm_port_stp_set(HWBCM_UNIT, port, BCM_STG_STP_FORWARD);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGW("port %d: bcm_port_stp_set(FORWARD): %s", port, bcm_errmsg(rv));
+        }
+    }
     HWBCM_LOGD("port %d: admin %s", port, enable ? "up" : "down");
     return 0;
 }
@@ -837,6 +1097,24 @@ int hwbcm_port_pvid_set(int port, int vid)
     HWBCM_CHECK("bcm_port_untagged_vlan_set",
                 bcm_port_untagged_vlan_set(HWBCM_UNIT, port, (bcm_vlan_t)vid));
     HWBCM_LOGD("port %d: pvid %d", port, vid);
+
+    /* Rebuild the tag-stripping KNET filter of any netif bound to this port. */
+    {
+        int i;
+        for (i = 0; i < HWBCM_KNET_MAX; i++) {
+            hwbcm_knet_slot_t *slot = &g_knet[i];
+            if (slot->netif_id == 0 || slot->port != port || slot->pvid == vid) {
+                continue;
+            }
+            knet_filter_destroy_quiet(&slot->pvid_filter_id);
+            slot->pvid = vid;
+            {
+                char name[BCM_KNET_NETIF_NAME_MAX];
+                snprintf(name, sizeof(name), "netif%d", slot->netif_id);
+                (void)knet_pvid_filter_create(slot, name);
+            }
+        }
+    }
     return 0;
 }
 
@@ -1026,6 +1304,8 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     }
 
     bcm_knet_netif_t_init(&netif);
+    /* TX_LOCAL_PORT: frames from the kernel go out this port as sent
+     * (untagged from the stack = untagged on the wire, verified on the box). */
     netif.type = BCM_KNET_NETIF_T_TX_LOCAL_PORT;
     netif.port = port;
     memcpy(netif.mac_addr, mac, 6);
@@ -1037,9 +1317,29 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
         return rv;
     }
 
-    /* Everything punted to the CPU that ingressed on this port lands on the
-     * netdev. The netif strips the VLAN tag when the frame was untagged on
-     * ingress and keeps it otherwise (default KNET behaviour). */
+    memset(slot, 0, sizeof(*slot));
+    slot->netif_id = netif.id;
+    slot->port = port;
+
+    /* Filter (a): PVID frames, tag stripped (prio 49). Built for the port's
+     * current PVID; hwbcm_port_pvid_set rebuilds it on change. */
+    {
+        bcm_vlan_t pvid = BCM_VLAN_DEFAULT;
+        rv = bcm_port_untagged_vlan_get(unit, port, &pvid);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGW("port %d: bcm_port_untagged_vlan_get: %s, assuming %d", port, bcm_errmsg(rv), (int)pvid);
+        }
+        slot->pvid = (int)pvid;
+    }
+    rv = knet_pvid_filter_create(slot, netif.name);
+    if (BCM_FAILURE(rv)) {
+        (void)bcm_knet_netif_destroy(unit, netif.id);
+        memset(slot, 0, sizeof(*slot));
+        return rv;
+    }
+
+    /* Filter (b): everything else that ingressed on this port, tag kept
+     * (tagged VLAN members for the Linux bridge / VLAN subinterfaces). */
     bcm_knet_filter_t_init(&filter);
     filter.type = BCM_KNET_FILTER_T_RX_PKT;
     filter.priority = 50;
@@ -1051,14 +1351,16 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     rv = bcm_knet_filter_create(unit, &filter);
     if (BCM_FAILURE(rv)) {
         HWBCM_LOGE("bcm_knet_filter_create(port %d -> netif %d): %s", port, netif.id, bcm_errmsg(rv));
+        knet_filter_destroy_quiet(&slot->pvid_filter_id);
         (void)bcm_knet_netif_destroy(unit, netif.id);
+        memset(slot, 0, sizeof(*slot));
         return rv;
     }
-
-    slot->netif_id = netif.id;
     slot->filter_id = filter.id;
+
     *netif_id = netif.id;
-    HWBCM_LOGI("knet: netif %d (%s) port %d filter %d", netif.id, netif.name, port, filter.id);
+    HWBCM_LOGI("knet: netif %d (%s) port %d filters %d (pvid %d strip) / %d (any)",
+               netif.id, netif.name, port, slot->pvid_filter_id, slot->pvid, filter.id);
     return 0;
 }
 
@@ -1107,7 +1409,9 @@ int hwbcm_knet_cpu_netif_create(const char *name, const uint8_t mac[6], int *net
         filter.id = 0;
     }
 
+    memset(slot, 0, sizeof(*slot));
     slot->netif_id = netif.id;
+    slot->port = -1;
     slot->filter_id = filter.id;
     *netif_id = netif.id;
     HWBCM_LOGI("knet: cpu netif %d (%s) filter %d", netif.id, netif.name, filter.id);
@@ -1127,11 +1431,9 @@ int hwbcm_knet_netif_destroy(int netif_id)
         return BCM_E_PARAM;
     }
     slot = knet_slot_find(netif_id);
-    if (slot != NULL && slot->filter_id != 0) {
-        rv = bcm_knet_filter_destroy(unit, slot->filter_id);
-        if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
-            HWBCM_LOGW("bcm_knet_filter_destroy(%d): %s", slot->filter_id, bcm_errmsg(rv));
-        }
+    if (slot != NULL) {
+        knet_filter_destroy_quiet(&slot->pvid_filter_id);
+        knet_filter_destroy_quiet(&slot->filter_id);
     }
     rv = bcm_knet_netif_destroy(unit, netif_id);
     if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
@@ -1139,8 +1441,7 @@ int hwbcm_knet_netif_destroy(int netif_id)
         return rv;
     }
     if (slot != NULL) {
-        slot->netif_id = 0;
-        slot->filter_id = 0;
+        memset(slot, 0, sizeof(*slot));
     }
     HWBCM_LOGI("knet: netif %d destroyed", netif_id);
     return 0;
@@ -1277,11 +1578,16 @@ int hwbcm_trap_set(int reason, int action, int priority_queue)
 
 int hwbcm_shell(const char *cmd)
 {
+    int rc;
+
     if (!g_inited) {
         return BCM_E_INIT;
     }
     if (cmd == NULL) {
         return BCM_E_PARAM;
     }
-    return hwbcm_shell_cmd(cmd);
+    pthread_mutex_lock(&g_shell_lock);
+    rc = hwbcm_shell_cmd(cmd);
+    pthread_mutex_unlock(&g_shell_lock);
+    return rc;
 }

@@ -180,6 +180,61 @@ namespace
         return false;
     }
 
+    /* Resolve a virtual router oid to a bcm vrf. The default VR is created by
+     * the base class in initialize_default_objects before any hw dispatch, so
+     * it is mapped here on first use (-> vrf 0). Any other VR seen for the
+     * first time gets a fresh vrf id (allocate) or falls back to 0 with a WARN. */
+    int resolveVrf(
+            _In_ std::map<sai_object_id_t, int> &vrToVrf,
+            _In_ sai_object_id_t defaultVr,
+            _In_ sai_object_id_t vr,
+            _In_ bool allocate,
+            _In_ const char *ctx)
+    {
+        SWSS_LOG_ENTER();
+
+        auto it = vrToVrf.find(vr);
+
+        if (it != vrToVrf.end())
+        {
+            return it->second;
+        }
+
+        if (vr == SAI_NULL_OBJECT_ID)
+        {
+            SWSS_LOG_WARN("%s: null virtual router, using vrf 0", ctx);
+            return 0;
+        }
+
+        if (vr == defaultVr || defaultVr == SAI_NULL_OBJECT_ID)
+        {
+            // default VR (or default not yet published by the base: treat the
+            // first VR we meet as the default one)
+            vrToVrf[vr] = 0;
+            SWSS_LOG_NOTICE("%s: virtual router %s -> vrf 0 (default)", ctx, sai_serialize_object_id(vr).c_str());
+            return 0;
+        }
+
+        if (!allocate)
+        {
+            SWSS_LOG_WARN("%s: virtual router %s unknown, using vrf 0", ctx, sai_serialize_object_id(vr).c_str());
+            return 0;
+        }
+
+        int vrf = 0;
+        int rv = hwbcm_l3_vrf_create(&vrf);
+
+        if (rv < 0)
+        {
+            SWSS_LOG_ERROR("%s: hwbcm_l3_vrf_create failed: %d, using vrf 0", ctx, rv);
+            return 0;
+        }
+
+        vrToVrf[vr] = vrf;
+        SWSS_LOG_NOTICE("%s: virtual router %s -> vrf %d (late)", ctx, sai_serialize_object_id(vr).c_str(), vrf);
+        return vrf;
+    }
+
     /* Egress ids of all members of a next hop group, in member creation
      * order is not preserved (std::map order), duplicates kept out. */
     std::vector<int> groupEgressList(
@@ -240,14 +295,21 @@ sai_status_t SwitchBCM56860HW::hwCreateVirtualRouter(
         return SAI_STATUS_SUCCESS;
     }
 
-    bool isDefault = m_vrToVrf.empty(); // first VR = default VR made by vslib at switch init
+    // The default VR is created by the base before hw dispatch exists, so a
+    // VR reaching this handler is normally a user VRF. Still honour the
+    // stored default oid if it matches, and treat the very first VR as the
+    // default when the base has not published it yet.
+
+    sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
     sai_attribute_t sw;
 
-    if (!isDefault && getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+    if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
     {
-        isDefault = (sw.value.oid == vr_id);
+        defaultVr = sw.value.oid;
     }
+
+    bool isDefault = (vr_id == defaultVr) || (defaultVr == SAI_NULL_OBJECT_ID && m_vrToVrf.empty());
 
     int vrf = 0;
 
@@ -343,17 +405,18 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
 
     if (vrAttr != nullptr)
     {
-        auto vit = m_vrToVrf.find(vrAttr->value.oid);
+        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
-        if (vit == m_vrToVrf.end())
         {
-            SWSS_LOG_WARN("rif %s: virtual router %s unknown, using vrf 0",
-                    srif.c_str(), sai_serialize_object_id(vrAttr->value.oid).c_str());
+            sai_attribute_t sw;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+            {
+                defaultVr = sw.value.oid;
+            }
         }
-        else
-        {
-            vrf = vit->second;
-        }
+
+        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr->value.oid, true, srif.c_str());
     }
 
     // mac: RIF attribute, else switch mac
@@ -770,12 +833,18 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
 
     if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
     {
-        auto vit = m_vrToVrf.find(vrAttr.value.oid);
+        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
-        if (vit != m_vrToVrf.end())
         {
-            vrf = vit->second;
+            sai_attribute_t sw;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+            {
+                defaultVr = sw.value.oid;
+            }
         }
+
+        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str());
     }
 
     // where does the neighbor live: port / trunk, or unknown (-> CPU)
@@ -1020,12 +1089,18 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
 
     if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
     {
-        auto vit = m_vrToVrf.find(vrAttr.value.oid);
+        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
-        if (vit != m_vrToVrf.end())
         {
-            vrf = vit->second;
+            sai_attribute_t sw;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+            {
+                defaultVr = sw.value.oid;
+            }
         }
+
+        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str());
     }
 
     if (!noHostRoute)
@@ -1429,18 +1504,18 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
 
     // vrf
 
-    int vrf = 0;
+    sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
-    auto vit = m_vrToVrf.find(re.vr_id);
+    {
+        sai_attribute_t sw;
 
-    if (vit == m_vrToVrf.end())
-    {
-        SWSS_LOG_WARN("route %s: virtual router %s unknown, using vrf 0", serialized.c_str(), sai_serialize_object_id(re.vr_id).c_str());
+        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+        {
+            defaultVr = sw.value.oid;
+        }
     }
-    else
-    {
-        vrf = vit->second;
-    }
+
+    int vrf = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, true, serialized.c_str());
 
     // action + next hop
 
@@ -1636,14 +1711,18 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
     sai_route_entry_t re;
     sai_deserialize_route_entry(serialized, re);
 
-    int vrf = 0;
+    sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
 
-    auto vit = m_vrToVrf.find(re.vr_id);
-
-    if (vit != m_vrToVrf.end())
     {
-        vrf = vit->second;
+        sai_attribute_t sw;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+        {
+            defaultVr = sw.value.oid;
+        }
     }
+
+    int vrf = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, false, serialized.c_str());
 
     uint8_t prefix[16];
     int len = 0;

@@ -1,0 +1,4 @@
+#!/bin/bash
+# bsh "ps xe0" : run one diag shell command inside the running syncd via the hwbcm socket (from the PC over mgmt)
+S="sshpass -p ${SWITCH_PASS:-YourPaSsWoRd} ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR admin@${SWITCH_HOST:-192.168.0.2}"
+$S docker exec syncd python3 -c "'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(\"/var/run/hwbcm/shell.sock\"); s.sendall((sys.argv[1]+\"\\n\").encode()); s.shutdown(socket.SHUT_WR); sys.stdout.write(s.makefile().read())'" "\"$*\""

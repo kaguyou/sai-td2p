@@ -251,6 +251,11 @@ int hwbcm_l2_addr_add_trunk(const uint8_t mac[6], int vid, int trunk_id, int is_
 /* Flush dynamic entries learned on a trunk. */
 int hwbcm_l2_flush_trunk(int trunk_id);
 
+/* Make the CPU port a tagged member of a VLAN (done automatically by
+ * hwbcm_vlan_create and for VLAN 1 at init; exposed for VLANs created
+ * elsewhere, e.g. by the L3/VXLAN code). */
+int hwbcm_vlan_cpu_add(int vid);
+
 /* In hwbcm_l2_cb_t, an entry that sits on a trunk is reported with a
  * negative port: port = -(1 + trunk_id). */
 #define HWBCM_L2_CB_TRUNK_PORT(tid)   (-(1 + (tid)))
@@ -326,6 +331,12 @@ int hwbcm_vxlan_port_network_enable(int port, int enable);
 
 /* Flush all L2 entries of a VPN (remote MACs) — used before VPN destroy. */
 int hwbcm_vxlan_l2_flush_vpn(int vpn_id);
+
+/* L2 learn/age events for MACs in a VPN carry vid = VPN id and port = VXLAN VP
+ * gport. Describe such a VP: is_network (1 = remote VTEP, 0 = access), the
+ * physical port (-1 if trunk) / trunk id (-1 if port), and the VPN it belongs
+ * to. Returns BCM_E_NOT_FOUND when gport is not one of our VPs. */
+int hwbcm_vxlan_vp_info(int vp_gport, int *is_network, int *port, int *trunk_id, int *vpn_id);
 
 #ifdef __cplusplus
 }

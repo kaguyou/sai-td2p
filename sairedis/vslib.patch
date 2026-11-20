@@ -128,6 +128,19 @@ index 409a6c3..70c2c0a 100644
              std::shared_ptr<LaneMap> m_laneMap;
  
              std::shared_ptr<LaneMap> m_fabricLaneMap;
+diff --git a/vslib/SwitchStateBase.h b/vslib/SwitchStateBase.h
+index b7f4190..4064f2d 100644
+--- a/vslib/SwitchStateBase.h
++++ b/vslib/SwitchStateBase.h
+@@ -389,7 +389,7 @@ namespace saivs
+ 
+         public:
+ 
+-            void process_packet_for_fdb_event(
++            virtual void process_packet_for_fdb_event(
+                     _In_ sai_object_id_t portId,
+                     _In_ const std::string& name,
+                     _In_ const uint8_t *buffer,
 diff --git a/vslib/VirtualSwitchSaiInterface.cpp b/vslib/VirtualSwitchSaiInterface.cpp
 index a9baf70..df0da99 100644
 --- a/vslib/VirtualSwitchSaiInterface.cpp

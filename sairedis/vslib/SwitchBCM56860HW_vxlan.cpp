@@ -239,7 +239,7 @@ void SwitchBCM56860HW::vxlanAddVtepToVpn(
 {
     SWSS_LOG_ENTER();
 
-    if (vtep.vp < 0 || vtep.floodVpns.count(vpn))
+    if (!vtep.vpReady || vtep.floodVpns.count(vpn))
     {
         return;
     }
@@ -263,7 +263,7 @@ void SwitchBCM56860HW::vxlanInstallVtepMacs(
 {
     SWSS_LOG_ENTER();
 
-    if (vtep.vp < 0)
+    if (!vtep.vpReady)
     {
         return;
     }
@@ -299,7 +299,7 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
 {
     SWSS_LOG_ENTER();
 
-    if (vtep.vp >= 0)
+    if (vtep.vpReady)
     {
         return true;
     }
@@ -372,6 +372,7 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
     }
 
     vtep.vp = vp;
+    vtep.vpReady = true;
     vtep.vpVpn = vpn;
     vtep.floodVpns.clear();
     vtep.floodVpns.insert(vpn);
@@ -399,7 +400,7 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
 {
     SWSS_LOG_ENTER();
 
-    if (vtep.vp >= 0)
+    if (vtep.vpReady)
     {
         for (const auto &kv: vtep.macs)
         {
@@ -434,6 +435,7 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
         SWSS_LOG_NOTICE("remote VTEP %s: network vp 0x%x removed", vtep.ip.c_str(), vtep.vp);
 
         vtep.vp = -1;
+        vtep.vpReady = false;
         vtep.vpVpn = -1;
         vtep.floodVpns.clear();
     }
@@ -466,7 +468,7 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
             continue;
         }
 
-        if (vtep.vp < 0)
+        if (!vtep.vpReady)
         {
             vxlanTryBringUpVtep(vtep);
 
@@ -484,17 +486,17 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
             continue; // nothing better known; keep what we have
         }
 
-        if (l3 != vtep.srcEgr)
-        {
-            stale = 1;
-        }
-        else if (hwbcm_vxlan_egress_is_stale(l3, vtep.egr, &stale) < 0)
+        // Compare contents, not ids: A3 may hand out a different egress/ecmp id
+        // for the same next hop (route flap), which must not churn the VP.
+        if (hwbcm_vxlan_egress_is_stale(l3, vtep.egr, &stale) < 0)
         {
             continue;
         }
 
         if (!stale)
         {
+            vtep.srcEgr = l3;
+
             continue;
         }
 
@@ -506,6 +508,59 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
     }
 
     return SAI_STATUS_SUCCESS;
+}
+
+bool SwitchBCM56860HW::hwVxlanTranslateL2Event(
+        _Inout_ int &vid,
+        _Inout_ int &port,
+        _Out_ int &trunk)
+{
+    SWSS_LOG_ENTER();
+
+    trunk = -1;
+
+    int isNetwork = 0;
+    int phys = -1;
+    int tid = -1;
+    int vpn = -1;
+
+    if (hwbcm_vxlan_vp_info(port, &isNetwork, &phys, &tid, &vpn) < 0)
+    {
+        // Not one of our VPs: a plain VLAN event passes, a foreign VFI is dropped.
+        return vid >= 0 && vid <= 4095;
+    }
+
+    if (isNetwork)
+    {
+        return false; // remote MAC (EVPN type-2), never reported as a local learn
+    }
+
+    // VPN id -> VLAN. The event's vid is the VPN; trust the VP's VPN if they differ.
+    int lookup = (vid > 4095) ? vid : vpn;
+
+    for (const auto &kv: m_vniToVpn)
+    {
+        if (kv.second != lookup)
+        {
+            continue;
+        }
+
+        for (const auto &vv: m_vidToVni)
+        {
+            if (vv.second == kv.first)
+            {
+                vid = vv.first;
+                port = phys;
+                trunk = tid;
+
+                return true;
+            }
+        }
+    }
+
+    SWSS_LOG_WARN("l2 event on access vp 0x%x: vpn 0x%x has no VLAN mapping, dropped", port, lookup);
+
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1203,7 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnelMapEntry(
     {
         VxlanRemoteVtep &vtep = kv.second;
 
-        if (vtep.vp < 0)
+        if (!vtep.vpReady)
         {
             if (!vtep.bridgePorts.empty())
             {
@@ -1216,7 +1271,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
     {
         VxlanRemoteVtep &vtep = kv.second;
 
-        if (vtep.vp < 0)
+        if (!vtep.vpReady)
         {
             continue;
         }
@@ -1417,7 +1472,7 @@ sai_status_t SwitchBCM56860HW::hwCreateBridgePort(
     vtep.bridgePorts.insert(bp_id);
     m_bridgePortRemoteIp[bp_id] = key;
 
-    if (vtep.vp >= 0)
+    if (vtep.vpReady)
     {
         m_bridgePortToVp[bp_id] = vtep.vp;
     }
@@ -1531,9 +1586,9 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
 
         vtep.macs[key] = m;
 
-        if (vtep.vp < 0 || vpn < 0)
+        if (!vtep.vpReady || vpn < 0)
         {
-            SWSS_LOG_NOTICE("fdb %s on %s deferred (vp %d, vpn %d)", key.c_str(), vtep.ip.c_str(), vtep.vp, vpn);
+            SWSS_LOG_NOTICE("fdb %s on %s deferred (vp ready %d, vpn %d)", key.c_str(), vtep.ip.c_str(), vtep.vpReady ? 1 : 0, vpn);
 
             return SAI_STATUS_SUCCESS;
         }
@@ -1554,7 +1609,7 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
 
     vtep.macs.erase(key);
 
-    if (vpn >= 0 && vtep.vp >= 0)
+    if (vpn >= 0 && vtep.vpReady)
     {
         int rc = hwbcm_vxlan_l2_addr_delete(fdb.mac_address, vpn);
 

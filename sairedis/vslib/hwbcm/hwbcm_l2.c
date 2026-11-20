@@ -15,6 +15,7 @@
 #include <bcm/types.h>
 #include <bcm/error.h>
 #include <bcm/vlan.h>
+#include <bcm/stg.h>
 #include <bcm/l2.h>
 #include <bcm/stack.h>
 #include <bcm/trunk.h>
@@ -45,9 +46,65 @@ static int port_valid(int port)
     return port >= 0 && port < SOC_MAX_NUM_PORTS;
 }
 
+/* No STP object support: in the STG a VLAN belongs to, every front panel
+ * port (or the one given, port >= 0) is forced to FORWARD. 6.5.27 leaves
+ * TD2+ ports DISABLED otherwise, which silently drops all ingress. */
+static int vlan_stg_forward(int vid, int only_port)
+{
+    int unit = HWBCM_UNIT;
+    bcm_stg_t stg = 0;
+    bcm_port_t port;
+    int rv, n = 0;
+
+    HWBCM_CHECK("bcm_vlan_stg_get", bcm_vlan_stg_get(unit, (bcm_vlan_t)vid, &stg));
+    if (only_port >= 0) {
+        HWBCM_CHECK("bcm_stg_stp_set", bcm_stg_stp_set(unit, stg, only_port, BCM_STG_STP_FORWARD));
+        HWBCM_LOGD("vlan %d: stg %d port %d FORWARD", vid, (int)stg, only_port);
+        return 0;
+    }
+    PBMP_PORT_ITER(unit, port) {
+        if (IS_CPU_PORT(unit, port) || IS_LB_PORT(unit, port)) {
+            continue;
+        }
+        rv = bcm_stg_stp_set(unit, stg, port, BCM_STG_STP_FORWARD);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGW("bcm_stg_stp_set(stg %d, port %d, FORWARD): %s", (int)stg, port, bcm_errmsg(rv));
+        } else {
+            n++;
+        }
+    }
+    HWBCM_LOGI("vlan %d: stg %d, stp forward on %d ports", vid, (int)stg, n);
+    return 0;
+}
+
 /* ------------------------------------------------------------------------ */
 /* VLAN                                                                     */
 /* ------------------------------------------------------------------------ */
+
+/* The CPU port must be a (tagged) member of every VLAN, like Broadcom's
+ * SAI does: copies to CPU (IP2ME, traps) are otherwise dropped at the CPU
+ * port's egress VLAN membership check (TDBGC3 ticks, nothing reaches KNET).
+ * Verified live on the box (2026-11-20). */
+int hwbcm_vlan_cpu_add(int vid)
+{
+    int unit = HWBCM_UNIT;
+    bcm_pbmp_t pbmp, ubmp;
+    int rv;
+
+    if (!vid_valid(vid)) {
+        return BCM_E_PARAM;
+    }
+    BCM_PBMP_CLEAR(pbmp);
+    BCM_PBMP_CLEAR(ubmp);
+    BCM_PBMP_PORT_ADD(pbmp, CMIC_PORT(unit));
+    rv = bcm_vlan_port_add(unit, (bcm_vlan_t)vid, pbmp, ubmp);
+    if (BCM_FAILURE(rv) && rv != BCM_E_EXISTS) {
+        HWBCM_LOGE("bcm_vlan_port_add(vlan %d, cpu port %d): %s", vid, CMIC_PORT(unit), bcm_errmsg(rv));
+        return rv;
+    }
+    HWBCM_LOGD("vlan %d: cpu port %d member (tagged)", vid, CMIC_PORT(unit));
+    return 0;
+}
 
 int hwbcm_vlan_create(int vid)
 {
@@ -66,6 +123,8 @@ int hwbcm_vlan_create(int vid)
         return rv;
     }
     HWBCM_LOGI("vlan %d created", vid);
+    (void)vlan_stg_forward(vid, -1);
+    (void)hwbcm_vlan_cpu_add(vid);
     return 0;
 }
 
@@ -104,6 +163,7 @@ int hwbcm_vlan_port_add(int vid, int port, int tagged)
     }
     HWBCM_CHECK("bcm_vlan_port_add", bcm_vlan_port_add(HWBCM_UNIT, (bcm_vlan_t)vid, pbmp, ubmp));
     HWBCM_LOGI("vlan %d: port %d added %s", vid, port, tagged ? "tagged" : "untagged");
+    (void)vlan_stg_forward(vid, port);
     return 0;
 }
 
@@ -113,6 +173,10 @@ int hwbcm_vlan_port_remove(int vid, int port)
 
     if (!vid_valid(vid) || !port_valid(port)) {
         return BCM_E_PARAM;
+    }
+    if (port == CMIC_PORT(HWBCM_UNIT)) {
+        HWBCM_LOGW("vlan %d: refusing to remove the cpu port %d", vid, port);
+        return 0;
     }
     BCM_PBMP_CLEAR(pbmp);
     BCM_PBMP_PORT_ADD(pbmp, port);

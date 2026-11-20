@@ -11,6 +11,7 @@
 
 #include "SwitchBCM56860HW.h"
 #include "EventPayloadNetLinkMsg.h"
+#include "EventPayloadPacket.h"
 
 #include "swss/logger.h"
 #include "meta/sai_serialize.h"
@@ -225,6 +226,13 @@ sai_status_t SwitchBCM56860HW::hwInitialize()
     if (rv < 0)
     {
         SWSS_LOG_ERROR("hwbcm_link_callback_register failed: %d (no link notifications)", rv);
+    }
+
+    rv = hwbcm_l2_callback_register(&SwitchBCM56860HW::l2CallbackC, this);
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_l2_callback_register failed: %d (no FDB notifications)", rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -812,20 +820,356 @@ void SwitchBCM56860HW::linkThreadMain()
         }
 
         std::vector<std::pair<int,int>> events;
+        std::vector<L2Event> l2events;
 
         {
             std::lock_guard<std::mutex> lock(m_linkMutex);
 
             events.swap(m_linkEvents);
+            l2events.swap(m_l2Events);
         }
 
         for (auto &ev: events)
         {
             onLinkChange(ev.first, ev.second);
         }
+
+        for (auto &ev: l2events)
+        {
+            onL2Event(ev);
+        }
     }
 
     SWSS_LOG_NOTICE("link thread ended");
+}
+
+// ---------------------------------------------------------------------------
+// FDB learn / age notifications
+// ---------------------------------------------------------------------------
+
+#define HWBCM_FDB_IFNAME_LEARN "hwbcm-learn:"
+#define HWBCM_FDB_IFNAME_AGE   "hwbcm-age:"
+
+void SwitchBCM56860HW::l2CallbackC(
+        const uint8_t mac[6],
+        int vid,
+        int port,
+        int add,
+        void *cookie)
+{
+    // SDK thread: queue only
+
+    auto *self = static_cast<SwitchBCM56860HW*>(cookie);
+
+    if (self == NULL || mac == NULL)
+    {
+        return;
+    }
+
+    L2Event ev;
+
+    memcpy(ev.mac, mac, sizeof(ev.mac));
+    ev.vid = vid;
+    ev.port = port;
+    ev.add = add;
+
+    {
+        std::lock_guard<std::mutex> lock(self->m_linkMutex);
+
+        self->m_l2Events.push_back(ev);
+    }
+
+    if (self->m_linkEventFd >= 0)
+    {
+        uint64_t one = 1;
+
+        ssize_t w = write(self->m_linkEventFd, &one, sizeof(one));
+
+        (void)w;
+    }
+}
+
+void SwitchBCM56860HW::onL2Event(
+        _In_ const L2Event &ev)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * Link thread. Build a minimal tagged ethernet frame (dst broadcast, src =
+     * learned mac, 802.1Q tag = vid) and push it as EVENT_TYPE_PACKET. Sai's
+     * event thread takes the API mutex and calls our overridden
+     * process_packet_for_fdb_event. The bcm port (or trunk encoding) rides in
+     * the ifname; the payload port is the switch oid so the dispatcher finds
+     * this switch without us touching the port maps here.
+     */
+
+    uint8_t frame[18];
+
+    memset(frame, 0xff, 6);
+    memcpy(frame + 6, ev.mac, 6);
+    frame[12] = 0x81;
+    frame[13] = 0x00;
+    frame[14] = (uint8_t)((ev.vid >> 8) & 0x0f);
+    frame[15] = (uint8_t)(ev.vid & 0xff);
+    frame[16] = 0x00;
+    frame[17] = 0x00;
+
+    // "<prefix><port>:<vid>" — vid also in the name since a VXLAN VFI id
+    // (> 4095) does not fit the 12-bit tag
+    std::string name = std::string(ev.add ? HWBCM_FDB_IFNAME_LEARN : HWBCM_FDB_IFNAME_AGE)
+        + std::to_string(ev.port) + ":" + std::to_string(ev.vid);
+
+    auto payload = std::make_shared<EventPayloadPacket>(
+            m_switch_id,
+            ev.port,
+            name,
+            Buffer(frame, sizeof(frame)));
+
+    if (m_switchConfig->m_eventQueue)
+    {
+        m_switchConfig->m_eventQueue->enqueue(std::make_shared<Event>(EVENT_TYPE_PACKET, payload));
+    }
+}
+
+void SwitchBCM56860HW::process_packet_for_fdb_event(
+        _In_ sai_object_id_t portId,
+        _In_ const std::string& name,
+        _In_ const uint8_t *buffer,
+        _In_ size_t size)
+{
+    SWSS_LOG_ENTER();
+
+    // API thread, under the Sai mutex
+
+    bool learn = (name.compare(0, strlen(HWBCM_FDB_IFNAME_LEARN), HWBCM_FDB_IFNAME_LEARN) == 0);
+    bool age = (name.compare(0, strlen(HWBCM_FDB_IFNAME_AGE), HWBCM_FDB_IFNAME_AGE) == 0);
+
+    if (!learn && !age)
+    {
+        // not ours (tap device path, unused on hardware)
+        SwitchBCM56850::process_packet_for_fdb_event(portId, name, buffer, size);
+        return;
+    }
+
+    if (buffer == NULL || size < 18 || buffer[12] != 0x81 || buffer[13] != 0x00)
+    {
+        SWSS_LOG_ERROR("malformed internal fdb event frame (%zu bytes)", size);
+        return;
+    }
+
+    int bcm = 0;
+    int vid = 0;
+
+    if (sscanf(name.c_str() + (learn ? strlen(HWBCM_FDB_IFNAME_LEARN) : strlen(HWBCM_FDB_IFNAME_AGE)),
+                "%d:%d", &bcm, &vid) != 2)
+    {
+        SWSS_LOG_ERROR("malformed internal fdb event name %s", name.c_str());
+        return;
+    }
+
+    // VXLAN: events on a VNI-mapped VLAN come as VFI id + VP gport (A4
+    // translates them to the real VLAN and bcm port/trunk, or says drop)
+
+    int trunk = -1;
+
+    if (!hwVxlanTranslateL2Event(vid, bcm, trunk))
+    {
+        SWSS_LOG_DEBUG("fdb %s event dropped by vxlan translation", learn ? "learn" : "age");
+        return;
+    }
+
+    if (bcm < 0 && trunk >= 0)
+    {
+        bcm = HWBCM_L2_CB_TRUNK_PORT(trunk);
+    }
+
+    // frame with the (possibly translated) vid in the tag, for the stock code
+
+    uint8_t frame[18];
+
+    memcpy(frame, buffer, sizeof(frame));
+    frame[14] = (uint8_t)((vid >> 8) & 0x0f);
+    frame[15] = (uint8_t)(vid & 0xff);
+
+    const uint8_t *mac = frame + 6;
+
+    // resolve the physical port oid (for a trunk: any current member, the
+    // stock code maps it back to the LAG via getLagFromPort)
+
+    sai_object_id_t port_oid = SAI_NULL_OBJECT_ID;
+
+    if (HWBCM_L2_CB_IS_TRUNK(bcm))
+    {
+        int tid = HWBCM_L2_CB_TRUNK_ID(bcm);
+
+        for (const auto &kvp: m_lagToTrunk)
+        {
+            if (kvp.second != tid)
+            {
+                continue;
+            }
+
+            auto mit = m_lagMembers.find(kvp.first);
+
+            if (mit != m_lagMembers.end() && !mit->second.empty())
+            {
+                port_oid = mit->second.front();
+            }
+
+            break;
+        }
+    }
+    else
+    {
+        port_oid = portOidOf(bcm);
+    }
+
+    if (port_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_INFO("fdb %s event for %s vid %d on unmapped bcm port %d, ignored",
+                learn ? "learn" : "age", sai_serialize_mac(mac).c_str(), vid, bcm);
+        return;
+    }
+
+    if (age)
+    {
+        onFdbAged(port_oid, mac, vid);
+        return;
+    }
+
+    // learn: skip entries SONiC already knows (static ones programmed by
+    // orchagent come back from the ASIC as ADD events too)
+
+    sai_object_id_t vlan_oid = vlanOidOf(vid);
+
+    if (vlan_oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_INFO("fdb learn %s vid %d: no VLAN object for vid (rif vlan?), ignored",
+                sai_serialize_mac(mac).c_str(), vid);
+        return;
+    }
+
+    sai_fdb_entry_t fdb;
+
+    memset(&fdb, 0, sizeof(fdb));
+    fdb.switch_id = m_switch_id;
+    fdb.bv_id = vlan_oid;
+    memcpy(fdb.mac_address, mac, sizeof(fdb.mac_address));
+
+    auto sid = sai_serialize_fdb_entry(fdb);
+
+    auto &fdbHash = m_objectHash.at(SAI_OBJECT_TYPE_FDB_ENTRY);
+
+    if (fdbHash.find(sid) != fdbHash.end())
+    {
+        SWSS_LOG_DEBUG("fdb %s already known, not re-reported", sid.c_str());
+        return;
+    }
+
+    SWSS_LOG_NOTICE("fdb learn %s vid %d on bcm port %d (%s)",
+            sai_serialize_mac(mac).c_str(), vid, bcm, sai_serialize_object_id(port_oid).c_str());
+
+    // stock vslib learning: bridge port lookup, learning mode check,
+    // m_fdb_info_set, local DB create (DYNAMIC, no HW write) and the
+    // SAI_FDB_EVENT_LEARNED notification
+
+    SwitchBCM56850::process_packet_for_fdb_event(port_oid, name, frame, sizeof(frame));
+}
+
+void SwitchBCM56860HW::onFdbAged(
+        _In_ sai_object_id_t port_oid,
+        _In_ const uint8_t mac[6],
+        _In_ int vid)
+{
+    SWSS_LOG_ENTER();
+
+    FdbInfo key;
+
+    key.setVlanId((sai_vlan_id_t)vid);
+    memcpy(key.m_fdbEntry.mac_address, mac, sizeof(sai_mac_t));
+
+    auto it = m_fdb_info_set.find(key);
+
+    if (it == m_fdb_info_set.end())
+    {
+        // static entry removed by orchagent, or never reported: nothing to do
+        SWSS_LOG_DEBUG("fdb age %s vid %d not in learned set, ignored",
+                sai_serialize_mac(mac).c_str(), vid);
+        return;
+    }
+
+    FdbInfo fi = *it;
+
+    m_fdb_info_set.erase(it);
+
+    SWSS_LOG_NOTICE("fdb aged %s vid %d (%s)",
+            sai_serialize_mac(mac).c_str(), vid, sai_serialize_object_id(port_oid).c_str());
+
+    sai_attribute_t attrs[2];
+
+    attrs[0].id = SAI_FDB_ENTRY_ATTR_TYPE;
+    attrs[0].value.s32 = SAI_FDB_ENTRY_TYPE_DYNAMIC;
+
+    attrs[1].id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+    attrs[1].value.oid = fi.getBridgePortId();
+
+    sai_fdb_event_notification_data_t data;
+
+    data.event_type = SAI_FDB_EVENT_AGED;
+    data.fdb_entry = fi.getFdbEntry();
+    data.attr_count = 2;
+    data.attr = attrs;
+
+    // the ASIC already dropped the entry: bookkeeping only, no HW delete
+
+    auto sid = sai_serialize_fdb_entry(data.fdb_entry);
+
+    sai_status_t status = SwitchBCM56850::remove(SAI_OBJECT_TYPE_FDB_ENTRY, sid);
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_WARN("failed to remove aged fdb entry %s: %s", sid.c_str(), sai_serialize_status(status).c_str());
+    }
+
+    send_fdb_event_notification(data);
+}
+
+void SwitchBCM56860HW::processFdbEntriesForAging()
+{
+    SWSS_LOG_ENTER();
+
+    // the ASIC ages entries (hwbcm_l2_age_set from SAI_SWITCH_ATTR_FDB_AGING_TIME)
+    // and reports them through the l2 callback; the vslib timer must not.
+}
+
+sai_object_id_t SwitchBCM56860HW::vlanOidOf(
+        _In_ int vid)
+{
+    SWSS_LOG_ENTER();
+
+    auto oit = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
+
+    if (oit == m_objectHash.end())
+    {
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    for (const auto &kvp: oit->second)
+    {
+        sai_attribute_t attr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, kvp.first, SAI_VLAN_ATTR_VLAN_ID, attr) &&
+                (int)attr.value.u16 == vid)
+        {
+            sai_object_id_t oid;
+
+            sai_deserialize_object_id(kvp.first, oid);
+
+            return oid;
+        }
+    }
+
+    return SAI_NULL_OBJECT_ID;
 }
 
 void SwitchBCM56860HW::onLinkChange(
@@ -1431,6 +1775,13 @@ sai_status_t SwitchBCM56860HW::hwCreateFdbEntry(
     auto *type = findAttr(attr_count, attr_list, SAI_FDB_ENTRY_ATTR_TYPE);
 
     int isStatic = (type != NULL && type->value.s32 == SAI_FDB_ENTRY_TYPE_STATIC) ? 1 : 0;
+
+    if (!isStatic)
+    {
+        // dynamic entries are learned by the ASIC itself; this create comes
+        // from our own learn notification (updateLocalDB), bookkeeping only
+        return SAI_STATUS_SUCCESS;
+    }
 
     auto *pa = findAttr(attr_count, attr_list, SAI_FDB_ENTRY_ATTR_PACKET_ACTION);
 

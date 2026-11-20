@@ -1054,6 +1054,29 @@ int hwbcm_vxlan_l2_addr_delete(const uint8_t mac[6], int vpn_id)
     return BCM_E_NONE;
 }
 
+int hwbcm_vxlan_vp_info(int vp_gport, int *is_network, int *port, int *trunk_id, int *vpn_id)
+{
+    int vp = hwbcm_vxlan_vp_index(vp_gport);
+
+    if (vp < 0 || !s_vp[vp].in_use) {
+        return BCM_E_NOT_FOUND;
+    }
+    if (is_network != NULL) {
+        *is_network = s_vp[vp].is_network;
+    }
+    if (port != NULL) {
+        *port = hwbcm_vxlan_port_of_gport((bcm_gport_t)s_vp[vp].port_gport);
+    }
+    if (trunk_id != NULL) {
+        *trunk_id = BCM_GPORT_IS_TRUNK((bcm_gport_t)s_vp[vp].port_gport)
+                    ? BCM_GPORT_TRUNK_GET((bcm_gport_t)s_vp[vp].port_gport) : -1;
+    }
+    if (vpn_id != NULL) {
+        *vpn_id = s_vp[vp].vpn_id;
+    }
+    return BCM_E_NONE;
+}
+
 /* ------------------------------------------------------------------------ */
 /* MY_STATION                                                               */
 /* ------------------------------------------------------------------------ */

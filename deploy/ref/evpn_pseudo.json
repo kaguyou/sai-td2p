@@ -1,0 +1,4 @@
+[
+  {"VXLAN_REMOTE_VNI_TABLE:Vlan200:10.1.0.2": {"vni": "2000"}, "OP": "SET"},
+  {"VXLAN_FDB_TABLE:Vlan200:00:aa:bb:cc:dd:01": {"remote_vtep": "10.1.0.2", "type": "dynamic", "vni": "2000"}, "OP": "SET"}
+]
