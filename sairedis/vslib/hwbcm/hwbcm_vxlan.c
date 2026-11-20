@@ -511,6 +511,27 @@ int hwbcm_vxlan_egress_create(int intf_id, const uint8_t dst_mac[6], int port, i
     return BCM_E_NONE;
 }
 
+/* A3 punts an unresolved/aged neighbor with BCM_L3_L2TOCPU (port 0 = CMIC,
+ * no MAC) and drops with BCM_L3_DST_DISCARD. bcm_l3_egress_get() reports the
+ * L2TOCPU one with intf 0x2fff and a zero MAC, so look at all three: cloning
+ * it into a VXLAN egress would point the tunnel at the CPU port (seen
+ * 2026-11-21: "network vp ... port 0" after a syncd restart). */
+static int hwbcm_vxlan_egress_is_cpu_or_drop(const bcm_l3_egress_t *e)
+{
+    static const uint8_t zero[6] = { 0, 0, 0, 0, 0, 0 };
+
+    if (e->flags & (BCM_L3_COPY_TO_CPU | BCM_L3_DST_DISCARD | BCM_L3_L2TOCPU)) {
+        return 1;
+    }
+    if (memcmp(e->mac_addr, zero, 6) == 0) {
+        return 1;
+    }
+    if (!(e->flags & BCM_L3_TGID) && hwbcm_vxlan_port_of_gport(e->port) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 /* Read the unicast egress behind an egress id or the first member of an ECMP
  * group. */
 static int hwbcm_vxlan_egress_source_get(int l3_egr_or_ecmp_id, bcm_l3_egress_t *src)
@@ -561,8 +582,8 @@ int hwbcm_vxlan_egress_is_stale(int l3_egr_or_ecmp_id, int vxlan_egr_id, int *st
         *stale = 1;     /* source vanished */
         return BCM_E_NONE;
     }
-    if (src.flags & (BCM_L3_COPY_TO_CPU | BCM_L3_DST_DISCARD)) {
-        *stale = 1;     /* neighbor gone: A3 rewrote it to L2TOCPU */
+    if (hwbcm_vxlan_egress_is_cpu_or_drop(&src)) {
+        *stale = 1;     /* neighbor gone or unresolved: A3 rewrote it to L2TOCPU */
         return BCM_E_NONE;
     }
 
@@ -605,7 +626,7 @@ int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *po
         return rv;
     }
 
-    if (src.flags & (BCM_L3_COPY_TO_CPU | BCM_L3_DST_DISCARD)) {
+    if (hwbcm_vxlan_egress_is_cpu_or_drop(&src)) {
         hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: egress %d is a CPU/drop egress, not usable for a tunnel",
                   l3_egr_or_ecmp_id);
         return BCM_E_CONFIG;

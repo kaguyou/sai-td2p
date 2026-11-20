@@ -174,6 +174,13 @@ namespace saivs
                     _In_ const uint8_t *buffer,
                     _In_ size_t size) override;
 
+
+            virtual sai_status_t hwFlushFdbEntries(
+
+                    _In_ uint32_t attr_count,
+
+                    _In_ const sai_attribute_t *attr_list) override;
+
             /* Hardware ages entries itself; disable the vslib timer ageing. */
             virtual void processFdbEntriesForAging() override;
 
@@ -195,6 +202,7 @@ namespace saivs
             sai_status_t hwRemoveRouterInterface(_In_ sai_object_id_t rif_id);
             sai_status_t hwCreateNeighbor(_In_ const std::string &serialized, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwRemoveNeighbor(_In_ const std::string &serialized);
+            void hwRefreshNeighborsOnLearn(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6], _In_ int port, _In_ int trunk);
             sai_status_t hwCreateNextHop(_In_ sai_object_id_t nh_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwRemoveNextHop(_In_ sai_object_id_t nh_id);
             sai_status_t hwCreateNextHopGroup(_In_ sai_object_id_t nhg_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
@@ -382,6 +390,7 @@ namespace saivs
             int vxlanResolveUnderlayEgress(_In_ const uint8_t ip4[4]);
             bool vxlanTryBringUpVtep(_Inout_ VxlanRemoteVtep &vtep);
             void vxlanTearDownVtepVp(_Inout_ VxlanRemoteVtep &vtep);
+            void vxlanNotifyTunnelOper(_In_ const VxlanRemoteVtep &vtep, _In_ bool up);
             void vxlanInstallVtepMacs(_Inout_ VxlanRemoteVtep &vtep, _In_ int onlyVid);
             void vxlanAddVtepToVpn(_Inout_ VxlanRemoteVtep &vtep, _In_ int vpn);
             sai_status_t vxlanAddAccessPorts(_In_ int vid, _In_ int vpn);

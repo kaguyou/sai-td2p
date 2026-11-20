@@ -37,6 +37,8 @@
 
 #include "swss/logger.h"
 #include "meta/sai_serialize.h"
+#include "meta/NotificationPortStateChange.h"
+#include "EventPayloadNotification.h"
 
 #include "hwbcm/hwbcm.h"
 
@@ -392,7 +394,65 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
     SWSS_LOG_NOTICE("remote VTEP %s up: network vp 0x%x (vpn 0x%x, egress %d, port %d, %zu MACs)",
             vtep.ip.c_str(), vp, vpn, vtep.egr, vtep.port, vtep.macs.size());
 
+    vxlanNotifyTunnelOper(vtep, true);
+
     return true;
+}
+
+void SwitchBCM56860HW::vxlanNotifyTunnelOper(
+        _In_ const VxlanRemoteVtep &vtep,
+        _In_ bool up)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * orchagent learns the oper status of an EVPN P2P tunnel ("show vxlan
+     * remotevtep", STATE_DB VXLAN_TUNNEL_TABLE operstatus) from a port state
+     * change notification whose port_id is the SAI_OBJECT_TYPE_TUNNEL oid
+     * (PortsOrch::updateDbPortOperStatus -> VxlanTunnelOrch::updateDbTunnelOperStatus),
+     * the way the Broadcom SAI reports it. Without this it stays oper_down forever.
+     * SwitchStateBase::send_port_oper_status_notification() only accepts PORT oids,
+     * so the event is queued here the same way it does it.
+     */
+    if (vtep.tunnels.empty())
+    {
+        return;
+    }
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY;
+
+    if (get(SAI_OBJECT_TYPE_SWITCH, m_switch_id, 1, &attr) != SAI_STATUS_SUCCESS || attr.value.ptr == NULL)
+    {
+        SWSS_LOG_WARN("remote VTEP %s: no port state change callback, tunnel oper status not reported",
+                vtep.ip.c_str());
+        return;
+    }
+
+    sai_switch_notifications_t sn = { };
+
+    sn.on_port_state_change = (sai_port_state_change_notification_fn)attr.value.ptr;
+
+    for (auto tunnel_id: vtep.tunnels)
+    {
+        sai_port_oper_status_notification_t data = { };
+
+        data.port_id = tunnel_id;
+        data.port_state = up ? SAI_PORT_OPER_STATUS_UP : SAI_PORT_OPER_STATUS_DOWN;
+
+        auto str = sai_serialize_port_oper_status_ntf(1, &data);
+        auto ntf = std::make_shared<sairedis::NotificationPortStateChange>(str);
+        auto payload = std::make_shared<EventPayloadNotification>(ntf, sn);
+
+        if (m_switchConfig->m_eventQueue)
+        {
+            m_switchConfig->m_eventQueue->enqueue(std::make_shared<Event>(EVENT_TYPE_NOTIFICATION, payload));
+        }
+
+        SWSS_LOG_NOTICE("remote VTEP %s: tunnel %s oper %s reported",
+                vtep.ip.c_str(), sai_serialize_object_id(tunnel_id).c_str(), up ? "up" : "down");
+    }
 }
 
 void SwitchBCM56860HW::vxlanTearDownVtepVp(
@@ -433,6 +493,8 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
         }
 
         SWSS_LOG_NOTICE("remote VTEP %s: network vp 0x%x removed", vtep.ip.c_str(), vtep.vp);
+
+        vxlanNotifyTunnelOper(vtep, false);
 
         vtep.vp = -1;
         vtep.vpReady = false;

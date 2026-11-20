@@ -129,10 +129,10 @@ index 409a6c3..70c2c0a 100644
  
              std::shared_ptr<LaneMap> m_fabricLaneMap;
 diff --git a/vslib/SwitchStateBase.h b/vslib/SwitchStateBase.h
-index b7f4190..4064f2d 100644
+index b7f4190..9be9fb1 100644
 --- a/vslib/SwitchStateBase.h
 +++ b/vslib/SwitchStateBase.h
-@@ -389,7 +389,7 @@ namespace saivs
+@@ -389,12 +389,27 @@ namespace saivs
  
          public:
  
@@ -141,6 +141,26 @@ index b7f4190..4064f2d 100644
                      _In_ sai_object_id_t portId,
                      _In_ const std::string& name,
                      _In_ const uint8_t *buffer,
+                     _In_ size_t size);
+ 
++            /**
++             * Called by VirtualSwitchSaiInterface::flushFdbEntries before the
++             * local FDB copies are dropped. A hardware-backed switch mirrors
++             * the flush into the ASIC so the MACs are re-learned (and
++             * re-reported); the virtual switch has nothing to do.
++             */
++            virtual sai_status_t hwFlushFdbEntries(
++                    _In_ uint32_t attr_count,
++                    _In_ const sai_attribute_t *attr_list)
++            {
++                SWSS_LOG_ENTER();
++
++                return SAI_STATUS_SUCCESS;
++            }
++
+             void debugSetStats(
+                     _In_ sai_object_id_t oid,
+                     _In_ const std::map<sai_stat_id_t, uint64_t>& stats);
 diff --git a/vslib/VirtualSwitchSaiInterface.cpp b/vslib/VirtualSwitchSaiInterface.cpp
 index a9baf70..df0da99 100644
 --- a/vslib/VirtualSwitchSaiInterface.cpp
@@ -165,6 +185,28 @@ index a9baf70..df0da99 100644
          case SAI_VS_SWITCH_TYPE_VPP:
  
  #ifdef USE_VPP
+diff --git a/vslib/VirtualSwitchSaiInterfaceFdb.cpp b/vslib/VirtualSwitchSaiInterfaceFdb.cpp
+index 4d13784..ad51e32 100644
+--- a/vslib/VirtualSwitchSaiInterfaceFdb.cpp
++++ b/vslib/VirtualSwitchSaiInterfaceFdb.cpp
+@@ -121,6 +121,17 @@ sai_status_t VirtualSwitchSaiInterface::flushFdbEntries(
+ 
+     auto ss = m_switchStateMap.at(switch_id);
+ 
++    // hardware switch: drop the same entries from the ASIC L2 table, otherwise
++    // they are never re-learned and SONiC's view stays empty
++    {
++        sai_status_t hw = ss->hwFlushFdbEntries(attr_count, attr_list);
++
++        if (hw != SAI_STATUS_SUCCESS)
++        {
++            SWSS_LOG_WARN("hwFlushFdbEntries failed: %s", sai_serialize_status(hw).c_str());
++        }
++    }
++
+     // TODO move some part to switch state
+     auto &fdbs = ss->m_objectHash.at(SAI_OBJECT_TYPE_FDB_ENTRY);
+ 
 diff --git a/vslib/saivs.h b/vslib/saivs.h
 index 0a62d3b..299b446 100644
 --- a/vslib/saivs.h

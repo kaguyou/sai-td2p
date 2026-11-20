@@ -712,6 +712,35 @@ int hwbcm_init(const char *config_bcm)
         }
     }
 
+    /* "init bcm" brings every front port up in VLAN 1 with learning on, and
+     * a copper link partner (the PC) links in ~1 s and gets learned before
+     * the SAI port objects exist and buildPortMaps() applies the SAI default
+     * admin-down. That stale learn then reaches orchagent while it is still
+     * removing the default bridge ports, the remove fails with OBJECT_IN_USE
+     * (meta refcount) and orchagent aborts (2026-11-21, 07:47). Do what the
+     * Broadcom SAI does: ports start admin-down, and whatever was learned in
+     * the window is dropped from the L2 table. */
+    {
+        int ndis = 0;
+        PBMP_PORT_ITER(unit, port) {
+            if (IS_CPU_PORT(unit, port) || IS_LB_PORT(unit, port)) {
+                continue;
+            }
+            rv = bcm_port_enable_set(unit, port, 0);
+            if (BCM_FAILURE(rv)) {
+                HWBCM_LOGW("bcm_port_enable_set(%d, 0): %s", port, bcm_errmsg(rv));
+            } else {
+                ndis++;
+            }
+        }
+        rv = bcm_l2_addr_delete_by_vlan(unit, BCM_VLAN_DEFAULT, 0);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGW("bcm_l2_addr_delete_by_vlan(%d) after init: %s", BCM_VLAN_DEFAULT, bcm_errmsg(rv));
+        }
+        HWBCM_LOGI("hwbcm_init: %d ports admin down until SAI enables them, vlan %d L2 entries flushed",
+                   ndis, BCM_VLAN_DEFAULT);
+    }
+
     /* STP: 6.5.27 "init bcm" leaves every TD2+ front port in STP state
      * DISABLE in the default STG, which drops all ingress (TX works, RX=0).
      * We have no STP object support, so every port is always FORWARD. */

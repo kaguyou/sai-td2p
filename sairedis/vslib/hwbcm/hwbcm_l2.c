@@ -329,6 +329,17 @@ int hwbcm_l2_flush_port(int port)
     return 0;
 }
 
+int hwbcm_l2_flush_vlan_port(int vid, int port)
+{
+    if (!port_valid(port)) {
+        return BCM_E_PORT;
+    }
+    HWBCM_CHECK("bcm_l2_addr_delete_by_vlan_port",
+                bcm_l2_addr_delete_by_vlan_port(HWBCM_UNIT, (bcm_vlan_t)vid, -1, port, 0));
+    HWBCM_LOGI("l2 flush vlan %d port %d", vid, port);
+    return 0;
+}
+
 int hwbcm_l2_flush_vlan(int vid)
 {
     if (!vid_valid(vid)) {

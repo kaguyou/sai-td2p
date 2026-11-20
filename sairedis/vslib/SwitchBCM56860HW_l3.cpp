@@ -1740,3 +1740,77 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
 
     return SAI_STATUS_SUCCESS;
 }
+
+void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
+        _In_ sai_object_id_t vlanOid,
+        _In_ const uint8_t mac[6],
+        _In_ int port,
+        _In_ int trunk)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * hwCreateNeighbor() punts a neighbor on a VLAN RIF to the CPU when its MAC
+     * is not in the FDB yet. That is the normal case right after a syncd
+     * restart: orchagent re-creates the neighbors from the kernel cache before
+     * the ASIC has re-learned anything, and it never touches the neighbor
+     * again (neighorch does not observe FDB changes). The Broadcom SAI fixes
+     * this up internally; do the same here: on a learn of (vlan, mac) rewrite
+     * the egress of every neighbor with that MAC on that VLAN's RIF in place
+     * (host entry, next hops, routes and ECMP members keep the egress id), and
+     * let the remote VTEPs re-check their underlay (a tunnel cloned from the
+     * punt egress is stale). Also covers a MAC moving to another port.
+     */
+
+    bool changed = false;
+
+    for (auto &kv: m_neighborEgr)
+    {
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(kv.first, ne);
+
+        sai_attribute_t rifType, vlanAttr, macAttr, paAttr;
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
+                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
+                !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr) ||
+                vlanAttr.value.oid != vlanOid ||
+                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr) ||
+                !macEqual(macAttr.value.mac, mac))
+        {
+            continue;
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+                paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
+        {
+            continue;
+        }
+
+        auto rit = m_rifToIntf.find(ne.rif_id);
+
+        if (rit == m_rifToIntf.end())
+        {
+            continue;
+        }
+
+        int rv = hwbcm_l3_egress_replace(kv.second, rit->second, mac, port, trunk);
+
+        if (rv < 0)
+        {
+            SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve after fdb learn failed: %d",
+                    kv.first.c_str(), kv.second, rv);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("neighbor %s: egress %d re-resolved after fdb learn (port %d trunk %d)",
+                kv.first.c_str(), kv.second, port, trunk);
+
+        changed = true;
+    }
+
+    if (changed && m_hwReady)
+    {
+        hwVxlanRetryPending();
+    }
+}

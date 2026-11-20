@@ -1037,6 +1037,28 @@ void SwitchBCM56860HW::process_packet_for_fdb_event(
         return;
     }
 
+    // learn on an admin-down port can only be stale (learned by the ASIC in
+    // the init window before the SAI default admin-down was applied): never
+    // report it, orchagent would trip over it while removing the default
+    // bridge ports (OBJECT_IN_USE -> abort, 2026-11-21). Drop it from the L2
+    // table too so it is learned again, with an event, once the port is up.
+    {
+        sai_attribute_t adm;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_ADMIN_STATE, adm) && !adm.value.booldata)
+        {
+            SWSS_LOG_NOTICE("fdb learn %s vid %d on admin-down bcm port %d ignored and flushed",
+                    sai_serialize_mac(mac).c_str(), vid, bcm);
+
+            if (vid > 0 && vid <= 4095)
+            {
+                hwbcm_l2_addr_delete(mac, vid);
+            }
+
+            return;
+        }
+    }
+
     // learn: skip entries SONiC already knows (static ones programmed by
     // orchagent come back from the ASIC as ADD events too)
 
@@ -1074,6 +1096,23 @@ void SwitchBCM56860HW::process_packet_for_fdb_event(
     // SAI_FDB_EVENT_LEARNED notification
 
     SwitchBCM56850::process_packet_for_fdb_event(port_oid, name, frame, sizeof(frame));
+
+    // a neighbor punted to the CPU (A3) may have been waiting for this MAC
+    {
+        int lp = -1;
+        int lt = -1;
+
+        if (HWBCM_L2_CB_IS_TRUNK(bcm))
+        {
+            lt = HWBCM_L2_CB_TRUNK_ID(bcm);
+        }
+        else
+        {
+            lp = bcm;
+        }
+
+        hwRefreshNeighborsOnLearn(vlan_oid, mac, lp, lt);
+    }
 }
 
 void SwitchBCM56860HW::onFdbAged(
@@ -2571,4 +2610,132 @@ const sai_attribute_t *SwitchBCM56860HW::findAttr(
     }
 
     return NULL;
+}
+
+sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * orchagent flushes the dynamic MACs of a bridge port when the port goes
+     * down (PortsOrch) and of a (port, vlan) when a VLAN member is removed.
+     * Stock vslib only forgets them; the ASIC kept them, so they were never
+     * re-learned (the SDK reports a learn once), "show mac" stayed empty and a
+     * neighbor created afterwards was punted to the CPU for good (seen
+     * 2026-11-21 after a 1G link bounce). Mirror the flush into the L2 table;
+     * hwbcm's flushes delete dynamic entries only, static ones are removed
+     * one by one through the normal SAI remove.
+     */
+
+    if (!m_hwReady)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t bp = SAI_NULL_OBJECT_ID;
+    sai_object_id_t bv = SAI_NULL_OBJECT_ID;
+    sai_fdb_flush_entry_type_t type = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
+
+    for (uint32_t i = 0; i < attr_count; i++)
+    {
+        switch (attr_list[i].id)
+        {
+            case SAI_FDB_FLUSH_ATTR_BRIDGE_PORT_ID:
+                bp = attr_list[i].value.oid;
+                break;
+
+            case SAI_FDB_FLUSH_ATTR_BV_ID:
+                bv = attr_list[i].value.oid;
+                break;
+
+            case SAI_FDB_FLUSH_ATTR_ENTRY_TYPE:
+                type = (sai_fdb_flush_entry_type_t)attr_list[i].value.s32;
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    if (type == SAI_FDB_FLUSH_ENTRY_TYPE_STATIC)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int vid = -1;
+
+    if (bv != SAI_NULL_OBJECT_ID && objectTypeQuery(bv) == SAI_OBJECT_TYPE_VLAN)
+    {
+        sai_attribute_t a;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, bv, SAI_VLAN_ATTR_VLAN_ID, a))
+        {
+            vid = a.value.u16;
+        }
+    }
+
+    int port = -1;
+    int trunk = -1;
+    int rv = 0;
+
+    if (bp != SAI_NULL_OBJECT_ID)
+    {
+        sai_object_id_t target = bridgePortTarget(bp);
+        sai_object_type_t ot = objectTypeQuery(target);
+
+        if (ot == SAI_OBJECT_TYPE_LAG)
+        {
+            trunk = trunkOf(target);
+            rv = (trunk >= 0) ? hwbcm_l2_flush_trunk(trunk) : 0; // (vlan filter not available for trunks)
+        }
+        else if (ot == SAI_OBJECT_TYPE_PORT)
+        {
+            port = bcmPortOf(target);
+
+            if (port >= 0)
+            {
+                rv = (vid > 0) ? hwbcm_l2_flush_vlan_port(vid, port) : hwbcm_l2_flush_port(port);
+            }
+        }
+        else
+        {
+            return SAI_STATUS_SUCCESS; // tunnel bridge port: remote MACs are static, nothing to flush
+        }
+    }
+    else if (vid > 0)
+    {
+        rv = hwbcm_l2_flush_vlan(vid);
+    }
+    else
+    {
+        auto it = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
+
+        if (it != m_objectHash.end())
+        {
+            for (auto &kv: it->second)
+            {
+                sai_object_id_t oid;
+                sai_deserialize_object_id(kv.first, oid);
+
+                sai_attribute_t a;
+
+                if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, oid, SAI_VLAN_ATTR_VLAN_ID, a))
+                {
+                    int r = hwbcm_l2_flush_vlan(a.value.u16);
+
+                    if (r < 0)
+                    {
+                        rv = r;
+                    }
+                }
+            }
+        }
+    }
+
+    SWSS_LOG_NOTICE("fdb flush mirrored to ASIC: bridge port %s (bcm port %d trunk %d) vlan %d: %d",
+            sai_serialize_object_id(bp).c_str(), port, trunk, vid, rv);
+
+    return SAI_STATUS_SUCCESS; // the local flush must proceed even if the ASIC call failed
 }

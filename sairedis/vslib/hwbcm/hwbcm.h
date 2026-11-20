@@ -159,6 +159,7 @@ int hwbcm_l2_addr_add(const uint8_t mac[6], int vid, int port, int is_static);
 int hwbcm_l2_addr_delete(const uint8_t mac[6], int vid);
 int hwbcm_l2_flush_port(int port);
 int hwbcm_l2_flush_vlan(int vid);
+int hwbcm_l2_flush_vlan_port(int vid, int port);   /* dynamic entries of one (vlan, port) */
 int hwbcm_l2_age_set(int seconds);
 
 /* Learned-MAC event callback (for SAI FDB notifications). add: 1 learn, 0 age/delete. */
