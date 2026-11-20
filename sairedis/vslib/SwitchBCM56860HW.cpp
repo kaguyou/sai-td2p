@@ -1,0 +1,2223 @@
+/*
+ * SwitchBCM56860HW.cpp — core of the Trident2+ hardware switch (A2).
+ *
+ * Construction, SDK bring-up, port map, link notifications, dispatch of
+ * create/set/remove to the per-area handlers, hostif (KNET), VLAN,
+ * VLAN_MEMBER, FDB_ENTRY, LAG, LAG_MEMBER and the shared helpers.
+ *
+ * L3 handlers live in SwitchBCM56860HW_l3.cpp (A3), VXLAN/bridge handlers in
+ * SwitchBCM56860HW_vxlan.cpp (A4).
+ */
+
+#include "SwitchBCM56860HW.h"
+#include "EventPayloadNetLinkMsg.h"
+
+#include "swss/logger.h"
+#include "meta/sai_serialize.h"
+
+#include "hwbcm/hwbcm.h"
+
+#include <sys/eventfd.h>
+#include <poll.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <linux/if.h>
+#include <linux/rtnetlink.h>
+
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
+#include <algorithm>
+
+using namespace saivs;
+
+/* BCM_E_* values we need to recognise (sdk include/shared/error.h). We don't
+ * include SDK headers from C++, so the two we care about are repeated here. */
+#define HWBCM_E_NOT_FOUND (-7)
+#define HWBCM_E_EXISTS    (-8)
+
+#define SAI_VS_BCM_FALLBACK_PROFILE "/usr/share/sonic/hwsku/sai.profile"
+
+// ---------------------------------------------------------------------------
+// construction
+// ---------------------------------------------------------------------------
+
+SwitchBCM56860HW::SwitchBCM56860HW(
+        _In_ sai_object_id_t switch_id,
+        _In_ std::shared_ptr<RealObjectIdManager> manager,
+        _In_ std::shared_ptr<SwitchConfig> config):
+    SwitchBCM56850(switch_id, manager, config)
+{
+    SWSS_LOG_ENTER();
+
+    if (m_switchConfig->m_useTapDevice)
+    {
+        SWSS_LOG_ERROR("SAI_VS_HOSTIF_USE_TAP_DEVICE is true on hardware switch, "
+                "tap devices will conflict with KNET netdevs (should be forced off in Sai.cpp)");
+    }
+}
+
+SwitchBCM56860HW::SwitchBCM56860HW(
+        _In_ sai_object_id_t switch_id,
+        _In_ std::shared_ptr<RealObjectIdManager> manager,
+        _In_ std::shared_ptr<SwitchConfig> config,
+        _In_ std::shared_ptr<WarmBootState> warmBootState):
+    SwitchBCM56850(switch_id, manager, config, warmBootState)
+{
+    SWSS_LOG_ENTER();
+
+    if (m_switchConfig->m_useTapDevice)
+    {
+        SWSS_LOG_ERROR("SAI_VS_HOSTIF_USE_TAP_DEVICE is true on hardware switch, "
+                "tap devices will conflict with KNET netdevs (should be forced off in Sai.cpp)");
+    }
+}
+
+SwitchBCM56860HW::~SwitchBCM56860HW()
+{
+    SWSS_LOG_ENTER();
+
+    m_linkRun = false;
+
+    if (m_linkEventFd >= 0)
+    {
+        uint64_t one = 1;
+
+        ssize_t w = write(m_linkEventFd, &one, sizeof(one));
+
+        (void)w;
+    }
+
+    if (m_linkThread.joinable())
+    {
+        m_linkThread.join();
+    }
+
+    if (m_linkEventFd >= 0)
+    {
+        close(m_linkEventFd);
+
+        m_linkEventFd = -1;
+    }
+
+    if (m_hwReady)
+    {
+        int rv = hwbcm_deinit();
+
+        if (rv < 0)
+        {
+            SWSS_LOG_WARN("hwbcm_deinit failed: %d", rv);
+        }
+
+        m_hwReady = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// initialization
+// ---------------------------------------------------------------------------
+
+std::string SwitchBCM56860HW::resolveConfigBcm() const
+{
+    SWSS_LOG_ENTER();
+
+    if (!m_switchConfig->m_initConfigFile.empty())
+    {
+        return m_switchConfig->m_initConfigFile;
+    }
+
+    const char *env = getenv(SAI_KEY_INIT_CONFIG_FILE);
+
+    if (env != NULL && env[0] != '\0')
+    {
+        SWSS_LOG_NOTICE("using %s from environment: %s", SAI_KEY_INIT_CONFIG_FILE, env);
+
+        return env;
+    }
+
+    std::ifstream ifs(SAI_VS_BCM_FALLBACK_PROFILE);
+
+    std::string line;
+
+    const std::string key = std::string(SAI_KEY_INIT_CONFIG_FILE) + "=";
+
+    while (std::getline(ifs, line))
+    {
+        if (line.compare(0, key.size(), key) == 0)
+        {
+            std::string value = line.substr(key.size());
+
+            while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\t'))
+            {
+                value.pop_back();
+            }
+
+            SWSS_LOG_NOTICE("using %s from %s: %s", SAI_KEY_INIT_CONFIG_FILE, SAI_VS_BCM_FALLBACK_PROFILE, value.c_str());
+
+            return value;
+        }
+    }
+
+    return "";
+}
+
+sai_status_t SwitchBCM56860HW::hwInitialize()
+{
+    SWSS_LOG_ENTER();
+
+    if (m_hwReady)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    m_configBcm = resolveConfigBcm();
+
+    if (m_configBcm.empty())
+    {
+        SWSS_LOG_ERROR("%s not found in profile, environment or %s",
+                SAI_KEY_INIT_CONFIG_FILE,
+                SAI_VS_BCM_FALLBACK_PROFILE);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    SWSS_LOG_NOTICE("initializing Broadcom SDK with %s", m_configBcm.c_str());
+
+    hwbcm_log_level_set(HWBCM_LOG_INFO);
+
+    int rv = hwbcm_init(m_configBcm.c_str());
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_init(%s) failed: %d", m_configBcm.c_str(), rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    uint16_t devId = 0;
+    uint8_t revId = 0;
+    char name[64] = { 0 };
+
+    if (hwbcm_chip_info(&devId, &revId, name, sizeof(name)) == 0)
+    {
+        SWSS_LOG_NOTICE("attached to %s (device 0x%04x rev 0x%02x)", name, devId, revId);
+    }
+
+    m_hwReady = true;
+
+    // link notification thread
+
+    m_linkEventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+
+    if (m_linkEventFd < 0)
+    {
+        SWSS_LOG_ERROR("eventfd failed: %s", strerror(errno));
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    m_linkRun = true;
+
+    m_linkThread = std::thread(&SwitchBCM56860HW::linkThreadMain, this);
+
+    rv = hwbcm_link_callback_register(&SwitchBCM56860HW::linkCallbackC, this);
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_link_callback_register failed: %d (no link notifications)", rv);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::initialize_default_objects(
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(hwInitialize());
+
+    CHECK_STATUS(SwitchBCM56850::initialize_default_objects(attr_count, attr_list));
+
+    // switch create attributes with a HW effect (e.g. SRC_MAC_ADDRESS)
+
+    for (uint32_t i = 0; i < attr_count; i++)
+    {
+        sai_status_t status = hwSetSwitch(&attr_list[i]);
+
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_WARN("failed to apply switch create attribute %d to HW", attr_list[i].id);
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(SwitchBCM56850::warm_boot_initialize_objects());
+
+    // NOTE: the SDK is initialized cold here, so ASIC tables are empty while
+    // the vslib bookkeeping says objects exist. Good enough for syncd restart
+    // with orchagent replay; true warm boot is not supported.
+
+    CHECK_STATUS(hwInitialize());
+
+    return buildPortMaps(true);
+}
+
+sai_status_t SwitchBCM56860HW::set_switch_default_attributes()
+{
+    SWSS_LOG_ENTER();
+
+    return SwitchBCM56850::set_switch_default_attributes();
+}
+
+sai_status_t SwitchBCM56860HW::refresh_port_list(
+        _In_ const sai_attr_metadata_t *meta)
+{
+    SWSS_LOG_ENTER();
+
+    return SwitchBCM56850::refresh_port_list(meta);
+}
+
+// ---------------------------------------------------------------------------
+// ports
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::create_ports()
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(SwitchBCM56850::create_ports());
+
+    return buildPortMaps(true);
+}
+
+void SwitchBCM56860HW::mapPort(
+        _In_ sai_object_id_t port_oid,
+        _In_ int bcm_port,
+        _In_ uint32_t first_lane)
+{
+    SWSS_LOG_ENTER();
+
+    std::string ifname;
+
+    if (m_switchConfig->m_laneMap)
+    {
+        ifname = m_switchConfig->m_laneMap->getInterfaceFromLaneNumber(first_lane);
+    }
+
+    if (ifname.empty())
+    {
+        // syncOnLinkMsg skips the lane map name check for names starting with
+        // the veth prefix "v", so use a synthetic one
+        ifname = "vbcm" + std::to_string(bcm_port);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mapMutex);
+
+        m_portToBcm[port_oid] = bcm_port;
+        m_bcmToPort[bcm_port] = port_oid;
+        m_bcmIfName[bcm_port] = ifname;
+    }
+
+    setIfNameToPortId(ifname, port_oid);
+
+    char pname[32] = { 0 };
+
+    hwbcm_port_name(bcm_port, pname, sizeof(pname));
+
+    SWSS_LOG_NOTICE("port %s <-> bcm port %d (%s) lane %u ifname %s",
+            sai_serialize_object_id(port_oid).c_str(),
+            bcm_port,
+            pname,
+            first_lane,
+            ifname.c_str());
+}
+
+void SwitchBCM56860HW::unmapPort(
+        _In_ sai_object_id_t port_oid)
+{
+    SWSS_LOG_ENTER();
+
+    std::string ifname;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mapMutex);
+
+        auto it = m_portToBcm.find(port_oid);
+
+        if (it == m_portToBcm.end())
+        {
+            return;
+        }
+
+        int bcm = it->second;
+
+        auto nit = m_bcmIfName.find(bcm);
+
+        if (nit != m_bcmIfName.end())
+        {
+            ifname = nit->second;
+
+            m_bcmIfName.erase(nit);
+        }
+
+        m_bcmToPort.erase(bcm);
+        m_portToBcm.erase(it);
+    }
+
+    if (!ifname.empty())
+    {
+        removeIfNameToPortId(ifname);
+    }
+}
+
+sai_status_t SwitchBCM56860HW::buildPortMaps(
+        _In_ bool applyDefaults)
+{
+    SWSS_LOG_ENTER();
+
+    if (!m_hwReady)
+    {
+        SWSS_LOG_ERROR("hardware not initialized");
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mapMutex);
+
+        m_portToBcm.clear();
+        m_bcmToPort.clear();
+        m_bcmIfName.clear();
+    }
+
+    size_t mapped = 0;
+
+    for (auto port_oid: m_port_list)
+    {
+        sai_attribute_t attr;
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_HW_LANE_LIST, attr) ||
+                attr.value.u32list.count == 0 || attr.value.u32list.list == NULL)
+        {
+            SWSS_LOG_WARN("port %s has no HW_LANE_LIST, not mapped to hardware",
+                    sai_serialize_object_id(port_oid).c_str());
+            continue;
+        }
+
+        uint32_t lane = attr.value.u32list.list[0];
+
+        int bcm = hwbcm_port_from_phys((int)lane);
+
+        if (bcm < 0)
+        {
+            SWSS_LOG_WARN("port %s lane %u has no bcm logical port (check portmap in config.bcm)",
+                    sai_serialize_object_id(port_oid).c_str(), lane);
+            continue;
+        }
+
+        mapPort(port_oid, bcm, lane);
+
+        mapped++;
+
+        if (!applyDefaults)
+        {
+            continue;
+        }
+
+        // admin state: push the stored value (default down)
+
+        int enable = 0;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_ADMIN_STATE, attr))
+        {
+            enable = attr.value.booldata ? 1 : 0;
+        }
+
+        int rv = hwbcm_port_enable_set(bcm, enable);
+
+        if (rv < 0)
+        {
+            SWSS_LOG_WARN("hwbcm_port_enable_set(%d, %d) failed: %d", bcm, enable, rv);
+        }
+
+        // speed: the base class default (40G) is a placeholder, store what the
+        // hardware really has so GET returns the truth until orchagent sets it
+
+        int speed = 0;
+
+        if (hwbcm_port_speed_get(bcm, &speed) == 0 && speed > 0)
+        {
+            attr.id = SAI_PORT_ATTR_SPEED;
+            attr.value.u32 = (uint32_t)speed;
+
+            set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &attr);
+        }
+
+        int mtu = 0;
+
+        if (hwbcm_port_mtu_get(bcm, &mtu) == 0 && mtu > 0)
+        {
+            attr.id = SAI_PORT_ATTR_MTU;
+            attr.value.u32 = (uint32_t)mtu;
+
+            set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &attr);
+        }
+
+        int up = 0;
+
+        if (hwbcm_port_link_get(bcm, &up) == 0)
+        {
+            attr.id = SAI_PORT_ATTR_OPER_STATUS;
+            attr.value.s32 = up ? SAI_PORT_OPER_STATUS_UP : SAI_PORT_OPER_STATUS_DOWN;
+
+            set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &attr);
+        }
+    }
+
+    SWSS_LOG_NOTICE("mapped %zu of %zu ports to hardware", mapped, m_port_list.size());
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwCreatePort(
+        _In_ sai_object_id_t port_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *lanes = findAttr(attr_count, attr_list, SAI_PORT_ATTR_HW_LANE_LIST);
+
+    if (lanes == NULL || lanes->value.u32list.count == 0 || lanes->value.u32list.list == NULL)
+    {
+        SWSS_LOG_WARN("port %s created without HW_LANE_LIST, not mapped to hardware",
+                sai_serialize_object_id(port_id).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    uint32_t lane = lanes->value.u32list.list[0];
+
+    int bcm = hwbcm_port_from_phys((int)lane);
+
+    if (bcm < 0)
+    {
+        SWSS_LOG_ERROR("port %s lane %u has no bcm logical port",
+                sai_serialize_object_id(port_id).c_str(), lane);
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    mapPort(port_id, bcm, lane);
+
+    for (uint32_t i = 0; i < attr_count; i++)
+    {
+        sai_status_t status = hwSetPort(port_id, &attr_list[i]);
+
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            unmapPort(port_id);
+
+            return status;
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwSetPort(
+        _In_ sai_object_id_t port_id,
+        _In_ const sai_attribute_t *attr)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr == NULL)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    int bcm = bcmPortOf(port_id);
+
+    if (bcm < 0)
+    {
+        // CPU port, or a port not mapped to hardware: bookkeeping only
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = 0;
+
+    sai_attribute_t other;
+
+    switch (attr->id)
+    {
+        case SAI_PORT_ATTR_ADMIN_STATE:
+
+            rv = hwbcm_port_enable_set(bcm, attr->value.booldata ? 1 : 0);
+            break;
+
+        case SAI_PORT_ATTR_SPEED:
+            {
+                int autoneg = 0;
+
+                if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_id, SAI_PORT_ATTR_AUTO_NEG_MODE, other))
+                {
+                    autoneg = other.value.booldata ? 1 : 0;
+                }
+
+                rv = hwbcm_port_speed_set(bcm, (int)attr->value.u32, autoneg);
+            }
+            break;
+
+        case SAI_PORT_ATTR_AUTO_NEG_MODE:
+            {
+                int speed = 0;
+
+                if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_id, SAI_PORT_ATTR_SPEED, other))
+                {
+                    speed = (int)other.value.u32;
+                }
+
+                if (speed > 0)
+                {
+                    rv = hwbcm_port_speed_set(bcm, speed, attr->value.booldata ? 1 : 0);
+                }
+            }
+            break;
+
+        case SAI_PORT_ATTR_MTU:
+
+            rv = hwbcm_port_mtu_set(bcm, (int)attr->value.u32);
+            break;
+
+        case SAI_PORT_ATTR_PORT_VLAN_ID:
+
+            rv = hwbcm_port_pvid_set(bcm, (int)attr->value.u16);
+            break;
+
+        case SAI_PORT_ATTR_GLOBAL_FLOW_CONTROL_MODE:
+            {
+                int tx = 0, rx = 0;
+
+                switch (attr->value.s32)
+                {
+                    case SAI_PORT_FLOW_CONTROL_MODE_TX_ONLY: tx = 1; break;
+                    case SAI_PORT_FLOW_CONTROL_MODE_RX_ONLY: rx = 1; break;
+                    case SAI_PORT_FLOW_CONTROL_MODE_BOTH_ENABLE: tx = 1; rx = 1; break;
+                    default: break;
+                }
+
+                rv = hwbcm_port_pause_set(bcm, tx, rx);
+            }
+            break;
+
+        case SAI_PORT_ATTR_FEC_MODE:
+        case SAI_PORT_ATTR_INTERFACE_TYPE:
+        case SAI_PORT_ATTR_OPER_STATUS:
+        case SAI_PORT_ATTR_HOST_TX_READY_STATUS:
+        case SAI_PORT_ATTR_ADVERTISED_SPEED:
+        case SAI_PORT_ATTR_PKT_TX_ENABLE:
+
+            // silently ignored (bookkeeping only)
+            break;
+
+        default:
+
+            SWSS_LOG_INFO("port attribute %d not programmed to hardware (bookkeeping only)", attr->id);
+            break;
+    }
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hardware set of port attribute %d on bcm port %d failed: %d", attr->id, bcm, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwRemovePort(
+        _In_ sai_object_id_t port_id)
+{
+    SWSS_LOG_ENTER();
+
+    int bcm = bcmPortOf(port_id);
+
+    if (bcm >= 0)
+    {
+        int rv = hwbcm_port_enable_set(bcm, 0);
+
+        if (rv < 0)
+        {
+            SWSS_LOG_WARN("hwbcm_port_enable_set(%d, 0) failed: %d", bcm, rv);
+        }
+    }
+
+    unmapPort(port_id);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::refresh_port_oper_speed(
+        _In_ sai_object_id_t port_id)
+{
+    SWSS_LOG_ENTER();
+
+    int bcm = bcmPortOf(port_id);
+
+    if (bcm < 0)
+    {
+        return SwitchBCM56850::refresh_port_oper_speed(port_id);
+    }
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_PORT_ATTR_OPER_STATUS;
+
+    CHECK_STATUS(get(SAI_OBJECT_TYPE_PORT, port_id, 1, &attr));
+
+    uint32_t operSpeed = 0;
+
+    if (attr.value.s32 != SAI_PORT_OPER_STATUS_DOWN)
+    {
+        int speed = 0;
+
+        if (hwbcm_port_speed_get(bcm, &speed) == 0 && speed > 0)
+        {
+            operSpeed = (uint32_t)speed;
+        }
+    }
+
+    attr.id = SAI_PORT_ATTR_OPER_SPEED;
+    attr.value.u32 = operSpeed;
+
+    return set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_id), &attr);
+}
+
+// ---------------------------------------------------------------------------
+// switch attributes
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwSetSwitch(
+        _In_ const sai_attribute_t *attr)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr == NULL || !m_hwReady)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = 0;
+
+    switch (attr->id)
+    {
+        case SAI_SWITCH_ATTR_SRC_MAC_ADDRESS:
+
+            rv = hwbcm_switch_mac_set(attr->value.mac);
+
+            SWSS_LOG_NOTICE("switch mac %s -> hardware: %d", sai_serialize_mac(attr->value.mac).c_str(), rv);
+            break;
+
+        case SAI_SWITCH_ATTR_FDB_AGING_TIME:
+
+            rv = hwbcm_l2_age_set((int)attr->value.u32);
+            break;
+
+        default:
+            break;
+    }
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hardware set of switch attribute %d failed: %d", attr->id, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// link notifications
+// ---------------------------------------------------------------------------
+
+void SwitchBCM56860HW::linkCallbackC(
+        int port,
+        int up,
+        void *cookie)
+{
+    // Called from the SDK linkscan thread: just queue and wake our thread.
+
+    auto *self = static_cast<SwitchBCM56860HW*>(cookie);
+
+    if (self == NULL)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(self->m_linkMutex);
+
+        self->m_linkEvents.emplace_back(port, up);
+    }
+
+    if (self->m_linkEventFd >= 0)
+    {
+        uint64_t one = 1;
+
+        ssize_t w = write(self->m_linkEventFd, &one, sizeof(one));
+
+        (void)w;
+    }
+}
+
+void SwitchBCM56860HW::linkThreadMain()
+{
+    SWSS_LOG_ENTER();
+
+    SWSS_LOG_NOTICE("link thread started");
+
+    while (m_linkRun)
+    {
+        struct pollfd pfd;
+
+        pfd.fd = m_linkEventFd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int pr = poll(&pfd, 1, 1000);
+
+        if (pr > 0 && (pfd.revents & POLLIN))
+        {
+            uint64_t v = 0;
+
+            ssize_t r = read(m_linkEventFd, &v, sizeof(v));
+
+            (void)r;
+        }
+
+        if (!m_linkRun)
+        {
+            break;
+        }
+
+        std::vector<std::pair<int,int>> events;
+
+        {
+            std::lock_guard<std::mutex> lock(m_linkMutex);
+
+            events.swap(m_linkEvents);
+        }
+
+        for (auto &ev: events)
+        {
+            onLinkChange(ev.first, ev.second);
+        }
+    }
+
+    SWSS_LOG_NOTICE("link thread ended");
+}
+
+void SwitchBCM56860HW::onLinkChange(
+        int port,
+        int up)
+{
+    SWSS_LOG_ENTER();
+
+    sai_object_id_t port_oid = SAI_NULL_OBJECT_ID;
+    std::string ifname;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mapMutex);
+
+        auto it = m_bcmToPort.find(port);
+
+        if (it == m_bcmToPort.end())
+        {
+            SWSS_LOG_INFO("link change on unmapped bcm port %d (%s), ignored", port, up ? "up" : "down");
+
+            return;
+        }
+
+        port_oid = it->second;
+
+        auto nit = m_bcmIfName.find(port);
+
+        if (nit != m_bcmIfName.end())
+        {
+            ifname = nit->second;
+        }
+    }
+
+    SWSS_LOG_NOTICE("bcm port %d (%s) link %s",
+            port,
+            sai_serialize_object_id(port_oid).c_str(),
+            up ? "UP" : "DOWN");
+
+    /*
+     * We are on our own thread; the SAI API is serialized by the mutex in
+     * Sai.cpp which we can't take from here. Push a synthetic RTM_NEWLINK into
+     * the vslib event queue: Sai's event thread takes the mutex and calls
+     * SwitchStateBase::syncOnLinkMsg -> send_port_oper_status_notification,
+     * which updates SAI_PORT_ATTR_OPER_STATUS and emits
+     * SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY. hasIfIndex() is overridden to
+     * accept our synthetic ifindex, ifname was registered in mapPort().
+     */
+
+    unsigned int flags = IFF_UP;
+
+    if (up)
+    {
+        flags |= (unsigned int)(IFF_RUNNING | IFF_LOWER_UP);
+    }
+
+    auto payload = std::make_shared<EventPayloadNetLinkMsg>(
+            m_switch_id,
+            RTM_NEWLINK,
+            LINK_IFINDEX_BASE + port,
+            flags,
+            ifname);
+
+    if (m_switchConfig->m_eventQueue)
+    {
+        m_switchConfig->m_eventQueue->enqueue(std::make_shared<Event>(EVENT_TYPE_NET_LINK_MSG, payload));
+    }
+    else
+    {
+        SWSS_LOG_ERROR("no event queue on switch config, link change dropped");
+    }
+}
+
+bool SwitchBCM56860HW::hasIfIndex(
+        _In_ int ifIndex) const
+{
+    SWSS_LOG_ENTER();
+
+    if (ifIndex >= LINK_IFINDEX_BASE && ifIndex < LINK_IFINDEX_BASE + HWBCM_MAX_PORTS)
+    {
+        return true;
+    }
+
+    return SwitchBCM56850::hasIfIndex(ifIndex);
+}
+
+// ---------------------------------------------------------------------------
+// hostif (KNET)
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwCreateHostif(
+        _In_ sai_object_id_t hostif_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *type = findAttr(attr_count, attr_list, SAI_HOSTIF_ATTR_TYPE);
+
+    if (type == NULL || type->value.s32 != SAI_HOSTIF_TYPE_NETDEV)
+    {
+        SWSS_LOG_INFO("hostif %s is not a netdev, bookkeeping only",
+                sai_serialize_object_id(hostif_id).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    auto *obj = findAttr(attr_count, attr_list, SAI_HOSTIF_ATTR_OBJ_ID);
+    auto *name = findAttr(attr_count, attr_list, SAI_HOSTIF_ATTR_NAME);
+
+    if (obj == NULL || name == NULL)
+    {
+        SWSS_LOG_ERROR("hostif %s netdev without OBJ_ID or NAME",
+                sai_serialize_object_id(hostif_id).c_str());
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    sai_object_type_t ot = objectTypeQuery(obj->value.oid);
+
+    if (ot != SAI_OBJECT_TYPE_PORT)
+    {
+        SWSS_LOG_WARN("hostif %s on %s %s: only port netdevs are created on hardware (bookkeeping only)",
+                sai_serialize_object_id(hostif_id).c_str(),
+                sai_serialize_object_type(ot).c_str(),
+                sai_serialize_object_id(obj->value.oid).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int bcm = bcmPortOf(obj->value.oid);
+
+    if (bcm < 0)
+    {
+        SWSS_LOG_WARN("hostif %s: port %s not mapped to hardware (bookkeeping only)",
+                sai_serialize_object_id(hostif_id).c_str(),
+                sai_serialize_object_id(obj->value.oid).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    char ifname[SAI_HOSTIF_NAME_SIZE + 1];
+
+    memset(ifname, 0, sizeof(ifname));
+    memcpy(ifname, name->value.chardata, SAI_HOSTIF_NAME_SIZE);
+
+    uint8_t mac[6] = { 0 };
+
+    sai_attribute_t sattr;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_SRC_MAC_ADDRESS, sattr))
+    {
+        memcpy(mac, sattr.value.mac, sizeof(mac));
+    }
+    else
+    {
+        SWSS_LOG_WARN("switch has no SRC_MAC_ADDRESS yet, netdev %s gets a zero mac", ifname);
+    }
+
+    int netif = 0;
+
+    int rv = hwbcm_knet_netif_create(bcm, ifname, mac, &netif);
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_knet_netif_create(%d, %s) failed: %d", bcm, ifname, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    m_hostifToNetif[hostif_id] = netif;
+
+    SWSS_LOG_NOTICE("hostif %s: knet netdev %s on bcm port %d (netif %d)",
+            sai_serialize_object_id(hostif_id).c_str(), ifname, bcm, netif);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveHostif(
+        _In_ sai_object_id_t hostif_id)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_hostifToNetif.find(hostif_id);
+
+    if (it == m_hostifToNetif.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = hwbcm_knet_netif_destroy(it->second);
+
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+    {
+        SWSS_LOG_ERROR("hwbcm_knet_netif_destroy(%d) failed: %d", it->second, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    m_hostifToNetif.erase(it);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwCreateHostifTrap(
+        _In_ sai_object_id_t trap_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *type = findAttr(attr_count, attr_list, SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE);
+
+    if (type == NULL)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int reason = -1;
+
+    switch (type->value.s32)
+    {
+        case SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST:
+        case SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE:
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_DISCOVERY:
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_SOLICITATION:
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_ADVERTISEMENT:
+            reason = HWBCM_TRAP_ARP;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_LLDP:
+            reason = HWBCM_TRAP_LLDP;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_LACP:
+            reason = HWBCM_TRAP_LACP;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_IP2ME:
+        case SAI_HOSTIF_TRAP_TYPE_SSH:
+        case SAI_HOSTIF_TRAP_TYPE_SNMP:
+            reason = HWBCM_TRAP_IP2ME;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_DHCP:
+        case SAI_HOSTIF_TRAP_TYPE_DHCPV6:
+        case SAI_HOSTIF_TRAP_TYPE_DHCP_L2:
+        case SAI_HOSTIF_TRAP_TYPE_DHCPV6_L2:
+            reason = HWBCM_TRAP_DHCP;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_BGP:
+        case SAI_HOSTIF_TRAP_TYPE_BGPV6:
+            reason = HWBCM_TRAP_BGP;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_TTL_ERROR:
+            reason = HWBCM_TRAP_TTL_ERR;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_L3_MTU_ERROR:
+        case SAI_HOSTIF_TRAP_TYPE_NEIGHBOR_MISS:
+            reason = HWBCM_TRAP_NEIGH_MISS;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_UDLD:
+            reason = HWBCM_TRAP_UDLD;
+            break;
+
+        case SAI_HOSTIF_TRAP_TYPE_STP:
+        case SAI_HOSTIF_TRAP_TYPE_PVRST:
+            reason = HWBCM_TRAP_STP;
+            break;
+
+        default:
+            break;
+    }
+
+    if (reason < 0)
+    {
+        SWSS_LOG_NOTICE("hostif trap %s type %d not supported on hardware, bookkeeping only",
+                sai_serialize_object_id(trap_id).c_str(), type->value.s32);
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int action = 2; // trap
+
+    auto *pa = findAttr(attr_count, attr_list, SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION);
+
+    if (pa != NULL)
+    {
+        switch (pa->value.s32)
+        {
+            case SAI_PACKET_ACTION_DROP:
+            case SAI_PACKET_ACTION_DENY:
+                action = 0;
+                break;
+
+            case SAI_PACKET_ACTION_COPY:
+            case SAI_PACKET_ACTION_LOG:
+                action = 1;
+                break;
+
+            case SAI_PACKET_ACTION_TRAP:
+                action = 2;
+                break;
+
+            case SAI_PACKET_ACTION_FORWARD:
+            case SAI_PACKET_ACTION_TRANSIT:
+            default:
+
+                SWSS_LOG_NOTICE("hostif trap %s packet action %d: nothing to program",
+                        sai_serialize_object_id(trap_id).c_str(), pa->value.s32);
+
+                return SAI_STATUS_SUCCESS;
+        }
+    }
+
+    int queue = 0;
+
+    auto *tg = findAttr(attr_count, attr_list, SAI_HOSTIF_TRAP_ATTR_TRAP_GROUP);
+
+    if (tg != NULL && tg->value.oid != SAI_NULL_OBJECT_ID)
+    {
+        sai_attribute_t q;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP, tg->value.oid, SAI_HOSTIF_TRAP_GROUP_ATTR_QUEUE, q))
+        {
+            queue = (int)q.value.u32;
+        }
+    }
+
+    int rv = hwbcm_trap_set(reason, action, queue);
+
+    if (rv < 0)
+    {
+        // trap policy is not critical for the data path: keep orchagent going
+        SWSS_LOG_WARN("hwbcm_trap_set(%d, %d, %d) for trap %s failed: %d (ignored)",
+                reason, action, queue, sai_serialize_object_id(trap_id).c_str(), rv);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// VLAN
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwCreateVlan(
+        _In_ sai_object_id_t vlan_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *vid = findAttr(attr_count, attr_list, SAI_VLAN_ATTR_VLAN_ID);
+
+    if (vid == NULL)
+    {
+        SWSS_LOG_ERROR("vlan %s created without VLAN_ID", sai_serialize_object_id(vlan_id).c_str());
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    int rv = hwbcm_vlan_create((int)vid->value.u16);
+
+    if (rv < 0 && rv != HWBCM_E_EXISTS)
+    {
+        SWSS_LOG_ERROR("hwbcm_vlan_create(%u) failed: %d", vid->value.u16, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    SWSS_LOG_NOTICE("vlan %u created on hardware (%s)", vid->value.u16, sai_serialize_object_id(vlan_id).c_str());
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveVlan(
+        _In_ sai_object_id_t vlan_id)
+{
+    SWSS_LOG_ENTER();
+
+    int vid = vidOf(vlan_id);
+
+    if (vid < 0)
+    {
+        SWSS_LOG_WARN("vlan %s has no VLAN_ID, nothing to remove on hardware",
+                sai_serialize_object_id(vlan_id).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (vid == DEFAULT_VLAN_NUMBER)
+    {
+        // default VLAN can't be destroyed on bcm
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = hwbcm_vlan_destroy(vid);
+
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+    {
+        SWSS_LOG_ERROR("hwbcm_vlan_destroy(%d) failed: %d", vid, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwCreateVlanMember(
+        _In_ sai_object_id_t member_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *vlan = findAttr(attr_count, attr_list, SAI_VLAN_MEMBER_ATTR_VLAN_ID);
+    auto *bp = findAttr(attr_count, attr_list, SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID);
+    auto *mode = findAttr(attr_count, attr_list, SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE);
+
+    if (vlan == NULL || bp == NULL)
+    {
+        SWSS_LOG_ERROR("vlan member %s without VLAN_ID or BRIDGE_PORT_ID",
+                sai_serialize_object_id(member_id).c_str());
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    int vid = vidOf(vlan->value.oid);
+
+    if (vid < 0)
+    {
+        SWSS_LOG_ERROR("vlan member %s: vlan %s unknown",
+                sai_serialize_object_id(member_id).c_str(),
+                sai_serialize_object_id(vlan->value.oid).c_str());
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    int tagged = (mode != NULL && mode->value.s32 == SAI_VLAN_TAGGING_MODE_TAGGED) ? 1 : 0;
+
+    sai_object_id_t target = bridgePortTarget(bp->value.oid);
+
+    std::vector<int> ports;
+
+    sai_object_type_t ot = objectTypeQuery(target);
+
+    if (ot == SAI_OBJECT_TYPE_PORT)
+    {
+        int bcm = bcmPortOf(target);
+
+        if (bcm >= 0)
+        {
+            ports.push_back(bcm);
+        }
+    }
+    else if (ot == SAI_OBJECT_TYPE_LAG)
+    {
+        auto it = m_lagMembers.find(target);
+
+        if (it != m_lagMembers.end())
+        {
+            for (auto p: it->second)
+            {
+                int bcm = bcmPortOf(p);
+
+                if (bcm >= 0)
+                {
+                    ports.push_back(bcm);
+                }
+            }
+        }
+
+        SWSS_LOG_NOTICE("vlan member %s on LAG %s: adding current %zu member ports (later members via syncLagMemberPort)",
+                sai_serialize_object_id(member_id).c_str(),
+                sai_serialize_object_id(target).c_str(),
+                ports.size());
+    }
+    else
+    {
+        SWSS_LOG_WARN("vlan member %s: bridge port %s target %s is %s, bookkeeping only",
+                sai_serialize_object_id(member_id).c_str(),
+                sai_serialize_object_id(bp->value.oid).c_str(),
+                sai_serialize_object_id(target).c_str(),
+                sai_serialize_object_type(ot).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    for (int bcm: ports)
+    {
+        int rv = hwbcm_vlan_port_add(vid, bcm, tagged);
+
+        if (rv < 0 && rv != HWBCM_E_EXISTS)
+        {
+            SWSS_LOG_ERROR("hwbcm_vlan_port_add(%d, %d, %d) failed: %d", vid, bcm, tagged, rv);
+
+            return SAI_STATUS_FAILURE;
+        }
+
+        SWSS_LOG_NOTICE("vlan %d: bcm port %d added %s", vid, bcm, tagged ? "tagged" : "untagged");
+    }
+
+    // VXLAN access side (no-op unless the VLAN is mapped to a VNI)
+
+    return hwVxlanVlanMemberChanged(member_id, true);
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveVlanMember(
+        _In_ sai_object_id_t member_id)
+{
+    SWSS_LOG_ENTER();
+
+    // VXLAN access side first (no-op unless the VLAN is mapped to a VNI)
+
+    CHECK_STATUS(hwVxlanVlanMemberChanged(member_id, false));
+
+    sai_attribute_t vlan, bp;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_VLAN_MEMBER, member_id, SAI_VLAN_MEMBER_ATTR_VLAN_ID, vlan) ||
+            !getStoredAttr(SAI_OBJECT_TYPE_VLAN_MEMBER, member_id, SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID, bp))
+    {
+        SWSS_LOG_WARN("vlan member %s has no VLAN_ID/BRIDGE_PORT_ID stored",
+                sai_serialize_object_id(member_id).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int vid = vidOf(vlan.value.oid);
+
+    if (vid < 0)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t target = bridgePortTarget(bp.value.oid);
+
+    std::vector<int> ports;
+
+    sai_object_type_t ot = objectTypeQuery(target);
+
+    if (ot == SAI_OBJECT_TYPE_PORT)
+    {
+        int bcm = bcmPortOf(target);
+
+        if (bcm >= 0)
+        {
+            ports.push_back(bcm);
+        }
+    }
+    else if (ot == SAI_OBJECT_TYPE_LAG)
+    {
+        auto it = m_lagMembers.find(target);
+
+        if (it != m_lagMembers.end())
+        {
+            for (auto p: it->second)
+            {
+                int bcm = bcmPortOf(p);
+
+                if (bcm >= 0)
+                {
+                    ports.push_back(bcm);
+                }
+            }
+        }
+    }
+
+    for (int bcm: ports)
+    {
+        int rv = hwbcm_vlan_port_remove(vid, bcm);
+
+        if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+        {
+            SWSS_LOG_ERROR("hwbcm_vlan_port_remove(%d, %d) failed: %d", vid, bcm, rv);
+
+            return SAI_STATUS_FAILURE;
+        }
+
+        SWSS_LOG_NOTICE("vlan %d: bcm port %d removed", vid, bcm);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// FDB
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwCreateFdbEntry(
+        _In_ const std::string &serialized,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    sai_fdb_entry_t fdb;
+
+    sai_deserialize_fdb_entry(serialized, fdb);
+
+    auto *type = findAttr(attr_count, attr_list, SAI_FDB_ENTRY_ATTR_TYPE);
+
+    int isStatic = (type != NULL && type->value.s32 == SAI_FDB_ENTRY_TYPE_STATIC) ? 1 : 0;
+
+    auto *pa = findAttr(attr_count, attr_list, SAI_FDB_ENTRY_ATTR_PACKET_ACTION);
+
+    if (pa != NULL && pa->value.s32 != SAI_PACKET_ACTION_FORWARD)
+    {
+        SWSS_LOG_WARN("fdb %s packet action %d not supported on hardware, bookkeeping only",
+                serialized.c_str(), pa->value.s32);
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    auto *bp = findAttr(attr_count, attr_list, SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID);
+
+    if (bp == NULL || bp->value.oid == SAI_NULL_OBJECT_ID)
+    {
+        SWSS_LOG_WARN("fdb %s without BRIDGE_PORT_ID, bookkeeping only", serialized.c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // remote MAC behind a VXLAN tunnel bridge port: A4 owns that path
+
+    sai_attribute_t bpType;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bp->value.oid, SAI_BRIDGE_PORT_ATTR_TYPE, bpType) &&
+            bpType.value.s32 == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+    {
+        return hwFdbOnTunnel(fdb, bp->value.oid, true);
+    }
+
+    int vid = vidOf(fdb.bv_id);
+
+    if (vid < 0)
+    {
+        SWSS_LOG_WARN("fdb %s: bv_id %s is not a known VLAN, bookkeeping only",
+                serialized.c_str(), sai_serialize_object_id(fdb.bv_id).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (m_vidToVni.find(vid) != m_vidToVni.end())
+    {
+        // local MACs of a VNI-mapped VLAN live in the VFI key space, a plain
+        // L2 entry keyed by vid would not match (A4 finding)
+        SWSS_LOG_NOTICE("fdb %s: vlan %d is mapped to vni %u, static entry not programmed (bookkeeping only)",
+                serialized.c_str(), vid, m_vidToVni.at(vid));
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t target = bridgePortTarget(bp->value.oid);
+
+    sai_object_type_t ot = objectTypeQuery(target);
+
+    if (ot == SAI_OBJECT_TYPE_LAG)
+    {
+        int trunk = trunkOf(target);
+
+        if (trunk < 0)
+        {
+            SWSS_LOG_WARN("fdb %s: lag %s has no trunk, bookkeeping only",
+                    serialized.c_str(), sai_serialize_object_id(target).c_str());
+
+            return SAI_STATUS_SUCCESS;
+        }
+
+        int rv = hwbcm_l2_addr_add_trunk(fdb.mac_address, vid, trunk, isStatic);
+
+        if (rv < 0 && rv != HWBCM_E_EXISTS)
+        {
+            SWSS_LOG_ERROR("hwbcm_l2_addr_add_trunk(%s vid %d trunk %d) failed: %d",
+                    sai_serialize_mac(fdb.mac_address).c_str(), vid, trunk, rv);
+
+            return SAI_STATUS_FAILURE;
+        }
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (ot != SAI_OBJECT_TYPE_PORT)
+    {
+        SWSS_LOG_WARN("fdb %s on %s %s: only ports and lags supported, bookkeeping only",
+                serialized.c_str(),
+                sai_serialize_object_type(ot).c_str(),
+                sai_serialize_object_id(target).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int bcm = bcmPortOf(target);
+
+    if (bcm < 0)
+    {
+        SWSS_LOG_WARN("fdb %s: port %s not mapped to hardware, bookkeeping only",
+                serialized.c_str(), sai_serialize_object_id(target).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = hwbcm_l2_addr_add(fdb.mac_address, vid, bcm, isStatic);
+
+    if (rv < 0 && rv != HWBCM_E_EXISTS)
+    {
+        SWSS_LOG_ERROR("hwbcm_l2_addr_add(%s vid %d port %d) failed: %d",
+                sai_serialize_mac(fdb.mac_address).c_str(), vid, bcm, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveFdbEntry(
+        _In_ const std::string &serialized)
+{
+    SWSS_LOG_ENTER();
+
+    sai_fdb_entry_t fdb;
+
+    sai_deserialize_fdb_entry(serialized, fdb);
+
+    // the entry still exists in the hash (hw is removed before the base)
+
+    sai_attribute_t bp, bpType;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, serialized, SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID, bp) &&
+            bp.value.oid != SAI_NULL_OBJECT_ID &&
+            getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bp.value.oid, SAI_BRIDGE_PORT_ATTR_TYPE, bpType) &&
+            bpType.value.s32 == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+    {
+        return hwFdbOnTunnel(fdb, bp.value.oid, false);
+    }
+
+    int vid = vidOf(fdb.bv_id);
+
+    if (vid < 0)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (m_vidToVni.find(vid) != m_vidToVni.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = hwbcm_l2_addr_delete(fdb.mac_address, vid);
+
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+    {
+        SWSS_LOG_ERROR("l2 addr delete for %s failed: %d", serialized.c_str(), rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// LAG
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwCreateLag(
+        _In_ sai_object_id_t lag_id)
+{
+    SWSS_LOG_ENTER();
+
+    int trunk = -1;
+
+    int rv = hwbcm_trunk_create(&trunk);
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_trunk_create failed: %d", rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    m_lagToTrunk[lag_id] = trunk;
+    m_lagMembers[lag_id] = {};
+
+    SWSS_LOG_NOTICE("lag %s -> trunk %d", sai_serialize_object_id(lag_id).c_str(), trunk);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveLag(
+        _In_ sai_object_id_t lag_id)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_lagToTrunk.find(lag_id);
+
+    if (it == m_lagToTrunk.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int rv = hwbcm_trunk_destroy(it->second);
+
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+    {
+        SWSS_LOG_ERROR("hwbcm_trunk_destroy(%d) failed: %d", it->second, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    m_lagToTrunk.erase(it);
+    m_lagMembers.erase(lag_id);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::applyTrunkMembers(
+        _In_ sai_object_id_t lag_id)
+{
+    SWSS_LOG_ENTER();
+
+    int trunk = trunkOf(lag_id);
+
+    if (trunk < 0)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    std::vector<int> ports;
+
+    auto it = m_lagMembers.find(lag_id);
+
+    if (it != m_lagMembers.end())
+    {
+        for (auto p: it->second)
+        {
+            int bcm = bcmPortOf(p);
+
+            if (bcm >= 0)
+            {
+                ports.push_back(bcm);
+            }
+        }
+    }
+
+    int rv = hwbcm_trunk_member_set(trunk, ports.data(), (int)ports.size());
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_trunk_member_set(%d, %zu ports) failed: %d", trunk, ports.size(), rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwCreateLagMember(
+        _In_ sai_object_id_t member_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    auto *lag = findAttr(attr_count, attr_list, SAI_LAG_MEMBER_ATTR_LAG_ID);
+    auto *port = findAttr(attr_count, attr_list, SAI_LAG_MEMBER_ATTR_PORT_ID);
+
+    if (lag == NULL || port == NULL)
+    {
+        SWSS_LOG_ERROR("lag member %s without LAG_ID or PORT_ID", sai_serialize_object_id(member_id).c_str());
+
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    if (trunkOf(lag->value.oid) < 0)
+    {
+        SWSS_LOG_WARN("lag member %s: lag %s has no trunk, bookkeeping only",
+                sai_serialize_object_id(member_id).c_str(),
+                sai_serialize_object_id(lag->value.oid).c_str());
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    m_lagMembers[lag->value.oid].push_back(port->value.oid);
+    m_lagMemberInfo[member_id] = std::make_pair(lag->value.oid, port->value.oid);
+
+    sai_status_t status = applyTrunkMembers(lag->value.oid);
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        auto &members = m_lagMembers[lag->value.oid];
+
+        members.erase(std::remove(members.begin(), members.end(), port->value.oid), members.end());
+
+        m_lagMemberInfo.erase(member_id);
+
+        return status;
+    }
+
+    syncLagMemberPort(lag->value.oid, port->value.oid, true);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+void SwitchBCM56860HW::syncLagMemberPort(
+        _In_ sai_object_id_t lag_id,
+        _In_ sai_object_id_t port_oid,
+        _In_ bool add)
+{
+    SWSS_LOG_ENTER();
+
+    int bcm = bcmPortOf(port_oid);
+
+    if (bcm < 0)
+    {
+        return;
+    }
+
+    // VLAN memberships of the LAG (bridge port whose target is the LAG)
+
+    auto vmit = m_objectHash.find(SAI_OBJECT_TYPE_VLAN_MEMBER);
+
+    if (vmit != m_objectHash.end())
+    {
+        for (const auto &kvp: vmit->second)
+        {
+            sai_attribute_t vlan, bp, mode;
+
+            if (!getStoredAttr(SAI_OBJECT_TYPE_VLAN_MEMBER, kvp.first, SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID, bp) ||
+                    bridgePortTarget(bp.value.oid) != lag_id ||
+                    !getStoredAttr(SAI_OBJECT_TYPE_VLAN_MEMBER, kvp.first, SAI_VLAN_MEMBER_ATTR_VLAN_ID, vlan))
+            {
+                continue;
+            }
+
+            int vid = vidOf(vlan.value.oid);
+
+            if (vid < 0)
+            {
+                continue;
+            }
+
+            int tagged = 0;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_VLAN_MEMBER, kvp.first, SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE, mode) &&
+                    mode.value.s32 == SAI_VLAN_TAGGING_MODE_TAGGED)
+            {
+                tagged = 1;
+            }
+
+            int rv = add ? hwbcm_vlan_port_add(vid, bcm, tagged) : hwbcm_vlan_port_remove(vid, bcm);
+
+            if (rv < 0 && rv != HWBCM_E_EXISTS && rv != HWBCM_E_NOT_FOUND)
+            {
+                SWSS_LOG_WARN("lag %s member bcm port %d: vlan %d %s failed: %d",
+                        sai_serialize_object_id(lag_id).c_str(), bcm, vid, add ? "add" : "remove", rv);
+            }
+        }
+    }
+
+    // VLAN of a port-type RIF sitting on the LAG (A3 keeps m_rifToVid)
+
+    for (const auto &kvp: m_rifToVid)
+    {
+        sai_attribute_t rifPort;
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kvp.first, SAI_ROUTER_INTERFACE_ATTR_PORT_ID, rifPort) ||
+                rifPort.value.oid != lag_id)
+        {
+            continue;
+        }
+
+        int vid = kvp.second;
+
+        int rv;
+
+        if (add)
+        {
+            rv = hwbcm_vlan_port_add(vid, bcm, 0);
+
+            if (rv >= 0 || rv == HWBCM_E_EXISTS)
+            {
+                rv = hwbcm_port_pvid_set(bcm, vid);
+            }
+        }
+        else
+        {
+            rv = hwbcm_vlan_port_remove(vid, bcm);
+
+            if (rv >= 0 || rv == HWBCM_E_NOT_FOUND)
+            {
+                rv = hwbcm_port_pvid_set(bcm, DEFAULT_VLAN_NUMBER);
+            }
+        }
+
+        if (rv < 0 && rv != HWBCM_E_EXISTS && rv != HWBCM_E_NOT_FOUND)
+        {
+            SWSS_LOG_WARN("lag %s member bcm port %d: rif vlan %d %s failed: %d",
+                    sai_serialize_object_id(lag_id).c_str(), bcm, vid, add ? "add" : "remove", rv);
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("lag %s member bcm port %d: rif vlan %d %s",
+                    sai_serialize_object_id(lag_id).c_str(), bcm, vid, add ? "added" : "removed");
+        }
+    }
+}
+
+sai_status_t SwitchBCM56860HW::hwRemoveLagMember(
+        _In_ sai_object_id_t member_id)
+{
+    SWSS_LOG_ENTER();
+
+    auto it = m_lagMemberInfo.find(member_id);
+
+    if (it == m_lagMemberInfo.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t lag = it->second.first;
+    sai_object_id_t port = it->second.second;
+
+    m_lagMemberInfo.erase(it);
+
+    auto mit = m_lagMembers.find(lag);
+
+    if (mit != m_lagMembers.end())
+    {
+        auto &members = mit->second;
+
+        members.erase(std::remove(members.begin(), members.end(), port), members.end());
+    }
+
+    CHECK_STATUS(applyTrunkMembers(lag));
+
+    syncLagMemberPort(lag, port, false);
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::create(
+        _In_ sai_object_type_t object_type,
+        _In_ const std::string &serializedObjectId,
+        _In_ sai_object_id_t switch_id,
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(SwitchBCM56850::create(object_type, serializedObjectId, switch_id, attr_count, attr_list));
+
+    if (!m_hwReady)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+
+    auto info = sai_metadata_get_object_type_info(object_type);
+
+    if (info != NULL && info->isobjectid)
+    {
+        sai_deserialize_object_id(serializedObjectId, oid);
+    }
+
+    sai_status_t hw = SAI_STATUS_SUCCESS;
+
+    switch (object_type)
+    {
+        case SAI_OBJECT_TYPE_SWITCH:
+
+            for (uint32_t i = 0; i < attr_count && hw == SAI_STATUS_SUCCESS; i++)
+            {
+                hw = hwSetSwitch(&attr_list[i]);
+            }
+
+            // never roll back the switch
+            return SAI_STATUS_SUCCESS;
+
+        // core / L2 (A2)
+        case SAI_OBJECT_TYPE_PORT:            hw = hwCreatePort(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_HOSTIF:          hw = hwCreateHostif(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_HOSTIF_TRAP:     hw = hwCreateHostifTrap(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_VLAN:            hw = hwCreateVlan(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_VLAN_MEMBER:     hw = hwCreateVlanMember(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_FDB_ENTRY:       hw = hwCreateFdbEntry(serializedObjectId, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_LAG:             hw = hwCreateLag(oid); break;
+        case SAI_OBJECT_TYPE_LAG_MEMBER:      hw = hwCreateLagMember(oid, attr_count, attr_list); break;
+
+        // L3 (A3)
+        case SAI_OBJECT_TYPE_VIRTUAL_ROUTER:        hw = hwCreateVirtualRouter(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ROUTER_INTERFACE:      hw = hwCreateRouterInterface(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_NEIGHBOR_ENTRY:        hw = hwCreateNeighbor(serializedObjectId, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_NEXT_HOP:              hw = hwCreateNextHop(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_NEXT_HOP_GROUP:        hw = hwCreateNextHopGroup(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER: hw = hwCreateNextHopGroupMember(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ROUTE_ENTRY:           hw = hwCreateRoute(serializedObjectId, attr_count, attr_list); break;
+
+        // VXLAN / bridge (A4)
+        case SAI_OBJECT_TYPE_TUNNEL:                 hw = hwCreateTunnel(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_TUNNEL_MAP:             hw = hwCreateTunnelMap(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY:       hw = hwCreateTunnelMapEntry(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY: hw = hwCreateTunnelTermEntry(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_BRIDGE:                 hw = hwCreateBridge(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_BRIDGE_PORT:            hw = hwCreateBridgePort(oid, attr_count, attr_list); break;
+
+        default:
+
+            // virtual switch behaviour only
+            return SAI_STATUS_SUCCESS;
+    }
+
+    if (hw != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("hardware create of %s %s failed: %s, rolling back",
+                sai_serialize_object_type(object_type).c_str(),
+                serializedObjectId.c_str(),
+                sai_serialize_status(hw).c_str());
+
+        sai_status_t rb = SwitchBCM56850::remove(object_type, serializedObjectId);
+
+        if (rb != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("rollback remove of %s failed: %s",
+                    serializedObjectId.c_str(),
+                    sai_serialize_status(rb).c_str());
+        }
+
+        return hw;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::remove(
+        _In_ sai_object_type_t object_type,
+        _In_ const std::string &serializedObjectId)
+{
+    SWSS_LOG_ENTER();
+
+    if (m_hwReady)
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+
+        auto info = sai_metadata_get_object_type_info(object_type);
+
+        if (info != NULL && info->isobjectid)
+        {
+            sai_deserialize_object_id(serializedObjectId, oid);
+        }
+
+        sai_status_t hw = SAI_STATUS_SUCCESS;
+
+        switch (object_type)
+        {
+            // core / L2 (A2)
+            case SAI_OBJECT_TYPE_PORT:            hw = hwRemovePort(oid); break;
+            case SAI_OBJECT_TYPE_HOSTIF:          hw = hwRemoveHostif(oid); break;
+            case SAI_OBJECT_TYPE_VLAN:            hw = hwRemoveVlan(oid); break;
+            case SAI_OBJECT_TYPE_VLAN_MEMBER:     hw = hwRemoveVlanMember(oid); break;
+            case SAI_OBJECT_TYPE_FDB_ENTRY:       hw = hwRemoveFdbEntry(serializedObjectId); break;
+            case SAI_OBJECT_TYPE_LAG:             hw = hwRemoveLag(oid); break;
+            case SAI_OBJECT_TYPE_LAG_MEMBER:      hw = hwRemoveLagMember(oid); break;
+
+            // L3 (A3)
+            case SAI_OBJECT_TYPE_VIRTUAL_ROUTER:        hw = hwRemoveVirtualRouter(oid); break;
+            case SAI_OBJECT_TYPE_ROUTER_INTERFACE:      hw = hwRemoveRouterInterface(oid); break;
+            case SAI_OBJECT_TYPE_NEIGHBOR_ENTRY:        hw = hwRemoveNeighbor(serializedObjectId); break;
+            case SAI_OBJECT_TYPE_NEXT_HOP:              hw = hwRemoveNextHop(oid); break;
+            case SAI_OBJECT_TYPE_NEXT_HOP_GROUP:        hw = hwRemoveNextHopGroup(oid); break;
+            case SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER: hw = hwRemoveNextHopGroupMember(oid); break;
+            case SAI_OBJECT_TYPE_ROUTE_ENTRY:           hw = hwRemoveRoute(serializedObjectId); break;
+
+            // VXLAN / bridge (A4)
+            case SAI_OBJECT_TYPE_TUNNEL:                 hw = hwRemoveTunnel(oid); break;
+            case SAI_OBJECT_TYPE_TUNNEL_MAP:             hw = hwRemoveTunnelMap(oid); break;
+            case SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY:       hw = hwRemoveTunnelMapEntry(oid); break;
+            case SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY: hw = hwRemoveTunnelTermEntry(oid); break;
+            case SAI_OBJECT_TYPE_BRIDGE:                 hw = hwRemoveBridge(oid); break;
+            case SAI_OBJECT_TYPE_BRIDGE_PORT:            hw = hwRemoveBridgePort(oid); break;
+
+            default:
+                break;
+        }
+
+        if (hw != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("hardware remove of %s %s failed: %s",
+                    sai_serialize_object_type(object_type).c_str(),
+                    serializedObjectId.c_str(),
+                    sai_serialize_status(hw).c_str());
+
+            return hw;
+        }
+    }
+
+    return SwitchBCM56850::remove(object_type, serializedObjectId);
+}
+
+sai_status_t SwitchBCM56860HW::set(
+        _In_ sai_object_type_t objectType,
+        _In_ const std::string &serializedObjectId,
+        _In_ const sai_attribute_t* attr)
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(SwitchBCM56850::set(objectType, serializedObjectId, attr));
+
+    if (!m_hwReady || attr == NULL)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+
+    auto info = sai_metadata_get_object_type_info(objectType);
+
+    if (info != NULL && info->isobjectid)
+    {
+        sai_deserialize_object_id(serializedObjectId, oid);
+    }
+
+    sai_status_t hw = SAI_STATUS_SUCCESS;
+
+    switch (objectType)
+    {
+        case SAI_OBJECT_TYPE_SWITCH:           hw = hwSetSwitch(attr); break;
+        case SAI_OBJECT_TYPE_PORT:             hw = hwSetPort(oid, attr); break;
+        case SAI_OBJECT_TYPE_ROUTER_INTERFACE: hw = hwSetRouterInterface(oid, attr); break;
+        case SAI_OBJECT_TYPE_ROUTE_ENTRY:      hw = hwSetRoute(serializedObjectId, attr); break;
+
+        default:
+            break;
+    }
+
+    if (hw != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("hardware set of %s %s attr %d failed: %s (virtual state already updated)",
+                sai_serialize_object_type(objectType).c_str(),
+                serializedObjectId.c_str(),
+                attr->id,
+                sai_serialize_status(hw).c_str());
+
+        return hw;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
+bool SwitchBCM56860HW::getStoredAttr(
+        _In_ sai_object_type_t ot,
+        _In_ sai_object_id_t oid,
+        _In_ sai_attr_id_t attr_id,
+        _Out_ sai_attribute_t &attr)
+{
+    SWSS_LOG_ENTER();
+
+    return getStoredAttr(ot, sai_serialize_object_id(oid), attr_id, attr);
+}
+
+bool SwitchBCM56860HW::getStoredAttr(
+        _In_ sai_object_type_t ot,
+        _In_ const std::string &serialized,
+        _In_ sai_attr_id_t attr_id,
+        _Out_ sai_attribute_t &attr)
+{
+    SWSS_LOG_ENTER();
+
+    auto meta = sai_metadata_get_attr_metadata(ot, attr_id);
+
+    if (meta == NULL)
+    {
+        return false;
+    }
+
+    auto oit = m_objectHash.find(ot);
+
+    if (oit == m_objectHash.end())
+    {
+        return false;
+    }
+
+    auto it = oit->second.find(serialized);
+
+    if (it == oit->second.end())
+    {
+        return false;
+    }
+
+    auto ait = it->second.find(meta->attridname);
+
+    if (ait == it->second.end() || ait->second == nullptr)
+    {
+        return false;
+    }
+
+    // shallow copy: list pointers stay owned by the SaiAttrWrap in the hash
+    attr = *ait->second->getAttr();
+
+    return true;
+}
+
+int SwitchBCM56860HW::bcmPortOf(
+        _In_ sai_object_id_t port_oid) const
+{
+    std::lock_guard<std::mutex> lock(m_mapMutex);
+
+    auto it = m_portToBcm.find(port_oid);
+
+    return (it == m_portToBcm.end()) ? -1 : it->second;
+}
+
+sai_object_id_t SwitchBCM56860HW::portOidOf(
+        _In_ int bcm_port) const
+{
+    std::lock_guard<std::mutex> lock(m_mapMutex);
+
+    auto it = m_bcmToPort.find(bcm_port);
+
+    return (it == m_bcmToPort.end()) ? SAI_NULL_OBJECT_ID : it->second;
+}
+
+int SwitchBCM56860HW::vidOf(
+        _In_ sai_object_id_t vlan_oid)
+{
+    SWSS_LOG_ENTER();
+
+    if (vlan_oid == SAI_NULL_OBJECT_ID)
+    {
+        return -1;
+    }
+
+    sai_attribute_t attr;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_VLAN, vlan_oid, SAI_VLAN_ATTR_VLAN_ID, attr))
+    {
+        return -1;
+    }
+
+    return (int)attr.value.u16;
+}
+
+int SwitchBCM56860HW::trunkOf(
+        _In_ sai_object_id_t lag_oid) const
+{
+    auto it = m_lagToTrunk.find(lag_oid);
+
+    return (it == m_lagToTrunk.end()) ? -1 : it->second;
+}
+
+sai_object_id_t SwitchBCM56860HW::bridgePortTarget(
+        _In_ sai_object_id_t bridge_port_oid)
+{
+    SWSS_LOG_ENTER();
+
+    sai_attribute_t attr;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bridge_port_oid, SAI_BRIDGE_PORT_ATTR_PORT_ID, attr))
+    {
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    return attr.value.oid;
+}
+
+const sai_attribute_t *SwitchBCM56860HW::findAttr(
+        _In_ uint32_t attr_count,
+        _In_ const sai_attribute_t *attr_list,
+        _In_ sai_attr_id_t id)
+{
+    if (attr_list == NULL)
+    {
+        return NULL;
+    }
+
+    for (uint32_t i = 0; i < attr_count; i++)
+    {
+        if (attr_list[i].id == id)
+        {
+            return &attr_list[i];
+        }
+    }
+
+    return NULL;
+}

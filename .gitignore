@@ -1,0 +1,10 @@
+# build outputs and binaries (hundreds of MB, reproducible with deploy/build.sh / hwtest/build.sh)
+deploy/build/*.a
+deploy/build/*.so*
+deploy/build/*.sha256
+hwtest/hwtest
+*.o
+*.so
+*.b64
+__pycache__/
+.env

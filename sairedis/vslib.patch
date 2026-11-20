@@ -1,0 +1,166 @@
+diff --git a/vslib/Makefile.am b/vslib/Makefile.am
+index ca2e26d..2046b3d 100644
+--- a/vslib/Makefile.am
++++ b/vslib/Makefile.am
+@@ -53,6 +53,9 @@ libSaiVS_a_SOURCES = \
+ 					  SelectableFd.cpp \
+ 					  Signal.cpp \
+ 					  SwitchBCM56850.cpp \
++					  SwitchBCM56860HW.cpp \
++					  SwitchBCM56860HW_l3.cpp \
++					  SwitchBCM56860HW_vxlan.cpp \
+ 					  SwitchBCM56971B0.cpp \
+ 					  SwitchBCM81724.cpp \
+ 					  SwitchConfigContainer.cpp \
+@@ -70,7 +73,18 @@ libSaiVS_a_SOURCES = \
+ 					  TrafficForwarder.cpp \
+ 					  VirtualSwitchSaiInterface.cpp \
+ 					  VirtualSwitchSaiInterfaceFdb.cpp \
+-					  VirtualSwitchSaiInterfacePort.cpp
++					  VirtualSwitchSaiInterfacePort.cpp \
++					  hwbcm/hwbcm_core.c \
++					  hwbcm/hwbcm_l2.c \
++					  hwbcm/hwbcm_l3.c \
++					  hwbcm/hwbcm_vxlan.c
++
++# hwbcm/*.c wrap the OpenBCM SDK (BCM56860 hardware switch). They need the SDK
++# defines and include paths, kept in ../sai-td2p next to this tree (see
++# sai-td2p/DESIGN.md). The SDK static libraries are added at link time by the
++# deploy scripts (LIBS override), not here.
++SDK_CFLAGS = $(shell cat $(top_srcdir)/../sai-td2p/sdk_cflags.txt $(top_srcdir)/../sai-td2p/sdk_incs.txt 2>/dev/null)
++libSaiVS_a_CFLAGS = $(SDK_CFLAGS) -fPIC -I$(srcdir)/hwbcm
+ 
+ if USE_VPP
+ libSaiVS_a_SOURCES +=\
+diff --git a/vslib/Sai.cpp b/vslib/Sai.cpp
+index bc6694a..f173ef9 100644
+--- a/vslib/Sai.cpp
++++ b/vslib/Sai.cpp
+@@ -152,6 +152,31 @@ sai_status_t Sai::apiInitialize(
+ 
+     auto useTapDevice = SwitchConfig::parseBool(use_tap_dev);
+ 
++    // hardware switch: packets go through KNET netdevs, never through tap/veth
++
++    std::string initConfigFile;
++
++    if (switchType == SAI_VS_SWITCH_TYPE_BCM56860HW)
++    {
++        if (useTapDevice)
++        {
++            SWSS_LOG_WARN("%s is true but switch type is %s, forcing tap devices OFF",
++                    SAI_KEY_VS_HOSTIF_USE_TAP_DEVICE,
++                    SAI_VALUE_VS_SWITCH_TYPE_BCM56860HW);
++
++            useTapDevice = false;
++        }
++
++        const char *init_config_file = service_method_table->profile_get_value(0, SAI_KEY_INIT_CONFIG_FILE);
++
++        if (init_config_file != NULL)
++        {
++            initConfigFile = init_config_file;
++        }
++
++        SWSS_LOG_NOTICE("%s = '%s'", SAI_KEY_INIT_CONFIG_FILE, initConfigFile.c_str());
++    }
++
+     const char *bfd_offload_supported = service_method_table->profile_get_value(0, SAI_KEY_VS_BFD_OFFLOAD_SUPPORTED);
+     auto bfdOffloadSupported = SwitchConfig::parseBfdOffloadSupported(bfd_offload_supported);
+ 
+@@ -228,6 +253,7 @@ sai_status_t Sai::apiInitialize(
+         sc->m_bootType = bootType;
+         sc->m_useTapDevice = useTapDevice;
+         sc->m_useConfiguredSpeedAsOperSpeed = useConfiguredSpeedAsOperSpeed;
++        sc->m_initConfigFile = initConfigFile;
+         sc->m_laneMap = m_laneMapContainer->getLaneMap(sc->m_switchIndex);
+         sc->m_bfdOffload = bfdOffloadSupported;
+ 
+diff --git a/vslib/SwitchConfig.cpp b/vslib/SwitchConfig.cpp
+index 051aa0a..c2c442d 100644
+--- a/vslib/SwitchConfig.cpp
++++ b/vslib/SwitchConfig.cpp
+@@ -96,6 +96,10 @@ bool SwitchConfig::parseSwitchType(
+     {
+         switchType = SAI_VS_SWITCH_TYPE_VPP;
+     }
++    else if (st == SAI_VALUE_VS_SWITCH_TYPE_BCM56860HW)
++    {
++        switchType = SAI_VS_SWITCH_TYPE_BCM56860HW;
++    }
+     else
+     {
+         std::vector<std::string> vals {
+@@ -104,8 +108,9 @@ bool SwitchConfig::parseSwitchType(
+                 SAI_VALUE_VS_SWITCH_TYPE_BCM56971B0,
+                 SAI_VALUE_VS_SWITCH_TYPE_MLNX2700,
+                 SAI_VALUE_VS_SWITCH_TYPE_NVDA_MBF2H536C,
+-                SAI_VALUE_VS_SWITCH_TYPE_DPU_SIMU_2P
++                SAI_VALUE_VS_SWITCH_TYPE_DPU_SIMU_2P,
+                 SAI_VALUE_VS_SWITCH_TYPE_VPP,
++                SAI_VALUE_VS_SWITCH_TYPE_BCM56860HW,
+         };
+ 
+         SWSS_LOG_ERROR("unknown switch type: '%s', expected (%s)",
+diff --git a/vslib/SwitchConfig.h b/vslib/SwitchConfig.h
+index 409a6c3..70c2c0a 100644
+--- a/vslib/SwitchConfig.h
++++ b/vslib/SwitchConfig.h
+@@ -30,6 +30,8 @@ namespace saivs
+ 
+         SAI_VS_SWITCH_TYPE_VPP,
+ 
++        SAI_VS_SWITCH_TYPE_BCM56860HW,
++
+     } sai_vs_switch_type_t;
+ 
+     typedef enum _sai_vs_boot_type_t
+@@ -90,6 +92,12 @@ namespace saivs
+ 
+             bool m_useConfiguredSpeedAsOperSpeed;
+ 
++            /**
++             * @brief SAI_INIT_CONFIG_FILE from the profile (hardware switch
++             * types only, empty otherwise).
++             */
++            std::string m_initConfigFile;
++
+             std::shared_ptr<LaneMap> m_laneMap;
+ 
+             std::shared_ptr<LaneMap> m_fabricLaneMap;
+diff --git a/vslib/VirtualSwitchSaiInterface.cpp b/vslib/VirtualSwitchSaiInterface.cpp
+index a9baf70..df0da99 100644
+--- a/vslib/VirtualSwitchSaiInterface.cpp
++++ b/vslib/VirtualSwitchSaiInterface.cpp
+@@ -15,6 +15,7 @@
+ #include "SwitchBCM56971B0.h"
+ #include "SwitchMLNX2700.h"
+ #include "SwitchNvdaMBF2H536C.h"
++#include "SwitchBCM56860HW.h"
+ #ifdef USE_VPP
+ #include "SwitchVpp.h"
+ #endif
+@@ -604,6 +605,11 @@ std::shared_ptr<SwitchStateBase> VirtualSwitchSaiInterface::init_switch(
+             m_switchStateMap[switch_id] = std::make_shared<SwitchNvdaMBF2H536C>(switch_id, m_realObjectIdManager, config, warmBootState);
+             break;
+ 
++        case SAI_VS_SWITCH_TYPE_BCM56860HW:
++
++            m_switchStateMap[switch_id] = std::make_shared<SwitchBCM56860HW>(switch_id, m_realObjectIdManager, config, warmBootState);
++            break;
++
+         case SAI_VS_SWITCH_TYPE_VPP:
+ 
+ #ifdef USE_VPP
+diff --git a/vslib/saivs.h b/vslib/saivs.h
+index 0a62d3b..299b446 100644
+--- a/vslib/saivs.h
++++ b/vslib/saivs.h
+@@ -116,6 +116,7 @@ extern "C" {
+ #define SAI_VALUE_VS_SWITCH_TYPE_NVDA_MBF2H536C    "SAI_VS_SWITCH_TYPE_NVDA_MBF2H536C"
+ #define SAI_VALUE_VS_SWITCH_TYPE_DPU_SIMU_2P       "SAI_VS_SWITCH_TYPE_DPU_SIMU_2P"
+ #define SAI_VALUE_VS_SWITCH_TYPE_VPP               "SAI_VS_SWITCH_TYPE_VPP"
++#define SAI_VALUE_VS_SWITCH_TYPE_BCM56860HW        "SAI_VS_SWITCH_TYPE_BCM56860HW"
+ 
+ /*
+  * Values for SAI_KEY_BOOT_TYPE (defined in saiswitch.h)
