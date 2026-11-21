@@ -95,6 +95,10 @@ TD2+ 固有で必要だったこと(いずれも hwbcm_vxlan.c):
    既定(HWBCM_VXLAN_VP_EFILTER 0)では外側フレームはアンダーレイ VLAN の**タグ付き**で出る。
    対向が tagged で受ければ往復は成立(PC は enp2s0.100 に 10.1.0.2 を置いて確認)。ルーテッドポートのアンダーレイで
    使うには要解決。
+   試して効かなかったもの(2026-11-21 夕): (a) EGRESS のみの efilter → 変化なし、INGRESS|EGRESS → 出口落ち。
+   (b) VPN(VFI)側への VP 登録 → 受理されるが変化なし。(c) 出口 VLAN 変換 `bcm_vlan_translate_egress_action_add`
+   でポート 45 × VLAN 100 の外側タグ削除 → EGR_VLAN_XLATE に入るがトンネル出力には効かない、VP キーは Invalid port。
+   次に当たるべきは Broadcom SAI の sai_vxlan(DVP の untag を何で決めているか)と、TD2+ の EGR_DVP_ATTRIBUTE/VP グループの実装。
 5. **RDBGC0/RDROP はフラッディングで常に +1** — L3_IPMC 複製を使う VFI フラッディングでは L2 ビットマップが空になり
    RDROP が数えられる。異常ではない。
 
