@@ -423,9 +423,9 @@ static int hwbcm_shell_hw_cmd(const char *s)
             act.ot_outer = bcmVlanActionDelete;
             act.dt_outer = bcmVlanActionDelete;
             if (flags) {
-                rv = bcm_vlan_translate_egress_action_add(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_INVALID, &act);
+                rv = bcm_vlan_translate_egress_action_add(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_NONE, &act);
             } else {
-                rv = bcm_vlan_translate_egress_action_delete(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_INVALID);
+                rv = bcm_vlan_translate_egress_action_delete(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_NONE);
             }
             printf("hw: vxlan egrxlate class 0x%x vlan %d %s rv %d (%s)\n", vp, vlan, flags ? "delete-outer-tag" : "removed", rv, bcm_errmsg(rv));
             fflush(stdout);

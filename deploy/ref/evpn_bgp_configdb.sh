@@ -12,7 +12,7 @@ $R hset "BGP_NEIGHBOR|default|192.168.52.2" asn 65200 local_addr 192.168.52.1 na
 # FRR's ebgp-requires-policy has no frrcfgd knob: permit-all route maps on both AFs
 $R hset "ROUTE_MAP|ALLOW_ALL|10" route_operation permit
 for af in ipv4_unicast l2vpn_evpn; do
-  $R hset "BGP_NEIGHBOR_AF|default|192.168.52.2|$af" admin_status true route_map_in ALLOW_ALL route_map_out ALLOW_ALL
+  $R hset "BGP_NEIGHBOR_AF|default|192.168.52.2|$af" admin_status true "route_map_in@" ALLOW_ALL "route_map_out@" ALLOW_ALL
 done
 $R hset "DEVICE_METADATA|localhost" frr_mgmt_framework_config true
 sudo config save -y
