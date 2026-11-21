@@ -607,7 +607,7 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
             continue;
         }
 
-        SWSS_LOG_NOTICE("remote VTEP %s: underlay egress changed (%d -> %d), rebuilding network VP",
+        SWSS_LOG_NOTICE("remote VTEP %s: underlay egress %d is stale (resolved %d), rebuilding network VP",
                 vtep.ip.c_str(), vtep.srcEgr, l3);
 
         vxlanTearDownVtepVp(vtep);
