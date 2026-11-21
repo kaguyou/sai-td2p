@@ -161,6 +161,23 @@ index b7f4190..9be9fb1 100644
              void debugSetStats(
                      _In_ sai_object_id_t oid,
                      _In_ const std::map<sai_stat_id_t, uint64_t>& stats);
+diff --git a/vslib/SwitchStateBaseHostif.cpp b/vslib/SwitchStateBaseHostif.cpp
+index e86d30b..c6f7dc5 100644
+--- a/vslib/SwitchStateBaseHostif.cpp
++++ b/vslib/SwitchStateBaseHostif.cpp
+@@ -140,10 +140,11 @@ void SwitchStateBase::send_port_oper_status_notification(
+ {
+     SWSS_LOG_ENTER();
+ 
+-    sai_port_oper_status_notification_t data;
++    sai_port_oper_status_notification_t data = { };
+ 
+     data.port_id = portId;
+     data.port_state = status;
++    data.port_error_status = SAI_PORT_ERROR_STATUS_CLEAR; // was left uninitialised: enum warnings in syslog
+ 
+     auto meta = getMeta();
+ 
 diff --git a/vslib/VirtualSwitchSaiInterface.cpp b/vslib/VirtualSwitchSaiInterface.cpp
 index a9baf70..df0da99 100644
 --- a/vslib/VirtualSwitchSaiInterface.cpp

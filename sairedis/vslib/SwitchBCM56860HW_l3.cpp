@@ -1814,3 +1814,81 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
         hwVxlanRetryPending();
     }
 }
+
+void SwitchBCM56860HW::hwPuntNeighborsOnAge(
+        _In_ sai_object_id_t vlanOid,
+        _In_ const uint8_t mac[6])
+{
+    SWSS_LOG_ENTER();
+
+    /*
+     * Mirror of hwRefreshNeighborsOnLearn(): when a dynamic (vlan, mac) leaves
+     * the L2 table (ASIC age-out, or a flush on link down / VLAN member
+     * removal) every neighbor on that VLAN's RIF still pointing at the old
+     * port would keep forwarding into a port the host may no longer be behind.
+     * The Broadcom SAI falls back to punting in that case so the kernel re-ARPs
+     * and the reply re-learns the MAC (which then brings hwRefreshNeighborsOnLearn
+     * back in). Rewrite the egress in place (ids stay valid for host entries,
+     * next hops, routes and ECMP members) and let the remote VTEPs notice
+     * their underlay clone is stale.
+     */
+
+    if (!m_hwReady)
+    {
+        return;
+    }
+
+    bool changed = false;
+
+    for (auto &kv: m_neighborEgr)
+    {
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(kv.first, ne);
+
+        sai_attribute_t rifType, vlanAttr, macAttr, paAttr;
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
+                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
+                !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr) ||
+                vlanAttr.value.oid != vlanOid ||
+                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr) ||
+                !macEqual(macAttr.value.mac, mac))
+        {
+            continue;
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+                paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
+        {
+            continue; // a drop egress stays a drop egress
+        }
+
+        int intf = -1;
+
+        auto rit = m_rifToIntf.find(ne.rif_id);
+
+        if (rit != m_rifToIntf.end())
+        {
+            intf = rit->second;
+        }
+
+        int rv = hwbcm_l3_egress_cpu_replace(kv.second, intf);
+
+        if (rv < 0)
+        {
+            SWSS_LOG_ERROR("neighbor %s: egress %d punt after fdb age/flush failed: %d",
+                    kv.first.c_str(), kv.second, rv);
+            continue;
+        }
+
+        SWSS_LOG_NOTICE("neighbor %s: mac %s left the fdb, egress %d punts to cpu until re-learned",
+                kv.first.c_str(), sai_serialize_mac(mac).c_str(), kv.second);
+
+        changed = true;
+    }
+
+    if (changed)
+    {
+        hwVxlanRetryPending(); // a tunnel cloned from this egress is stale now -> pending
+    }
+}

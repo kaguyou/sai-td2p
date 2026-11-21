@@ -1161,6 +1161,9 @@ void SwitchBCM56860HW::onFdbAged(
 
     // the ASIC already dropped the entry: bookkeeping only, no HW delete
 
+    // neighbors resolved to this MAC go back to punting until it is re-learned
+    hwPuntNeighborsOnAge(data.fdb_entry.bv_id, mac);
+
     auto sid = sai_serialize_fdb_entry(data.fdb_entry);
 
     sai_status_t status = SwitchBCM56850::remove(SAI_OBJECT_TYPE_FDB_ENTRY, sid);
@@ -2679,6 +2682,47 @@ sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
     int port = -1;
     int trunk = -1;
     int rv = 0;
+
+    // Called before the local tables are cleared: walk the dynamic entries in
+    // scope and put the neighbors that resolve to them back on the punt path
+    // (the ASIC flush below does not raise per-entry age callbacks we could
+    // act on, and the local entry is gone by the time one would arrive).
+    {
+        auto fit = m_objectHash.find(SAI_OBJECT_TYPE_FDB_ENTRY);
+
+        if (fit != m_objectHash.end())
+        {
+            for (auto &kv: fit->second)
+            {
+                auto ty = kv.second.find("SAI_FDB_ENTRY_ATTR_TYPE");
+
+                if (ty != kv.second.end() && ty->second->getAttr()->value.s32 != SAI_FDB_ENTRY_TYPE_DYNAMIC)
+                {
+                    continue;
+                }
+
+                sai_fdb_entry_t fe;
+                sai_deserialize_fdb_entry(kv.first, fe);
+
+                if (bv != SAI_NULL_OBJECT_ID && fe.bv_id != bv)
+                {
+                    continue;
+                }
+
+                if (bp != SAI_NULL_OBJECT_ID)
+                {
+                    auto ebp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
+
+                    if (ebp == kv.second.end() || ebp->second->getAttr()->value.oid != bp)
+                    {
+                        continue;
+                    }
+                }
+
+                hwPuntNeighborsOnAge(fe.bv_id, fe.mac_address);
+            }
+        }
+    }
 
     if (bp != SAI_NULL_OBJECT_ID)
     {
