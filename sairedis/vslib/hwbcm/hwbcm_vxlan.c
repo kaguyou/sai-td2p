@@ -958,8 +958,14 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
                     }
                 }
             }
+            /* DO_NOT_ADD: we only want the (un)tagged state; the VP must not
+             * join VLAN 100's flood groups (and bcm_tr2_vlan_gport_add returns
+             * E_PARAM for a network VP otherwise: no resolvable physical port). */
             rv = bcm_vlan_gport_add(U, (bcm_vlan_t)uvid, vxp.vxlan_port_id,
-                                    untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0);
+                                    (untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0) |
+                                    BCM_VLAN_GPORT_ADD_UNKNOWN_UCAST_DO_NOT_ADD |
+                                    BCM_VLAN_GPORT_ADD_UNKNOWN_MCAST_DO_NOT_ADD |
+                                    BCM_VLAN_GPORT_ADD_BCAST_DO_NOT_ADD);
             if (rv == BCM_E_EXISTS) {
                 rv = BCM_E_NONE;
             }

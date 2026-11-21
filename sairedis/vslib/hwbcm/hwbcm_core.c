@@ -400,6 +400,21 @@ static int hwbcm_shell_hw_cmd(const char *s)
         fflush(stdout);
         return rv < 0 ? BCM_E_FAIL : 0;
     }
+    {
+        int vlan = 0, flags = 0;
+        if (sscanf(s, "vxlan vlanadd %i %i %i", &vlan, &vp, &flags) == 3) {
+            rv = bcm_vlan_gport_add(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp, flags);
+            printf("hw: vxlan vlanadd vlan %d vp 0x%x flags 0x%x rv %d (%s)\n", vlan, vp, flags, rv, bcm_errmsg(rv));
+            fflush(stdout);
+            return rv < 0 ? BCM_E_FAIL : 0;
+        }
+        if (sscanf(s, "vxlan vlandel %i %i", &vlan, &vp) == 2) {
+            rv = bcm_vlan_gport_delete(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp);
+            printf("hw: vxlan vlandel vlan %d vp 0x%x rv %d (%s)\n", vlan, vp, rv, bcm_errmsg(rv));
+            fflush(stdout);
+            return rv < 0 ? BCM_E_FAIL : 0;
+        }
+    }
     if (sscanf(s, "vxlan vpdel %i %i", &vpn, &vp) == 2) {
         rv = hwbcm_vxlan_port_delete(vpn, vp);
         printf("hw: vxlan vpdel vpn 0x%x vp 0x%x rv %d (%s)\n", vpn, vp, rv, bcm_errmsg(rv));
