@@ -99,6 +99,16 @@ TD2+ 固有で必要だったこと(いずれも hwbcm_vxlan.c):
    (b) VPN(VFI)側への VP 登録 → 受理されるが変化なし。(c) 出口 VLAN 変換 `bcm_vlan_translate_egress_action_add`
    でポート 45 × VLAN 100 の外側タグ削除 → EGR_VLAN_XLATE に入るがトンネル出力には効かない、VP キーは Invalid port。
    次に当たるべきは Broadcom SAI の sai_vxlan(DVP の untag を何で決めているか)と、TD2+ の EGR_DVP_ATTRIBUTE/VP グループの実装。
+   **2026-11-21 夜(DeepSeek、SDK ソース解析)**: TD2+ の egress filter は 1 ビットではなく 3 値で、
+   `src/bcm/esw/trident2plus/vlan.c` の `VP_FILTER_*` がそのまま `EGR_DVP_ATTRIBUTE.EN_EFILTER` に入る。
+   0 = off、1 = VP グループビットマップ(`EGR_VLAN.UT_VP_GRP_BITMAP`)、**2 = VP VLAN membership ハッシュ
+   (`EGR_VP_VLAN_MEMBERSHIP` の UNTAG)**。ビルド 11 が試したのは 1 で、VP が egress グループに
+   入っていないと落ちる。2 は `bcm_vlan_gport_add(..., VP_VLAN_MEMBERSHIP|UNTAGGED)` が作る
+   (vp, VLAN 100).UNTAG=1 をそのまま引くので、SDK が VXLAN VP 用に用意した正規の経路。
+   ただし **EN_EFILTER=2 はまだ実機で試していない**。ランタイムで試せる(ビルド不要):
+   `deploy/bsh "hw vxlan vpefilter 0x80000001 6"`(6 = EGRESS|VP_VLAN_MEMBERSHIP)。
+   コード側は `hwbcm_vxlan.c` の `HWBCM_VXLAN_VP_EFILTER` を 2 にすると、membership 登録後に
+   EN_EFILTER=2 を設定する(既定は安全のため 0 のまま)。
 5. **RDBGC0/RDROP はフラッディングで常に +1** — L3_IPMC 複製を使う VFI フラッディングでは L2 ビットマップが空になり
    RDROP が数えられる。異常ではない。
 
