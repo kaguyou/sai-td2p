@@ -414,6 +414,29 @@ static int hwbcm_shell_hw_cmd(const char *s)
             fflush(stdout);
             return rv < 0 ? BCM_E_FAIL : 0;
         }
+        if (sscanf(s, "vxlan egrxlate %i %i %i", &vp, &vlan, &flags) == 3) {
+            /* egress VLAN translation keyed by port class <vp> (physical port number
+             * or a VP gport) for outer VLAN <vlan>: flags 1 = delete the outer tag,
+             * 0 = remove the entry. */
+            bcm_vlan_action_set_t act;
+            bcm_vlan_action_set_t_init(&act);
+            act.ot_outer = bcmVlanActionDelete;
+            act.dt_outer = bcmVlanActionDelete;
+            if (flags) {
+                rv = bcm_vlan_translate_egress_action_add(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_INVALID, &act);
+            } else {
+                rv = bcm_vlan_translate_egress_action_delete(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_INVALID);
+            }
+            printf("hw: vxlan egrxlate class 0x%x vlan %d %s rv %d (%s)\n", vp, vlan, flags ? "delete-outer-tag" : "removed", rv, bcm_errmsg(rv));
+            fflush(stdout);
+            return rv < 0 ? BCM_E_FAIL : 0;
+        }
+        if (sscanf(s, "vxlan egrvt %i %i", &vp, &flags) == 2) {
+            rv = bcm_vlan_control_port_set(HWBCM_UNIT, vp, bcmVlanTranslateEgressEnable, flags ? 1 : 0);
+            printf("hw: vxlan egrvt port %d TranslateEgressEnable=%d rv %d (%s)\n", vp, flags ? 1 : 0, rv, bcm_errmsg(rv));
+            fflush(stdout);
+            return rv < 0 ? BCM_E_FAIL : 0;
+        }
         if (sscanf(s, "vxlan vlandel %i %i", &vlan, &vp) == 2) {
             rv = bcm_vlan_gport_delete(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp);
             printf("hw: vxlan vlandel vlan %d vp 0x%x rv %d (%s)\n", vlan, vp, rv, bcm_errmsg(rv));
