@@ -74,6 +74,9 @@
 #define HWBCM_VXLAN_ENTROPY 1
 /* Copy unknown-tunnel / unknown-VNI packets to the CPU: off in production. */
 #define HWBCM_VXLAN_MISS_TO_CPU 0
+/* Enable the egress VLAN membership check on network VPs (needed for the
+ * untagged outer frame on TD2+, but currently drops the copies). */
+#define HWBCM_VXLAN_VP_EFILTER 0
 /* Service TPID used for SD-tag mode on access/network VPs. */
 #define HWBCM_VXLAN_TPID 0x8100
 
@@ -965,11 +968,18 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
              * EGR_VLAN.UT_VP_GRP_BITMAP) only happens for a VP whose egress VLAN
              * membership check is enabled (EGR_DVP_ATTRIBUTE.EN_EFILTER), and
              * bcm_tr2_vlan_gport_add() wants VP_VLAN_MEMBERSHIP for a VXLAN VP. */
+#if HWBCM_VXLAN_VP_EFILTER
+            /* 2026-11-21: with EN_EFILTER=1 the untagged state is honoured but
+             * the copies are dropped at egress (TDBGC3 on the underlay port),
+             * so the DVP egress membership check needs more than the
+             * EGR_VP_VLAN_MEMBERSHIP (vp, vlan) entry. Off until understood;
+             * the outer frame then leaves TAGGED with the underlay VLAN. */
             rv = bcm_port_vlan_member_set(U, vxp.vxlan_port_id, BCM_PORT_VLAN_MEMBER_EGRESS);
             if (BCM_FAILURE(rv)) {
                 hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_port_vlan_member_set(vp 0x%x, EGRESS): %s",
                           vxp.vxlan_port_id, bcm_errmsg(rv));
             }
+#endif
             rv = bcm_vlan_gport_add(U, (bcm_vlan_t)uvid, vxp.vxlan_port_id,
                                     (untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0) |
                                     BCM_VLAN_GPORT_ADD_VP_VLAN_MEMBERSHIP |
