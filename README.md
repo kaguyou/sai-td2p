@@ -4,11 +4,11 @@ Broadcom 純正 SAI は BCM56864 (Trident2+) を一度も対応していない�
 sonic-sairedis の仮想スイッチ SAI (vslib = libsaivs) に実機クラスを足して、syncd が読む libsai.so.1 を置き換える** 路線。
 対象 NOS は SONiC 202505 (Debian 12)。
 
-状態 (2026-11-21 深夜): 実機で syncd / orchagent が自作 libsai で稼働。72 ポート、リンク反映、L2 学習、
-ルーテッド/VLAN の ping、FRR の BGP 経路の ASIC 投入、VXLAN/EVPN(VTEP・リモート MAC・カプセル化/復号)まで実機確認。
+状態 (2026-11-21 夜・ビルド 15): 実機で syncd / orchagent が自作 libsai (`fc335781…`) で稼働。72 ポート、リンク反映、L2 学習、
+ルーテッド/VLAN の ping、FRR の BGP 経路の ASIC 投入、VXLAN/EVPN(VTEP・リモート MAC・カプセル化/復号・外側 VLAN タグの untagged 化)まで実機確認済み。
 1 本のケーブルで ASIC のポート→ポート転送を試すため、未接続ポートの MAC ループバックをアクセス側ホストの代役にしている。
-残: 2 ポート転送/ECMP/VXLAN 往復の完走(2 本目のケーブル)、外側 VLAN タグの untagged 化、CPLD ドライバの probe 失敗、
-RTC なしの時計。日々の到達点は `notes/` の議事録(2026-11-21 17:05 の締め)を参照。
+残: 2 ポート転送/ECMP/VXLAN 往復の完走(2 本目のケーブル)、BUM 二重送信の整理、CPLD ドライバの probe 失敗、
+RTC なしの時計。日々の到達点は `notes/` の議事録を参照。
 
 ## 中身
 

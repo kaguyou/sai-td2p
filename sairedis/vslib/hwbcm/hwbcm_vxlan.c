@@ -75,21 +75,27 @@
 /* Copy unknown-tunnel / unknown-VNI packets to the CPU: off in production. */
 #define HWBCM_VXLAN_MISS_TO_CPU 0
 /* Egress VLAN membership check on network VPs (EGR_DVP_ATTRIBUTE.EN_EFILTER).
- * TD2+ has three modes (sdk: src/bcm/esw/trident2plus/vlan.c):
- *   0 = disabled: the outer frame keeps the underlay VLAN tag.
- *   1 = VP-group bitmap (VP_FILTER_VP_GRP_BMAP): the untagged state lives in
- *       EGR_VLAN.UT_VP_GRP_BITMAP.  Tried in build 11; the copies were dropped
- *       at egress (TDBGC3 on the underlay port), so the VP was not in the
- *       egress group the check looks at.
- *   2 = VP VLAN membership hash (VP_FILTER_HASH): the untagged state lives in
- *       EGR_VP_VLAN_MEMBERSHIP(vp, underlay vlan).UNTAG, which
- *       bcm_vlan_gport_add(..., VP_VLAN_MEMBERSHIP|UNTAGGED) already fills in.
- * Mode 2 is the SDK's designed path for VXLAN VPs.  Try it at runtime first
- * (the deployed build has the hook):
- *   bsh "hw vxlan vpefilter <vp> 6"     (EGRESS|VP_VLAN_MEMBERSHIP)
- * and only then build with -DHWBCM_VXLAN_VP_EFILTER=2. */
+ * TD2+ has four modes (sdk: src/bcm/esw/trident2plus/vlan.c, include/bcm/port.h):
+ *   0 = VP_FILTER_DISABLE (default): no VP egress filter, no physical-port
+ *       EGR_VLAN.UT_BITMAP check -> outer frame keeps the underlay VLAN tag.
+ *   1 = VP_FILTER_VP_GRP_BMAP (flags = EGRESS = 0x2): checks EGR_VLAN
+ *       UT_VP_GRP_BITMAP.  Build 11 dropped copies (TDBGC3) because the VP was
+ *       not in an egress VP group.
+ *   2 = VP_FILTER_HASH (flags = EGRESS|VP_VLAN_MEMBERSHIP = 0x6): looks up
+ *       EGR_VP_VLAN_MEMBERSHIP(vp, vlan) for SP_TREE and UNTAG.  Requires
+ *       BCM_VLAN_GPORT_ADD_STP_FORWARD (0x30) when adding the entry; earlier
+ *       builds omitted it so SP_TREE was 0 (DISABLED) and EN_EFILTER=2 dropped
+ *       at egress (TDBGC3).
+ *   3 = VP_DO_NOT_CHECK (flags = EGRESS|VP_DO_NOT_CHECK = 0x0a, or 0x0b with
+ *       INGRESS): "Do not perform a VFI membership check on VP, instead do a
+ *       VLAN check on physical port."  Uses the underlay physical port's
+ *       EGR_VLAN.UT_BITMAP directly (same method Broadcom's stock SAI uses in
+ *       mptnl_xgs_common_sipdip_tnl_add_nh with flags=0x0b).
+ * Try at runtime first (the deployed build already has the shell hook):
+ *   bsh "hw vxlan vpefilter <vp> 0x0a"
+ * and only then build with -DHWBCM_VXLAN_VP_EFILTER=3 (or 2). */
 #ifndef HWBCM_VXLAN_VP_EFILTER
-#define HWBCM_VXLAN_VP_EFILTER 0
+#define HWBCM_VXLAN_VP_EFILTER 3
 #endif
 /* Service TPID used for SD-tag mode on access/network VPs. */
 #define HWBCM_VXLAN_TPID 0x8100
@@ -935,13 +941,28 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
         return rv;
     }
 
-    /* Outer 802.1Q tag: on TD2+ a packet leaving through a DVP takes its
-     * untagged decision from the VLAN's VP-group bitmap (EGR_VLAN.UT_VP_GRP_BITMAP),
-     * not from the physical port's UT_BITMAP, so the encapsulated frames went
-     * out tagged on an untagged underlay port (PC dropped them as "otherhost",
-     * 2026-11-21). Make the VP a member of the underlay VLAN, untagged when the
-     * physical port is an untagged member of it. */
+    /* Outer 802.1Q tag handling on TD2+:
+     * Mode 3 (VP_DO_NOT_CHECK) delegates egress VLAN check and untagging to
+     * the underlay physical port's EGR_VLAN.UT_BITMAP, so no per-VP hash entry
+     * is needed.  Modes 0/1/2 register (vp, underlay vlan) in
+     * EGR_VP_VLAN_MEMBERSHIP with STP_FORWARD so mode 2 can also be tested at
+     * runtime without dropping on SP_TREE=0 (DISABLED). */
     s_vp[vp].uvid = -1;
+#if HWBCM_VXLAN_VP_EFILTER == 3
+    {
+        uint32 efl = BCM_PORT_VLAN_MEMBER_EGRESS | BCM_PORT_VLAN_MEMBER_VP_DO_NOT_CHECK;
+        rv = bcm_port_vlan_member_set(U, vxp.vxlan_port_id, efl);
+        if (BCM_FAILURE(rv)) {
+            hwbcm_log(HWBCM_LOG_WARN,
+                      "hwbcm_vxlan: bcm_port_vlan_member_set(vp 0x%x, flags 0x%x): %s",
+                      vxp.vxlan_port_id, efl, bcm_errmsg(rv));
+        } else {
+            hwbcm_log(HWBCM_LOG_INFO,
+                      "hwbcm_vxlan: network vp 0x%x egress filter mode 3 (VP_DO_NOT_CHECK) enabled",
+                      vxp.vxlan_port_id);
+        }
+    }
+#else
     {
         bcm_l3_intf_t intf;
         bcm_pbmp_t pbmp, ubmp;
@@ -977,13 +998,14 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
             }
             /* DO_NOT_ADD: we only want the (un)tagged state; the VP must not
              * join VLAN 100's flood groups (and bcm_tr2_vlan_gport_add returns
-             * E_PARAM for a network VP otherwise: no resolvable physical port). */
-            /* bcm_tr2_vlan_gport_add() with VP_VLAN_MEMBERSHIP creates the
-             * EGR_VP_VLAN_MEMBERSHIP(vp, underlay vlan) entry that carries the
-             * untagged state.  The egress check (EN_EFILTER) must be enabled
-             * only afterwards: with it on and no entry the packet is dropped. */
+             * E_PARAM for a network VP otherwise: no resolvable physical port).
+             * STP_FORWARD (0x30): bcm_td2_egr_vp_vlan_membership_add writes
+             * SP_TREE from flags & BCM_VLAN_GPORT_ADD_STP_MASK; omitting it
+             * leaves SP_TREE=0 (DISABLED) and drops egress packets under
+             * EN_EFILTER=2. */
             rv = bcm_vlan_gport_add(U, (bcm_vlan_t)uvid, vxp.vxlan_port_id,
                                     (untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0) |
+                                    BCM_VLAN_GPORT_ADD_STP_FORWARD |
                                     BCM_VLAN_GPORT_ADD_VP_VLAN_MEMBERSHIP |
                                     BCM_VLAN_GPORT_ADD_UNKNOWN_UCAST_DO_NOT_ADD |
                                     BCM_VLAN_GPORT_ADD_UNKNOWN_MCAST_DO_NOT_ADD |
@@ -996,12 +1018,11 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
                           uvid, vxp.vxlan_port_id, untagged ? "untagged" : "tagged", bcm_errmsg(rv));
             } else {
                 s_vp[vp].uvid = uvid;
-                hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x joined underlay vlan %d (%s)",
+                hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x joined underlay vlan %d (%s, STP_FORWARD)",
                           vxp.vxlan_port_id, uvid, untagged ? "untagged" : "tagged");
 #if HWBCM_VXLAN_VP_EFILTER
-                /* Now that (vp, vlan) exists, turn on the egress membership
-                 * check.  Mode 1 looks at the VP-group bitmap, mode 2 at the
-                 * (vp, vlan) hash entry created just above. */
+                /* Now that (vp, vlan) exists with SP_TREE=3, turn on the egress
+                 * membership check (mode 1 = VP-group bitmap, mode 2 = hash). */
                 {
                     uint32 efl = BCM_PORT_VLAN_MEMBER_EGRESS;
 #if HWBCM_VXLAN_VP_EFILTER == 2
@@ -1022,6 +1043,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
             }
         }
     }
+#endif
 
     /* Only the multicast VP joins the flood groups: a unicast-view VP in the
      * group floods the inner frame unencapsulated onto the underlay port. */

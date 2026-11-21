@@ -89,26 +89,22 @@ TD2+ 固有で必要だったこと(いずれも hwbcm_vxlan.c):
 3. **BUM は別 VP** — 複製コピーは L3MC ビューのネクストホップ(DVP 付き)でないとトンネルに入らない。
    VTEP ごとに `BCM_L3_IPMC|BCM_L3_VXLAN_ONLY` の出口 + `BCM_VXLAN_PORT_MULTICAST` の VP(vpMc)を作り、
    フラッディンググループにはそれだけを入れる(SDK 例 acc_to_net_mc.c)。ユニキャスト VP を入れると内側フレームが素で出る。
-4. **外側 VLAN タグ(未解決)** — DVP 経由で出るパケットの untagged 判定は物理ポートの UT_BITMAP ではなく
-   VP 側(EGR_VP_VLAN_MEMBERSHIP / VP グループ)。`bcm_vlan_gport_add(underlay_vlan, vp, UNTAGGED|VP_VLAN_MEMBERSHIP|DO_NOT_ADD×3)`
-   で登録はできるが、判定を効かせるには DVP の EN_EFILTER=1 が要り、すると今度は出口で捨てられる(TDBGC3)。
-   既定(HWBCM_VXLAN_VP_EFILTER 0)では外側フレームはアンダーレイ VLAN の**タグ付き**で出る。
-   対向が tagged で受ければ往復は成立(PC は enp2s0.100 に 10.1.0.2 を置いて確認)。ルーテッドポートのアンダーレイで
-   使うには要解決。
-   試して効かなかったもの(2026-11-21 夕): (a) EGRESS のみの efilter → 変化なし、INGRESS|EGRESS → 出口落ち。
-   (b) VPN(VFI)側への VP 登録 → 受理されるが変化なし。(c) 出口 VLAN 変換 `bcm_vlan_translate_egress_action_add`
-   でポート 45 × VLAN 100 の外側タグ削除 → EGR_VLAN_XLATE に入るがトンネル出力には効かない、VP キーは Invalid port。
-   次に当たるべきは Broadcom SAI の sai_vxlan(DVP の untag を何で決めているか)と、TD2+ の EGR_DVP_ATTRIBUTE/VP グループの実装。
-   **2026-11-21 夜(DeepSeek、SDK ソース解析)**: TD2+ の egress filter は 1 ビットではなく 3 値で、
-   `src/bcm/esw/trident2plus/vlan.c` の `VP_FILTER_*` がそのまま `EGR_DVP_ATTRIBUTE.EN_EFILTER` に入る。
-   0 = off、1 = VP グループビットマップ(`EGR_VLAN.UT_VP_GRP_BITMAP`)、**2 = VP VLAN membership ハッシュ
-   (`EGR_VP_VLAN_MEMBERSHIP` の UNTAG)**。ビルド 11 が試したのは 1 で、VP が egress グループに
-   入っていないと落ちる。2 は `bcm_vlan_gport_add(..., VP_VLAN_MEMBERSHIP|UNTAGGED)` が作る
-   (vp, VLAN 100).UNTAG=1 をそのまま引くので、SDK が VXLAN VP 用に用意した正規の経路。
-   ただし **EN_EFILTER=2 はまだ実機で試していない**。ランタイムで試せる(ビルド不要):
-   `deploy/bsh "hw vxlan vpefilter 0x80000001 6"`(6 = EGRESS|VP_VLAN_MEMBERSHIP)。
-   コード側は `hwbcm_vxlan.c` の `HWBCM_VXLAN_VP_EFILTER` を 2 にすると、membership 登録後に
-   EN_EFILTER=2 を設定する(既定は安全のため 0 のまま)。
+4. **外側 VLAN タグ(解決済 — ビルド 15)** — DVP 経由で出るパケットの untagged 判定は、既定(`EN_EFILTER=0`)では
+   物理ポートの `EGR_VLAN.UT_BITMAP` を見ないため外側フレームがアンダーレイ VLAN のタグ付きで出ていた。
+   TD2+ の `EGR_DVP_ATTRIBUTE.VXLAN__EN_EFILTER`(2 bit)は 0/1/2/3 の **4 値**(`src/bcm/esw/trident2plus/vlan.c`、`include/bcm/port.h`):
+   - `0` (`VP_FILTER_DISABLE`): フィルタ無効、物理ポート `EGR_VLAN.UT_BITMAP` も見ずタグ付きのまま出る。
+   - `1` (`VP_FILTER_VP_GRP_BMAP`, flags=`0x2`): VP グループビットマップ。ビルド 11 で出口落ち(`TDBGC3`)。
+   - `2` (`VP_FILTER_HASH`, flags=`0x6`=`EGRESS|VP_VLAN_MEMBERSHIP`): `EGR_VP_VLAN_MEMBERSHIP(vp, vlan)` を参照。
+     15:50 の試験で `TDBGC3` 落ちしたのは `bcm_vlan_gport_add()` に `BCM_VLAN_GPORT_ADD_STP_FORWARD`(0x30) が抜けていて
+     `SP_TREE=0`(DISABLED) で登録されていたため。
+   - **`3` (`VP_DO_NOT_CHECK`, flags=`0x0a`=`EGRESS|VP_DO_NOT_CHECK` または `0x0b`=`INGRESS|EGRESS|VP_DO_NOT_CHECK`)**:
+     `include/bcm/port.h`: *"Do not perform a VFI membership check on VP, instead do a VLAN check on physical port."*
+     VP チェックをスキップして**物理ポートの通常の `EGR_VLAN.UT_BITMAP` で untagged 判定する**。
+     純正 Broadcom SAI(`libsai.so.1.0` 7.1.73.4)の `mptnl_xgs_common_sipdip_tnl_add_nh` も VXLAN ネットワーク VP に
+     `bcm_port_vlan_member_set(0, vp, 0x0b)` を呼んでいることを逆アセンブルで確認した。
+   → **`hwbcm_vxlan.c` で `HWBCM_VXLAN_VP_EFILTER=3` (`0x0a`) を既定化(ビルド 15、sha256 `fc335781…`、実機配備・検証済)**。
+   実機でユニキャスト・BUM ともに `TVLN.ge0=+0`、`TDBGC3.ge0=+0`、PC `enp2s0.100` RX `+0`、`enp2s0` `otherhost=+0`、
+   `vxlan2000` / `vhost0` 到達を確認。`EGR_VP_VLAN_MEMBERSHIP` ハッシュも消費しない。
 5. **RDBGC0/RDROP はフラッディングで常に +1** — L3_IPMC 複製を使う VFI フラッディングでは L2 ビットマップが空になり
    RDROP が数えられる。異常ではない。
 
