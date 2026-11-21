@@ -348,6 +348,8 @@ namespace saivs
                 int egr = -1;                              /* VXLAN-only L3 egress toward the VTEP */
                 int srcEgr = -1;                           /* A3 egress/ecmp id the clone was made from */
                 int vp = -1;                               /* network VP gport (bit 31 set: never test its sign) */
+                int egrMc = -1;                            /* IPMC VXLAN egress for the BUM copy */
+                int vpMc = -1;                             /* multicast network VP (the one in the flood groups) */
                 bool vpReady = false;                      /* true once vp holds a live network VP */
                 int vpVpn = -1;                            /* VPN the VP was created in */
                 int port = -1;                             /* underlay bcm port (-1 = trunk) */

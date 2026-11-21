@@ -382,10 +382,43 @@ static pthread_mutex_t g_shell_lock = PTHREAD_MUTEX_INITIALIZER;
 #define HWBCM_SHELL_CMD_MAX 4096
 
 /* Caller holds g_shell_lock. */
+/* "hw ..." lines are hwbcm-level test hooks, not SDK diag commands.
+ *   hw vxlan cpuaccess <vpn> <vid>   add the CPU port as an access VP of <vpn> for
+ *                                    VLAN <vid> (one-cable VXLAN test: a KNET
+ *                                    TX_CPU_INGRESS netif for <vid> then lands in
+ *                                    the VFI and floods to the network VPs)
+ *   hw vxlan vpdel <vpn> <vp>        remove a VP created above
+ * Output goes to stdout (the shell socket dups it to the client). */
+static int hwbcm_shell_hw_cmd(const char *s)
+{
+    int vpn = 0, vid = 0, vp = 0, rv;
+
+    if (sscanf(s, "vxlan cpuaccess %i %i", &vpn, &vid) == 2) {
+        rv = hwbcm_vxlan_access_port_add2(vpn, 0 /* cpu0 */, -1, vid, 1, &vp);
+        printf("hw: vxlan cpuaccess vpn 0x%x vid %d -> vp 0x%x rv %d (%s)\n",
+               vpn, vid, vp, rv, bcm_errmsg(rv));
+        fflush(stdout);
+        return rv < 0 ? BCM_E_FAIL : 0;
+    }
+    if (sscanf(s, "vxlan vpdel %i %i", &vpn, &vp) == 2) {
+        rv = hwbcm_vxlan_port_delete(vpn, vp);
+        printf("hw: vxlan vpdel vpn 0x%x vp 0x%x rv %d (%s)\n", vpn, vp, rv, bcm_errmsg(rv));
+        fflush(stdout);
+        return rv < 0 ? BCM_E_FAIL : 0;
+    }
+    printf("hw: unknown command \"%s\"\n", s);
+    fflush(stdout);
+    return BCM_E_PARAM;
+}
+
 static int hwbcm_shell_cmd(const char *cmd)
 {
     char buf[HWBCM_SHELL_CMD_MAX];
     cmd_result_t cr;
+
+    if (strncmp(cmd, "hw ", 3) == 0) {
+        return hwbcm_shell_hw_cmd(cmd + 3);
+    }
 
     sal_strncpy(buf, cmd, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';

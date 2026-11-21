@@ -229,6 +229,10 @@ int hwbcm_vxlan_tunnel_destroy(int tunnel_init_id, int tunnel_term_id);
 /* Network-side virtual port (remote VTEP in a VPN). Returns vp_id (gport). */
 int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term_id,
                                  int l3_egr_id, int *vp_id);
+/* Multicast (BUM) network VP toward the same VTEP: takes an egress made by
+ * hwbcm_vxlan_egress_from_l3_mc() and is the VP that joins the flood groups. */
+int hwbcm_vxlan_network_port_add_mc(int vpn_id, int tunnel_init_id, int tunnel_term_id,
+                                    int ipmc_egr_id, int *vp_id);
 /* Access-side virtual port (local VLAN/port into the VPN). */
 int hwbcm_vxlan_access_port_add(int vpn_id, int port, int vid, int *vp_id);
 int hwbcm_vxlan_port_delete(int vpn_id, int vp_id);
@@ -304,6 +308,8 @@ int hwbcm_vxlan_egress_create(int intf_id, const uint8_t dst_mac[6], int port, i
 /* Clone an existing unicast egress (or the first member of an ECMP group) into
  * a VXLAN-only egress. *port receives the local bcm port (-1 for a trunk/CPU). */
 int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *port);
+/* Same, with BCM_L3_IPMC: the egress for the BUM (flood) copy. */
+int hwbcm_vxlan_egress_from_l3_mc(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *port);
 int hwbcm_vxlan_egress_destroy(int egr_id);
 /* Compare a VXLAN-only clone with its source egress (A3 rewrites egresses in
  * place when a neighbor goes away / comes back). *stale = 1 when the source

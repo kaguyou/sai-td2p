@@ -610,7 +610,7 @@ int hwbcm_vxlan_egress_is_stale(int l3_egr_or_ecmp_id, int vxlan_egr_id, int *st
     return BCM_E_NONE;
 }
 
-int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *port)
+static int hwbcm_vxlan_egress_from_l3_impl(int l3_egr_or_ecmp_id, int ipmc, int *vxlan_egr_id, int *port)
 {
     bcm_l3_egress_t src;
     bcm_l3_egress_t egr;
@@ -637,7 +637,11 @@ int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *po
     }
 
     bcm_l3_egress_t_init(&egr);
-    egr.flags = BCM_L3_VXLAN_ONLY;
+    /* BCM_L3_IPMC: egress object for the BUM (flood) copy. The SDK then writes
+     * the EGR_L3_NEXT_HOP in L3MC view with the DVP, which is the only way a
+     * replicated copy gets VXLAN-encapsulated (a unicast-view NH in the flood
+     * group sends the inner frame out raw -- seen 2026-11-21). */
+    egr.flags = BCM_L3_VXLAN_ONLY | (ipmc ? BCM_L3_IPMC : 0);
     egr.intf = src.intf;
     memcpy(egr.mac_addr, src.mac_addr, 6);
     egr.vlan = src.vlan;
@@ -648,18 +652,29 @@ int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *po
         egr.module = src.module;
     }
 
-    rv = bcm_l3_egress_create(U, 0, &egr, &id);
-    HWBCM_CHECK(rv, "bcm_l3_egress_create(BCM_L3_VXLAN_ONLY clone)");
+    rv = bcm_l3_egress_create(U, ipmc ? BCM_L3_IPMC : 0, &egr, &id);
+    HWBCM_CHECK(rv, ipmc ? "bcm_l3_egress_create(BCM_L3_VXLAN_ONLY|BCM_L3_IPMC clone)"
+                         : "bcm_l3_egress_create(BCM_L3_VXLAN_ONLY clone)");
 
     *vxlan_egr_id = (int)id;
     if (port != NULL) {
         *port = (src.flags & BCM_L3_TGID) ? -1 : hwbcm_vxlan_port_of_gport(src.port);
     }
     hwbcm_log(HWBCM_LOG_INFO,
-              "hwbcm_vxlan: vxlan egress %d cloned from %d (intf %d, mac %02x:%02x:%02x:%02x:%02x:%02x, port 0x%x)",
-              id, l3_egr_or_ecmp_id, src.intf, src.mac_addr[0], src.mac_addr[1], src.mac_addr[2],
+              "hwbcm_vxlan: vxlan %segress %d cloned from %d (intf %d, mac %02x:%02x:%02x:%02x:%02x:%02x, port 0x%x)",
+              ipmc ? "ipmc " : "", id, l3_egr_or_ecmp_id, src.intf, src.mac_addr[0], src.mac_addr[1], src.mac_addr[2],
               src.mac_addr[3], src.mac_addr[4], src.mac_addr[5], src.port);
     return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_egress_from_l3(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *port)
+{
+    return hwbcm_vxlan_egress_from_l3_impl(l3_egr_or_ecmp_id, 0, vxlan_egr_id, port);
+}
+
+int hwbcm_vxlan_egress_from_l3_mc(int l3_egr_or_ecmp_id, int *vxlan_egr_id, int *port)
+{
+    return hwbcm_vxlan_egress_from_l3_impl(l3_egr_or_ecmp_id, 1, vxlan_egr_id, port);
 }
 
 int hwbcm_vxlan_egress_destroy(int egr_id)
@@ -712,6 +727,52 @@ static int hwbcm_vxlan_access_port_prepare(int port)
 /* ------------------------------------------------------------------------ */
 /* flood groups                                                             */
 /* ------------------------------------------------------------------------ */
+
+/* TD2+ (soc_feature_vlan_vfi_membership): the VLAN_XLATE/SVP entries the SDK
+ * writes have DISABLE_VLAN_CHECKS=0, so every packet switched inside a VFI is
+ * checked against the VFI's ING/EGR_VLAN_VFI_MEMBERSHIP profile. A fresh VPN
+ * points at profile 0 (no ports) and all VFI traffic dies with "port bitmap
+ * zero" (RDROP) -- seen 2026-11-21 on the one-cable loopback test. The physical
+ * port behind each VP has to be made a member with bcm_vlan_gport_add(vpn, ..). */
+static int hwbcm_vxlan_vfi_member_count(int vpn_id, int port_gport, int skip_vp)
+{
+    int i, n = 0;
+
+    for (i = 0; i < HWBCM_VXLAN_MAX_VP; i++) {
+        if (i == skip_vp || !s_vp[i].in_use) {
+            continue;
+        }
+        if (s_vp[i].vpn_id == vpn_id && s_vp[i].port_gport == port_gport) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int hwbcm_vxlan_vfi_member_set(int vpn_id, int port_gport, int add)
+{
+    int rv;
+
+    if (add) {
+        rv = bcm_vlan_gport_add(U, (bcm_vlan_t)vpn_id, (bcm_gport_t)port_gport, 0);
+        if (rv == BCM_E_EXISTS) {
+            rv = BCM_E_NONE;
+        }
+    } else {
+        rv = bcm_vlan_gport_delete(U, (bcm_vlan_t)vpn_id, (bcm_gport_t)port_gport);
+        if (rv == BCM_E_NOT_FOUND) {
+            rv = BCM_E_NONE;
+        }
+    }
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_ERR, "hwbcm_vxlan: bcm_vlan_gport_%s(vpn 0x%x, gport 0x%x): %s",
+                  add ? "add" : "delete", vpn_id, port_gport, bcm_errmsg(rv));
+        return rv;
+    }
+    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: gport 0x%x %s VFI membership of vpn 0x%x",
+              port_gport, add ? "added to" : "removed from", vpn_id);
+    return BCM_E_NONE;
+}
 
 int hwbcm_vxlan_vpn_flood_set(int vpn_id, int vp_id, int add)
 {
@@ -776,8 +837,8 @@ int hwbcm_vxlan_vpn_flood_set(int vpn_id, int vp_id, int add)
 /* virtual ports                                                            */
 /* ------------------------------------------------------------------------ */
 
-int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term_id,
-                                 int l3_egr_id, int *vp_id)
+static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int tunnel_term_id,
+                                             int l3_egr_id, int mc, int *vp_id)
 {
     bcm_vxlan_port_t vxp;
     bcm_l3_egress_t egr;
@@ -816,8 +877,15 @@ int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term
 
     bcm_vxlan_port_t_init(&vxp);
     vxp.flags = BCM_VXLAN_PORT_NETWORK | BCM_VXLAN_PORT_EGRESS_TUNNEL | BCM_VXLAN_PORT_SERVICE_TAGGED;
+    if (mc) {
+        /* BUM copy toward this VTEP: separate VP with an IPMC egress (SDK example
+         * acc_to_net_mc.c: MULTICAST flag, MATCH_NONE, same tunnel ids). */
+        vxp.flags |= BCM_VXLAN_PORT_MULTICAST;
+        vxp.criteria = BCM_VXLAN_PORT_MATCH_NONE;
+    } else {
+        vxp.criteria = BCM_VXLAN_PORT_MATCH_VN_ID;
+    }
     vxp.match_port = gport;
-    vxp.criteria = BCM_VXLAN_PORT_MATCH_VN_ID;
     vxp.egress_if = (bcm_if_t)l3_egr_id;
     vxp.egress_tunnel_id = (bcm_gport_t)tunnel_init_id;
     vxp.match_tunnel_id = (bcm_gport_t)tunnel_term_id;
@@ -841,7 +909,16 @@ int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term
     s_vp[vp].intf_vid = -1;
     s_vp[vp].vpn_id = vpn_id;
 
-    rv = hwbcm_vxlan_vpn_flood_set(vpn_id, (int)vxp.vxlan_port_id, 1);
+    rv = hwbcm_vxlan_vfi_member_set(vpn_id, (int)gport, 1);
+    if (BCM_FAILURE(rv)) {
+        (void)bcm_vxlan_port_delete(U, (bcm_vpn_t)vpn_id, vxp.vxlan_port_id);
+        memset(&s_vp[vp], 0, sizeof(s_vp[vp]));
+        return rv;
+    }
+
+    /* Only the multicast VP joins the flood groups: a unicast-view VP in the
+     * group floods the inner frame unencapsulated onto the underlay port. */
+    rv = mc ? hwbcm_vxlan_vpn_flood_set(vpn_id, (int)vxp.vxlan_port_id, 1) : BCM_E_NONE;
     if (BCM_FAILURE(rv)) {
         (void)bcm_vxlan_port_delete(U, (bcm_vpn_t)vpn_id, vxp.vxlan_port_id);
         memset(&s_vp[vp], 0, sizeof(s_vp[vp]));
@@ -901,6 +978,18 @@ static void hwbcm_vxlan_acc_intf_put(int vid)
     }
 }
 
+int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term_id,
+                                 int l3_egr_id, int *vp_id)
+{
+    return hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, l3_egr_id, 0, vp_id);
+}
+
+int hwbcm_vxlan_network_port_add_mc(int vpn_id, int tunnel_init_id, int tunnel_term_id,
+                                    int ipmc_egr_id, int *vp_id)
+{
+    return hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, ipmc_egr_id, 1, vp_id);
+}
+
 int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, int tagged, int *vp_id)
 {
     bcm_vxlan_port_t vxp;
@@ -943,15 +1032,21 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
     }
 
     bcm_vxlan_port_t_init(&vxp);
-    vxp.flags = BCM_VXLAN_PORT_SERVICE_TAGGED;
     if (tagged) {
-        vxp.flags |= BCM_VXLAN_PORT_SERVICE_VLAN_ADD;
+        /* tagged member: (port, vid) -> VP through VLAN_XLATE, SD-tag on egress */
+        vxp.flags = BCM_VXLAN_PORT_SERVICE_TAGGED | BCM_VXLAN_PORT_SERVICE_VLAN_ADD;
         vxp.egress_service_vlan = (bcm_vlan_t)vid;
+        vxp.egress_service_tpid = HWBCM_VXLAN_TPID;
+        vxp.criteria = BCM_VXLAN_PORT_MATCH_PORT_VLAN;
+        vxp.match_vlan = (bcm_vlan_t)vid;
+    } else {
+        /* untagged member: the VLAN_XLATE OVID key does not match untagged
+         * frames (they stayed in the plain VLAN, 2026-11-21), so bind the whole
+         * port to the VP the way the SDK does for untagged access ports
+         * (SOURCE_TRUNK_MAP SVP + untagged tag-action profile), egress untagged. */
+        vxp.criteria = BCM_VXLAN_PORT_MATCH_PORT;
     }
-    vxp.egress_service_tpid = HWBCM_VXLAN_TPID;
-    vxp.criteria = BCM_VXLAN_PORT_MATCH_PORT_VLAN;
     vxp.match_port = gport;
-    vxp.match_vlan = (bcm_vlan_t)vid;
     vxp.egress_if = (bcm_if_t)egr_id;
 
     rv = bcm_vxlan_port_add(U, (bcm_vpn_t)vpn_id, &vxp);
@@ -978,6 +1073,12 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
     s_vp[vp].egr_id = egr_id;
     s_vp[vp].intf_vid = vid;
     s_vp[vp].vpn_id = vpn_id;
+
+    rv = hwbcm_vxlan_vfi_member_set(vpn_id, (int)gport, 1);
+    if (BCM_FAILURE(rv)) {
+        (void)hwbcm_vxlan_port_delete(vpn_id, (int)vxp.vxlan_port_id);
+        return rv;
+    }
 
     rv = hwbcm_vxlan_vpn_flood_set(vpn_id, (int)vxp.vxlan_port_id, 1);
     if (BCM_FAILURE(rv)) {
@@ -1016,6 +1117,11 @@ int hwbcm_vxlan_port_delete(int vpn_id, int vp_id)
             hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: flood removal of vp 0x%x from vpn 0x%x: %s",
                       vp_id, s_vp[vp].vpn_id, bcm_errmsg(rv));
         }
+    }
+
+    if (s_vp[vp].in_use && s_vp[vp].vpn_id >= 0 &&
+        hwbcm_vxlan_vfi_member_count(s_vp[vp].vpn_id, s_vp[vp].port_gport, vp) == 0) {
+        (void)hwbcm_vxlan_vfi_member_set(s_vp[vp].vpn_id, s_vp[vp].port_gport, 0);
     }
 
     rv = bcm_vxlan_port_delete(U, vpn, (bcm_gport_t)vp_id);

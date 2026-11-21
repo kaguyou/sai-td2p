@@ -241,17 +241,17 @@ void SwitchBCM56860HW::vxlanAddVtepToVpn(
 {
     SWSS_LOG_ENTER();
 
-    if (!vtep.vpReady || vtep.floodVpns.count(vpn))
+    if (!vtep.vpReady || vtep.vpMc == -1 || vtep.floodVpns.count(vpn))
     {
         return;
     }
 
-    int rc = hwbcm_vxlan_vpn_flood_set(vpn, vtep.vp, 1);
+    int rc = hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 1);
 
     if (rc < 0)
     {
-        SWSS_LOG_ERROR("adding network vp 0x%x of %s to flood group of vpn 0x%x failed: %d",
-                vtep.vp, vtep.ip.c_str(), vpn, rc);
+        SWSS_LOG_ERROR("adding multicast network vp 0x%x of %s to flood group of vpn 0x%x failed: %d",
+                vtep.vpMc, vtep.ip.c_str(), vpn, rc);
 
         return;
     }
@@ -377,7 +377,38 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
     vtep.vpReady = true;
     vtep.vpVpn = vpn;
     vtep.floodVpns.clear();
-    vtep.floodVpns.insert(vpn);
+
+    // BUM copies: a second network VP with an IPMC egress is what goes into the
+    // flood groups (TD2+ replication only encapsulates through an L3MC-view
+    // next hop; the unicast VP above would flood the inner frame raw).
+    {
+        int egrMc = -1;
+        int vpMc = -1;
+        int mrc = hwbcm_vxlan_egress_from_l3_mc(vtep.srcEgr, &egrMc, NULL);
+        if (mrc == 0)
+        {
+            mrc = hwbcm_vxlan_network_port_add_mc(vpn, vtep.tunnelInit, vtep.tunnelTerm, egrMc, &vpMc);
+        }
+        if (mrc < 0)
+        {
+            SWSS_LOG_ERROR("remote VTEP %s: multicast network VP creation failed: %d (no BUM toward it)",
+                    vtep.ip.c_str(), mrc);
+            if (egrMc > 0)
+            {
+                hwbcm_vxlan_egress_destroy(egrMc);
+            }
+            egrMc = -1;
+            vpMc = -1;
+        }
+        else
+        {
+            vtep.floodVpns.insert(vpn);
+            SWSS_LOG_NOTICE("remote VTEP %s: multicast network vp 0x%x (ipmc egress %d) in flood group of vpn 0x%x",
+                    vtep.ip.c_str(), vpMc, egrMc, vpn);
+        }
+        vtep.egrMc = egrMc;
+        vtep.vpMc = vpMc;
+    }
 
     for (const auto &kv: m_vniToVpn)
     {
@@ -472,12 +503,26 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
             }
         }
 
-        for (int vpn: vtep.floodVpns)
+        if (vtep.vpMc != -1)
         {
-            if (vpn != vtep.vpVpn)
+            for (int vpn: vtep.floodVpns)
             {
-                hwbcm_vxlan_vpn_flood_set(vpn, vtep.vp, 0);
+                if (vpn != vtep.vpVpn)
+                {
+                    hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+                }
             }
+            int mrc = hwbcm_vxlan_port_delete(vtep.vpVpn, vtep.vpMc);
+            if (mrc < 0)
+            {
+                SWSS_LOG_WARN("remote VTEP %s: multicast network vp 0x%x delete: %d", vtep.ip.c_str(), vtep.vpMc, mrc);
+            }
+            vtep.vpMc = -1;
+        }
+        if (vtep.egrMc > 0)
+        {
+            hwbcm_vxlan_egress_destroy(vtep.egrMc);
+            vtep.egrMc = -1;
         }
 
         int rc = hwbcm_vxlan_port_delete(vtep.vpVpn, vtep.vp);
@@ -1345,7 +1390,10 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
         }
         else if (vtep.floodVpns.count(vpn))
         {
-            hwbcm_vxlan_vpn_flood_set(vpn, vtep.vp, 0);
+            if (vtep.vpMc != -1)
+            {
+                hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+            }
             vtep.floodVpns.erase(vpn);
         }
     }
