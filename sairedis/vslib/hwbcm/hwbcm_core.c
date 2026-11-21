@@ -408,6 +408,12 @@ static int hwbcm_shell_hw_cmd(const char *s)
             fflush(stdout);
             return rv < 0 ? BCM_E_FAIL : 0;
         }
+        if (sscanf(s, "vxlan vpefilter %i %i", &vp, &flags) == 2) {
+            rv = bcm_port_vlan_member_set(HWBCM_UNIT, (bcm_gport_t)vp, (uint32)flags);
+            printf("hw: vxlan vpefilter vp 0x%x flags 0x%x rv %d (%s)\n", vp, flags, rv, bcm_errmsg(rv));
+            fflush(stdout);
+            return rv < 0 ? BCM_E_FAIL : 0;
+        }
         if (sscanf(s, "vxlan vlandel %i %i", &vlan, &vp) == 2) {
             rv = bcm_vlan_gport_delete(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp);
             printf("hw: vxlan vlandel vlan %d vp 0x%x rv %d (%s)\n", vlan, vp, rv, bcm_errmsg(rv));

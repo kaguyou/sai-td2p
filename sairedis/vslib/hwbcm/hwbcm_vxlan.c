@@ -961,8 +961,18 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
             /* DO_NOT_ADD: we only want the (un)tagged state; the VP must not
              * join VLAN 100's flood groups (and bcm_tr2_vlan_gport_add returns
              * E_PARAM for a network VP otherwise: no resolvable physical port). */
+            /* The egress VP-group move (which carries the untagged state into
+             * EGR_VLAN.UT_VP_GRP_BITMAP) only happens for a VP whose egress VLAN
+             * membership check is enabled (EGR_DVP_ATTRIBUTE.EN_EFILTER), and
+             * bcm_tr2_vlan_gport_add() wants VP_VLAN_MEMBERSHIP for a VXLAN VP. */
+            rv = bcm_port_vlan_member_set(U, vxp.vxlan_port_id, BCM_PORT_VLAN_MEMBER_EGRESS);
+            if (BCM_FAILURE(rv)) {
+                hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_port_vlan_member_set(vp 0x%x, EGRESS): %s",
+                          vxp.vxlan_port_id, bcm_errmsg(rv));
+            }
             rv = bcm_vlan_gport_add(U, (bcm_vlan_t)uvid, vxp.vxlan_port_id,
                                     (untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0) |
+                                    BCM_VLAN_GPORT_ADD_VP_VLAN_MEMBERSHIP |
                                     BCM_VLAN_GPORT_ADD_UNKNOWN_UCAST_DO_NOT_ADD |
                                     BCM_VLAN_GPORT_ADD_UNKNOWN_MCAST_DO_NOT_ADD |
                                     BCM_VLAN_GPORT_ADD_BCAST_DO_NOT_ADD);
