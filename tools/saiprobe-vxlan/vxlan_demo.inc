@@ -118,6 +118,13 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
         sai_route_entry_t re; memset(&re, 0, sizeof re);
         re.switch_id = g_switch; re.vr_id = vr;
         re.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
+        re.destination.addr.ip4 = 0; re.destination.mask.ip4 = 0;
+        n = 0; memset(at, 0, sizeof at);
+        at[n].id = SAI_ROUTE_ENTRY_ATTR_PACKET_ACTION; at[n++].value.s32 = SAI_PACKET_ACTION_DROP;
+        VX_CALL("create_route_entry 0.0.0.0/0 drop (ALPM wants it first)", routeapi->create_route_entry(&re, n, at));
+        memset(&re, 0, sizeof re);
+        re.switch_id = g_switch; re.vr_id = vr;
+        re.destination.addr_family = SAI_IP_ADDR_FAMILY_IPV4;
         re.destination.addr.ip4 = inet_addr("10.1.0.2"); re.destination.mask.ip4 = inet_addr("255.255.255.255");
         n = 0; memset(at, 0, sizeof at);
         at[n].id = SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID; at[n++].value.oid = nh;
@@ -143,27 +150,14 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_TUNNEL_MAP_ATTR_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VLAN_ID_TO_VNI;
     VX_CALL("create_tunnel_map VLAN_ID_TO_VNI", tunapi->create_tunnel_map(&map_enc, g_switch, n, at));
-    n = 0; memset(at, 0, sizeof at);
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP; at[n++].value.oid = map_dec;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY; at[n++].value.u32 = 2000;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE; at[n++].value.u16 = 200;
-    VX_CALL("create_tunnel_map_entry 2000 -> vlan 200", tunapi->create_tunnel_map_entry(&me_dec, g_switch, n, at));
-    n = 0; memset(at, 0, sizeof at);
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VLAN_ID_TO_VNI;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP; at[n++].value.oid = map_enc;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_KEY; at[n++].value.u16 = 200;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_VALUE; at[n++].value.u32 = 2000;
-    VX_CALL("create_tunnel_map_entry vlan 200 -> 2000", tunapi->create_tunnel_map_entry(&me_enc, g_switch, n, at));
-
     /* ---- P2MP tunnel (decap side) + termination for our VTEP IP */
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_TUNNEL_ATTR_TYPE; at[n++].value.s32 = SAI_TUNNEL_TYPE_VXLAN;
     at[n].id = SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE; at[n++].value.oid = riflo;
-    at[n].id = SAI_TUNNEL_ATTR_PEER_MODE; at[n++].value.s32 = SAI_TUNNEL_PEER_MODE_P2MP;
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.1");
     at[n].id = SAI_TUNNEL_ATTR_DECAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_dec;
     at[n].id = SAI_TUNNEL_ATTR_ENCAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_enc;
+    at[n].id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.1");
+    at[n].id = SAI_TUNNEL_ATTR_PEER_MODE; at[n++].value.s32 = SAI_TUNNEL_PEER_MODE_P2MP;
     VX_CALL("create_tunnel P2MP (decap)", tunapi->create_tunnel(&tun_p2mp, g_switch, n, at));
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_VR_ID; at[n++].value.oid = vr;
@@ -173,15 +167,24 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
     at[n].id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_ACTION_TUNNEL_ID; at[n++].value.oid = tun_p2mp;
     VX_CALL("create_tunnel_term_table_entry 10.1.0.1", tunapi->create_tunnel_term_table_entry(&term, g_switch, n, at));
 
+    /* ---- decap map entry AFTER the tunnel (Broadcom SAI: "create tunnel before creating tunnel map entry");
+     * SONiC creates only the VNI_TO_VLAN_ID entry for an L2 VNI */
+    n = 0; memset(at, 0, sizeof at);
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP; at[n++].value.oid = map_dec;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY; at[n++].value.u32 = 2000;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE; at[n++].value.u16 = 200;
+    VX_CALL("create_tunnel_map_entry 2000 -> vlan 200", tunapi->create_tunnel_map_entry(&me_dec, g_switch, n, at));
+
     /* ---- P2P tunnel toward the remote VTEP + tunnel bridge port in VLAN 200 */
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_TUNNEL_ATTR_TYPE; at[n++].value.s32 = SAI_TUNNEL_TYPE_VXLAN;
     at[n].id = SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE; at[n++].value.oid = riflo;
-    at[n].id = SAI_TUNNEL_ATTR_PEER_MODE; at[n++].value.s32 = SAI_TUNNEL_PEER_MODE_P2P;
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.1");
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_DST_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
     at[n].id = SAI_TUNNEL_ATTR_DECAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_dec;
     at[n].id = SAI_TUNNEL_ATTR_ENCAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_enc;
+    at[n].id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.1");
+    at[n].id = SAI_TUNNEL_ATTR_PEER_MODE; at[n++].value.s32 = SAI_TUNNEL_PEER_MODE_P2P;
+    at[n].id = SAI_TUNNEL_ATTR_ENCAP_DST_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
     VX_CALL("create_tunnel P2P -> 10.1.0.2", tunapi->create_tunnel(&tun_p2p, g_switch, n, at));
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_BRIDGE_PORT_ATTR_TYPE; at[n++].value.s32 = SAI_BRIDGE_PORT_TYPE_TUNNEL;
