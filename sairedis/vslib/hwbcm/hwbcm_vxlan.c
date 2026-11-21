@@ -61,6 +61,7 @@
 #include <bcm/vlan.h>
 #include <bcm/l2.h>
 #include <bcm/l3.h>
+#include <bcm/trunk.h>
 #include <bcm/tunnel.h>
 #include <bcm/multicast.h>
 #include <bcm/vxlan.h>
@@ -86,6 +87,7 @@ typedef struct {
     int egr_id;         /* VXLAN-only egress owned by this VP (access only) */
     int intf_vid;       /* access: VLAN whose shared L3 intf we reference, else -1 */
     int vpn_id;         /* VPN the VP was created in */
+    int uvid;           /* network: underlay VLAN the VP was made a (un)tagged member of, else -1 */
 } hwbcm_vxlan_vp_t;
 
 static hwbcm_vxlan_vp_t s_vp[HWBCM_VXLAN_MAX_VP];
@@ -916,6 +918,62 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
         return rv;
     }
 
+    /* Outer 802.1Q tag: on TD2+ a packet leaving through a DVP takes its
+     * untagged decision from the VLAN's VP-group bitmap (EGR_VLAN.UT_VP_GRP_BITMAP),
+     * not from the physical port's UT_BITMAP, so the encapsulated frames went
+     * out tagged on an untagged underlay port (PC dropped them as "otherhost",
+     * 2026-11-21). Make the VP a member of the underlay VLAN, untagged when the
+     * physical port is an untagged member of it. */
+    s_vp[vp].uvid = -1;
+    {
+        bcm_l3_intf_t intf;
+        bcm_pbmp_t pbmp, ubmp;
+        int untagged = 0;
+        int uvid = -1;
+
+        bcm_l3_intf_t_init(&intf);
+        intf.l3a_intf_id = egr.intf;
+        if (BCM_SUCCESS(bcm_l3_intf_get(U, &intf)) && intf.l3a_vid > 0 && intf.l3a_vid <= BCM_VLAN_MAX) {
+            uvid = intf.l3a_vid;
+        }
+        if (uvid > 0) {
+            BCM_PBMP_CLEAR(pbmp);
+            BCM_PBMP_CLEAR(ubmp);
+            if (BCM_SUCCESS(bcm_vlan_port_get(U, (bcm_vlan_t)uvid, &pbmp, &ubmp))) {
+                if (port >= 0) {
+                    untagged = BCM_PBMP_MEMBER(ubmp, port) ? 1 : 0;
+                } else {
+                    /* trunk: untagged if every member is */
+                    bcm_trunk_member_t members[16];
+                    bcm_trunk_info_t tinfo;
+                    int n = 0, i;
+                    if (BCM_SUCCESS(bcm_trunk_get(U, egr.trunk, &tinfo, 16, members, &n)) && n > 0) {
+                        untagged = 1;
+                        for (i = 0; i < n; i++) {
+                            bcm_port_t mp = BCM_GPORT_LOCAL_GET(members[i].gport);
+                            if (!BCM_PBMP_MEMBER(ubmp, mp)) {
+                                untagged = 0;
+                            }
+                        }
+                    }
+                }
+            }
+            rv = bcm_vlan_gport_add(U, (bcm_vlan_t)uvid, vxp.vxlan_port_id,
+                                    untagged ? BCM_VLAN_GPORT_ADD_UNTAGGED : 0);
+            if (rv == BCM_E_EXISTS) {
+                rv = BCM_E_NONE;
+            }
+            if (BCM_FAILURE(rv)) {
+                hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_vlan_gport_add(vlan %d, vp 0x%x, %s): %s (outer tag may be wrong)",
+                          uvid, vxp.vxlan_port_id, untagged ? "untagged" : "tagged", bcm_errmsg(rv));
+            } else {
+                s_vp[vp].uvid = uvid;
+                hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x joined underlay vlan %d (%s)",
+                          vxp.vxlan_port_id, uvid, untagged ? "untagged" : "tagged");
+            }
+        }
+    }
+
     /* Only the multicast VP joins the flood groups: a unicast-view VP in the
      * group floods the inner frame unencapsulated onto the underlay port. */
     rv = mc ? hwbcm_vxlan_vpn_flood_set(vpn_id, (int)vxp.vxlan_port_id, 1) : BCM_E_NONE;
@@ -1069,6 +1127,7 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
     memset(&s_vp[vp], 0, sizeof(s_vp[vp]));
     s_vp[vp].in_use = 1;
     s_vp[vp].is_network = 0;
+    s_vp[vp].uvid = -1;
     s_vp[vp].port_gport = (int)gport;
     s_vp[vp].egr_id = egr_id;
     s_vp[vp].intf_vid = vid;
@@ -1122,6 +1181,13 @@ int hwbcm_vxlan_port_delete(int vpn_id, int vp_id)
     if (s_vp[vp].in_use && s_vp[vp].vpn_id >= 0 &&
         hwbcm_vxlan_vfi_member_count(s_vp[vp].vpn_id, s_vp[vp].port_gport, vp) == 0) {
         (void)hwbcm_vxlan_vfi_member_set(s_vp[vp].vpn_id, s_vp[vp].port_gport, 0);
+    }
+    if (s_vp[vp].in_use && s_vp[vp].is_network && s_vp[vp].uvid > 0) {
+        int r = bcm_vlan_gport_delete(U, (bcm_vlan_t)s_vp[vp].uvid, (bcm_gport_t)vp_id);
+        if (BCM_FAILURE(r) && r != BCM_E_NOT_FOUND) {
+            hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_vlan_gport_delete(vlan %d, vp 0x%x): %s",
+                      s_vp[vp].uvid, vp_id, bcm_errmsg(r));
+        }
     }
 
     rv = bcm_vxlan_port_delete(U, vpn, (bcm_gport_t)vp_id);
