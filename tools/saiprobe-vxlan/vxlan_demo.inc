@@ -176,30 +176,46 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
     at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE; at[n++].value.u16 = 200;
     VX_CALL("create_tunnel_map_entry 2000 -> vlan 200", tunapi->create_tunnel_map_entry(&me_dec, g_switch, n, at));
 
-    /* ---- P2P tunnel toward the remote VTEP + tunnel bridge port in VLAN 200 */
-    n = 0; memset(at, 0, sizeof at);
-    at[n].id = SAI_TUNNEL_ATTR_TYPE; at[n++].value.s32 = SAI_TUNNEL_TYPE_VXLAN;
-    at[n].id = SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE; at[n++].value.oid = riflo;
-    at[n].id = SAI_TUNNEL_ATTR_DECAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_dec;
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_MAPPERS; at[n].value.objlist.count = 1; at[n++].value.objlist.list = &map_enc;
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_SRC_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.1");
-    at[n].id = SAI_TUNNEL_ATTR_PEER_MODE; at[n++].value.s32 = SAI_TUNNEL_PEER_MODE_P2P;
-    at[n].id = SAI_TUNNEL_ATTR_ENCAP_DST_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
-    VX_CALL("create_tunnel P2P -> 10.1.0.2", tunapi->create_tunnel(&tun_p2p, g_switch, n, at));
+    /* ---- Broadcom SAI 7.1 has no P2P (DIP) tunnels: SONiC's EvpnRemoteVnip2mpOrch model instead.
+     * tunnel bridge port on the P2MP tunnel, VLAN 200 member, L2MC flood group with the remote VTEP as an
+     * endpoint member (BUM), and the remote MAC as an FDB entry with ENDPOINT_IP (unicast). */
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_BRIDGE_PORT_ATTR_TYPE; at[n++].value.s32 = SAI_BRIDGE_PORT_TYPE_TUNNEL;
-    at[n].id = SAI_BRIDGE_PORT_ATTR_TUNNEL_ID; at[n++].value.oid = tun_p2p;
+    at[n].id = SAI_BRIDGE_PORT_ATTR_TUNNEL_ID; at[n++].value.oid = tun_p2mp;
     at[n].id = SAI_BRIDGE_PORT_ATTR_BRIDGE_ID; at[n++].value.oid = br1q;
     at[n].id = SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE; at[n++].value.s32 = SAI_BRIDGE_PORT_FDB_LEARNING_MODE_DISABLE;
     at[n].id = SAI_BRIDGE_PORT_ATTR_ADMIN_STATE; at[n++].value.booldata = true;
-    VX_CALL("create_bridge_port TUNNEL", bridgeapi->create_bridge_port(&bp_tun, g_switch, n, at));
+    VX_CALL("create_bridge_port TUNNEL (p2mp)", bridgeapi->create_bridge_port(&bp_tun, g_switch, n, at));
     n = 0; memset(at, 0, sizeof at);
     at[n].id = SAI_VLAN_MEMBER_ATTR_VLAN_ID; at[n++].value.oid = vlan200;
     at[n].id = SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID; at[n++].value.oid = bp_tun;
     at[n].id = SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE; at[n++].value.s32 = SAI_VLAN_TAGGING_MODE_UNTAGGED;
     VX_CALL("create_vlan_member 200 <- tunnel bridge port", vlanapi->create_vlan_member(&vm_tun, g_switch, n, at));
-
-    /* ---- remote MAC (EVPN type-2) on the tunnel bridge port */
+    {
+        sai_l2mc_group_api_t *l2mcapi = NULL; sai_object_id_t grp = 0, mem = 0;
+        VX_CALL("api_query L2MC_GROUP", sai_api_query(SAI_API_L2MC_GROUP, (void **)&l2mcapi));
+        if (l2mcapi) {
+            VX_CALL("create_l2mc_group (flood group vlan 200)", l2mcapi->create_l2mc_group(&grp, g_switch, 0, NULL));
+            n = 0; memset(at, 0, sizeof at);
+            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID; at[n++].value.oid = grp;
+            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID; at[n++].value.oid = bp_tun;
+            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_ENDPOINT_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
+            VX_CALL("create_l2mc_group_member tunnel bp + endpoint 10.1.0.2", l2mcapi->create_l2mc_group_member(&mem, g_switch, n, at));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_UNICAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
+            VX_CALL("set vlan 200 UUC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_UNICAST_FLOOD_GROUP; g.value.oid = grp;
+            VX_CALL("set vlan 200 UUC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_BROADCAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
+            VX_CALL("set vlan 200 BC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_BROADCAST_FLOOD_GROUP; g.value.oid = grp;
+            VX_CALL("set vlan 200 BC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
+            VX_CALL("set vlan 200 UMC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
+            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_GROUP; g.value.oid = grp;
+            VX_CALL("set vlan 200 UMC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
+        }
+    }
+    /* ---- remote MAC (EVPN type-2): FDB on the tunnel bridge port with the remote VTEP as endpoint */
     {
         sai_fdb_entry_t fe; memset(&fe, 0, sizeof fe);
         fe.switch_id = g_switch; fe.bv_id = vlan200; memcpy(fe.mac_address, fakemac, 6);
@@ -208,10 +224,10 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
         at[n].id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID; at[n++].value.oid = bp_tun;
         at[n].id = SAI_FDB_ENTRY_ATTR_ENDPOINT_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
         at[n].id = SAI_FDB_ENTRY_ATTR_PACKET_ACTION; at[n++].value.s32 = SAI_PACKET_ACTION_FORWARD;
-        VX_CALL("create_fdb_entry 00:aa:bb:cc:dd:01 -> tunnel", fdbapi->create_fdb_entry(&fe, n, at));
+        VX_CALL("create_fdb_entry 00:aa:bb:cc:dd:01 -> tunnel/10.1.0.2", fdbapi->create_fdb_entry(&fe, n, at));
     }
-    say("  vxlan demo objects: vlan100 0x%llx rif100 0x%llx riflo 0x%llx nh 0x%llx vlan200 0x%llx tun_p2mp 0x%llx tun_p2p 0x%llx bp_tun 0x%llx term 0x%llx",
-        OID(vlan100), OID(rif100), OID(riflo), OID(nh), OID(vlan200), OID(tun_p2mp), OID(tun_p2p), OID(bp_tun), OID(term));
-    (void)vm100; (void)vm200; (void)vm_tun; (void)me_dec; (void)me_enc;
+    say("  vxlan demo objects: vlan100 0x%llx rif100 0x%llx riflo 0x%llx nh 0x%llx vlan200 0x%llx tun_p2mp 0x%llx bp_tun 0x%llx term 0x%llx",
+        OID(vlan100), OID(rif100), OID(riflo), OID(nh), OID(vlan200), OID(tun_p2mp), OID(bp_tun), OID(term));
+    (void)vm100; (void)vm200; (void)vm_tun; (void)me_dec; (void)me_enc; (void)tun_p2p;
     return fails;
 }
