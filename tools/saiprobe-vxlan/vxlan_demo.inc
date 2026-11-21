@@ -167,15 +167,6 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
     at[n].id = SAI_TUNNEL_TERM_TABLE_ENTRY_ATTR_ACTION_TUNNEL_ID; at[n++].value.oid = tun_p2mp;
     VX_CALL("create_tunnel_term_table_entry 10.1.0.1", tunapi->create_tunnel_term_table_entry(&term, g_switch, n, at));
 
-    /* ---- decap map entry AFTER the tunnel (Broadcom SAI: "create tunnel before creating tunnel map entry");
-     * SONiC creates only the VNI_TO_VLAN_ID entry for an L2 VNI */
-    n = 0; memset(at, 0, sizeof at);
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP; at[n++].value.oid = map_dec;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY; at[n++].value.u32 = 2000;
-    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE; at[n++].value.u16 = 200;
-    VX_CALL("create_tunnel_map_entry 2000 -> vlan 200", tunapi->create_tunnel_map_entry(&me_dec, g_switch, n, at));
-
     /* ---- Broadcom SAI 7.1 has no P2P (DIP) tunnels: SONiC's EvpnRemoteVnip2mpOrch model instead.
      * tunnel bridge port on the P2MP tunnel, VLAN 200 member, L2MC flood group with the remote VTEP as an
      * endpoint member (BUM), and the remote MAC as an FDB entry with ENDPOINT_IP (unicast). */
@@ -191,30 +182,15 @@ static int vxlan_demo(uint32_t lane_u, uint32_t lane_a, const char *pc_mac_s)
     at[n].id = SAI_VLAN_MEMBER_ATTR_BRIDGE_PORT_ID; at[n++].value.oid = bp_tun;
     at[n].id = SAI_VLAN_MEMBER_ATTR_VLAN_TAGGING_MODE; at[n++].value.s32 = SAI_VLAN_TAGGING_MODE_UNTAGGED;
     VX_CALL("create_vlan_member 200 <- tunnel bridge port", vlanapi->create_vlan_member(&vm_tun, g_switch, n, at));
-    {
-        sai_l2mc_group_api_t *l2mcapi = NULL; sai_object_id_t grp = 0, mem = 0;
-        VX_CALL("api_query L2MC_GROUP", sai_api_query(SAI_API_L2MC_GROUP, (void **)&l2mcapi));
-        if (l2mcapi) {
-            VX_CALL("create_l2mc_group (flood group vlan 200)", l2mcapi->create_l2mc_group(&grp, g_switch, 0, NULL));
-            n = 0; memset(at, 0, sizeof at);
-            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_GROUP_ID; at[n++].value.oid = grp;
-            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_OUTPUT_ID; at[n++].value.oid = bp_tun;
-            at[n].id = SAI_L2MC_GROUP_MEMBER_ATTR_L2MC_ENDPOINT_IP; at[n].value.ipaddr.addr_family = SAI_IP_ADDR_FAMILY_IPV4; at[n++].value.ipaddr.addr.ip4 = inet_addr("10.1.0.2");
-            VX_CALL("create_l2mc_group_member tunnel bp + endpoint 10.1.0.2", l2mcapi->create_l2mc_group_member(&mem, g_switch, n, at));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_UNICAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
-            VX_CALL("set vlan 200 UUC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_UNICAST_FLOOD_GROUP; g.value.oid = grp;
-            VX_CALL("set vlan 200 UUC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_BROADCAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
-            VX_CALL("set vlan 200 BC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_BROADCAST_FLOOD_GROUP; g.value.oid = grp;
-            VX_CALL("set vlan 200 BC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_CONTROL_TYPE; g.value.s32 = SAI_VLAN_FLOOD_CONTROL_TYPE_COMBINED;
-            VX_CALL("set vlan 200 UMC flood control COMBINED", vlanapi->set_vlan_attribute(vlan200, &g));
-            memset(&g, 0, sizeof g); g.id = SAI_VLAN_ATTR_UNKNOWN_MULTICAST_FLOOD_GROUP; g.value.oid = grp;
-            VX_CALL("set vlan 200 UMC flood group", vlanapi->set_vlan_attribute(vlan200, &g));
-        }
-    }
+    /* ---- decap map entry AFTER the tunnel (Broadcom SAI: "create tunnel before creating tunnel map entry");
+     * SONiC creates only the VNI_TO_VLAN_ID entry for an L2 VNI */
+    n = 0; memset(at, 0, sizeof at);
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP_TYPE; at[n++].value.s32 = SAI_TUNNEL_MAP_TYPE_VNI_TO_VLAN_ID;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_TUNNEL_MAP; at[n++].value.oid = map_dec;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VNI_ID_KEY; at[n++].value.u32 = 2000;
+    at[n].id = SAI_TUNNEL_MAP_ENTRY_ATTR_VLAN_ID_VALUE; at[n++].value.u16 = 200;
+    VX_CALL("create_tunnel_map_entry 2000 -> vlan 200", tunapi->create_tunnel_map_entry(&me_dec, g_switch, n, at));
+
     /* ---- remote MAC (EVPN type-2): FDB on the tunnel bridge port with the remote VTEP as endpoint */
     {
         sai_fdb_entry_t fe; memset(&fe, 0, sizeof fe);
