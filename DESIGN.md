@@ -73,6 +73,15 @@ syncd (SONiC, C++) --dlopen--> libsai.so.1  (= 改造 libsaivs.so)
 5. FRR で BGP、経路が ASIC に入る(M2)。
 6. VXLAN トンネル(M3)。
 
+## 冷間再起動後の 1G リンク片側問題(2026-11-21 夜、3/3 再現)
+- 症状: スイッチの電源入れ直し/`reboot` 後、PC(Realtek RTL8168h, r8169)の Ethernet44 向けリンクが PC 側だけ「リンクなし」のまま固まる。
+  スイッチの BCM84858 は 1000BASE-T リンク完了(dev7 reg1=0x006d、0xffea=0x7800: ローカル/リモート受信 OK)と報告し、SDK も up。
+  swss 再起動(PHY ファーム再ロードなし)では起きない。SDK 初期化中に PC 側が 4〜5 回リンク断続を見た直後に固まる。
+- スイッチ側で効かなかった操作: AN 再始動(bcm/PHY dev7 reg0 bit9 とも)、en=0 を 3 s/15 s 置いて en=1、PMA リセット(dev1 reg0 bit15)、
+  forced 1G→AN 往復、if=xfi→sgmii 往復。PC 側の NIC リセット(`ethtool -r` / `nmcli con up`)だけで即復帰し、以後はスイッチ側の
+  shutdown/startup でも正常に再リンクする。
+- 結論: PC NIC 側の癖として扱う。tools/pc-link-watchdog(root の systemd タイマー、30 s 無リンクで ethtool -r)を用意。
+
 ## VXLAN データプレーンで分かったこと(2026-11-21、ビルド 5〜12)
 
 実機試験は 2026-11-21 まで全部「CPU が片側」だった。ASIC がポート→ポートで自力転送する経路は、
