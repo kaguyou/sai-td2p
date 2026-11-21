@@ -72,3 +72,34 @@ syncd (SONiC, C++) --dlopen--> libsai.so.1  (= 改造 libsaivs.so)
 4. Ethernet0 のネットデバイス(KNET)に IP を付けて ping。
 5. FRR で BGP、経路が ASIC に入る(M2)。
 6. VXLAN トンネル(M3)。
+
+## VXLAN データプレーンで分かったこと(2026-11-21、ビルド 5〜12)
+
+実機試験は 2026-11-21 まで全部「CPU が片側」だった。ASIC がポート→ポートで自力転送する経路は、
+未接続ポートを MAC ループバック(`deploy/bsh "port xe47 lb=mac"`、xe47 = 論理 49 = Ethernet48)にして
+アクセス側ホストの代役にし、PC(Ethernet44、VLAN 100)を偽リモート VTEP(tools/pseudo-vtep)にして初めて通した。
+
+TD2+ 固有で必要だったこと(いずれも hwbcm_vxlan.c):
+
+1. **VFI メンバーシップ** — VLAN_XLATE の DISABLE_VLAN_CHECKS=0 で VFI 内の全パケットが
+   ING/EGR_VLAN_VFI_MEMBERSHIP で検査される。VP を作るたび物理ポートを `bcm_vlan_gport_add(vpn, gport, 0)` で登録。
+   無いと RDROP(「port bitmap zero」)で全部消える。
+2. **untagged アクセスは MATCH_PORT** — VLAN_XLATE の OVID キーは untagged フレームに当たらず素の VLAN に落ちる。
+   SDK 流儀どおり untagged メンバーは `BCM_VXLAN_PORT_MATCH_PORT`(SOURCE_TRUNK_MAP の SVP)、tagged は PORT_VLAN。
+3. **BUM は別 VP** — 複製コピーは L3MC ビューのネクストホップ(DVP 付き)でないとトンネルに入らない。
+   VTEP ごとに `BCM_L3_IPMC|BCM_L3_VXLAN_ONLY` の出口 + `BCM_VXLAN_PORT_MULTICAST` の VP(vpMc)を作り、
+   フラッディンググループにはそれだけを入れる(SDK 例 acc_to_net_mc.c)。ユニキャスト VP を入れると内側フレームが素で出る。
+4. **外側 VLAN タグ(未解決)** — DVP 経由で出るパケットの untagged 判定は物理ポートの UT_BITMAP ではなく
+   VP 側(EGR_VP_VLAN_MEMBERSHIP / VP グループ)。`bcm_vlan_gport_add(underlay_vlan, vp, UNTAGGED|VP_VLAN_MEMBERSHIP|DO_NOT_ADD×3)`
+   で登録はできるが、判定を効かせるには DVP の EN_EFILTER=1 が要り、すると今度は出口で捨てられる(TDBGC3)。
+   既定(HWBCM_VXLAN_VP_EFILTER 0)では外側フレームはアンダーレイ VLAN の**タグ付き**で出る。
+   対向が tagged で受ければ往復は成立(PC は enp2s0.100 に 10.1.0.2 を置いて確認)。ルーテッドポートのアンダーレイで
+   使うには要解決。
+5. **RDBGC0/RDROP はフラッディングで常に +1** — L3_IPMC 複製を使う VFI フラッディングでは L2 ビットマップが空になり
+   RDROP が数えられる。異常ではない。
+
+観測の道具: `show c`(diag、変化分のみ)、`cstat <port>` で RDBGC の内訳、`cstat set <port> rx 8 <trigger>` で分解、
+入口ミラー(`dmirror <port> mode=ingress destport=cpu0` + `knetctrl filter create DestType=NetIF DestID=<netif> MirrorSts=1`)で
+再入力フレームを cpu200 netdev で tcpdump。出口ミラーはカプセル化前の姿しか写らない。
+PC 側は NIC の otherhost カウンタ(宛先 MAC 不一致、または VLAN デバイス無しのタグ付き)で切り分け。
+SONiC の `config vlan member del` は vlanmgrd を落として swss を再起動させることがある。
