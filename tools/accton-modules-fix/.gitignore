@@ -1,0 +1,7 @@
+khdr/
+src/*.ko
+src/*.o
+src/*.mod*
+src/.*.cmd
+src/Module.symvers
+src/modules.order
