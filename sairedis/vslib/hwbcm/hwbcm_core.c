@@ -1427,6 +1427,42 @@ static void hwbcm_sgmii_warm_probe(int unit)
                g_fp_count, nmarked);
 }
 
+static epc_link_bmap_entry_t g_epc_saved;
+static int g_epc_saved_valid = 0;
+
+static void epc_link_save(int unit)
+{
+    g_epc_saved_valid = 0;
+    if (!SOC_MEM_IS_VALID(unit, EPC_LINK_BMAPm)) {
+        return;
+    }
+    if (SOC_SUCCESS(soc_mem_read(unit, EPC_LINK_BMAPm, MEM_BLOCK_ANY, 0, &g_epc_saved))) {
+        g_epc_saved_valid = 1;
+    }
+}
+
+static void epc_link_restore(int unit, const char *after)
+{
+    epc_link_bmap_entry_t cur;
+    pbmp_t want, have;
+
+    if (!g_epc_saved_valid ||
+        SOC_FAILURE(soc_mem_read(unit, EPC_LINK_BMAPm, MEM_BLOCK_ANY, 0, &cur))) {
+        return;
+    }
+    soc_mem_pbmp_field_get(unit, EPC_LINK_BMAPm, &g_epc_saved, PORT_BITMAPf, &want);
+    soc_mem_pbmp_field_get(unit, EPC_LINK_BMAPm, &cur, PORT_BITMAPf, &have);
+    if (SOC_PBMP_EQ(want, have)) {
+        HWBCM_LOGI("hwbcm_init_ex[warm]: EPC_LINK_BMAP unchanged after %s", after);
+        return;
+    }
+    if (SOC_FAILURE(soc_mem_write(unit, EPC_LINK_BMAPm, MEM_BLOCK_ALL, 0, &g_epc_saved))) {
+        HWBCM_LOGE("hwbcm_init_ex[warm]: EPC_LINK_BMAP restore after %s failed", after);
+        return;
+    }
+    HWBCM_LOGW("hwbcm_init_ex[warm]: EPC_LINK_BMAP was rewritten by %s, restored (front-port egress kept)", after);
+}
+
 int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file)
 {
     int unit = HWBCM_UNIT;
@@ -1596,8 +1632,15 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             return BCM_E_INTERNAL;
         }
 
+        /* EPC_LINK_BMAP = egress "link up" ports. _soc_trident2_misc_init
+         * overwrites it with CMIC only, and warm linkscan never rewrites it
+         * (it assumes the links stayed up), so every front port stopped
+         * egress after the first warm restart (2026-11-24). The wb SDK copy
+         * guards that write; keep the live value here as well. */
+        epc_link_save(unit);
         HWBCM_LOGI("hwbcm_init_ex[warm]: soc_misc_init");
         rv = soc_misc_init(unit);
+        epc_link_restore(unit, "soc_misc_init");
         if (SOC_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: soc_misc_init failed: %s (%d)", bcm_errmsg(rv), rv);
             SOC_WARM_BOOT_DONE(unit);
@@ -1629,6 +1672,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
 
         HWBCM_LOGI("hwbcm_init_ex[warm]: bcm_init");
         rv = bcm_init(unit);
+        epc_link_restore(unit, "bcm_init");
         if (BCM_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_init failed: %s (%d)", bcm_errmsg(rv), rv);
             SOC_WARM_BOOT_DONE(unit);
