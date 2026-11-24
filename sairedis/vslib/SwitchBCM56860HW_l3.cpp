@@ -624,6 +624,11 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
     SWSS_LOG_NOTICE("rif %s: intf %d vid %d vrf %d port %d trunk %d mtu %d",
             srif.c_str(), intf, vid, vrf, port, trunk, mtu);
 
+    if (type == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+    {
+        vxlanSviSync(vid); // RIOT: the VLAN may already carry a VNI
+    }
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -688,6 +693,18 @@ sai_status_t SwitchBCM56860HW::hwRemoveRouterInterface(
     if (it == m_rifToIntf.end())
     {
         return SAI_STATUS_SUCCESS;
+    }
+
+    {
+        sai_attribute_t rt;
+        auto v = m_rifToVid.find(rif_id);
+
+        if (v != m_rifToVid.end() &&
+                getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rt) &&
+                rt.value.s32 == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+        {
+            vxlanSviSync(v->second, rif_id); // RIOT: drop the VPN's L3 gateway first
+        }
     }
 
     int rv = hwbcm_l3_intf_destroy(it->second);
@@ -847,85 +864,14 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str());
     }
 
-    // where does the neighbor live: port / trunk, or unknown (-> CPU)
-
+    // where does the neighbor live: port / trunk / VXLAN VP, or unknown (-> CPU)
     int port = -1;
     int trunk = -1;
+    int vpGport = -1;
+    int ovlIntf = -1;
     bool toCpu = false;
 
-    sai_attribute_t rifType;
-
-    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType))
-    {
-        SWSS_LOG_ERROR("neighbor %s: rif %s has no TYPE attribute", serialized.c_str(), sai_serialize_object_id(ne.rif_id).c_str());
-        return SAI_STATUS_FAILURE;
-    }
-
-    if (rifType.value.s32 == SAI_ROUTER_INTERFACE_TYPE_PORT)
-    {
-        sai_attribute_t portAttr;
-
-        if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_PORT_ID, portAttr))
-        {
-            sai_object_id_t target = portAttr.value.oid;
-
-            if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
-            {
-                trunk = trunkOf(target);
-            }
-            else
-            {
-                port = bcmPortOf(target);
-            }
-        }
-    }
-    else if (rifType.value.s32 == SAI_ROUTER_INTERFACE_TYPE_VLAN)
-    {
-        sai_attribute_t vlanAttr;
-
-        if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr))
-        {
-            sai_object_id_t vlanOid = vlanAttr.value.oid;
-
-            auto fdbIt = m_objectHash.find(SAI_OBJECT_TYPE_FDB_ENTRY);
-
-            if (fdbIt != m_objectHash.end())
-            {
-                for (auto &kv: fdbIt->second)
-                {
-                    sai_fdb_entry_t fe;
-                    sai_deserialize_fdb_entry(kv.first, fe);
-
-                    if (fe.bv_id != vlanOid || !macEqual(fe.mac_address, macAttr->value.mac))
-                    {
-                        continue;
-                    }
-
-                    auto bp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
-
-                    if (bp == kv.second.end())
-                    {
-                        continue;
-                    }
-
-                    sai_object_id_t target = bridgePortTarget(bp->second->getAttr()->value.oid);
-
-                    if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
-                    {
-                        trunk = trunkOf(target);
-                    }
-                    else
-                    {
-                        port = bcmPortOf(target);
-                    }
-
-                    break;
-                }
-            }
-        }
-    }
-
-    if (port < 0 && trunk < 0)
+    if (!neighborTarget(ne.rif_id, macAttr->value.mac, port, trunk, vpGport, ovlIntf))
     {
         SWSS_LOG_NOTICE("neighbor %s: mac not in fdb yet, punting to cpu", serialized.c_str());
         toCpu = true;
@@ -981,6 +927,10 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
             {
                 rv = hwbcm_l3_egress_cpu_replace(e, intf);
             }
+            else if (vpGport != -1)
+            {
+                rv = hwbcm_vxlan_overlay_egress_replace(e, ovlIntf, macAttr->value.mac, vpGport);
+            }
             else
             {
                 rv = hwbcm_l3_egress_replace(e, intf, macAttr->value.mac, port, trunk);
@@ -1008,6 +958,10 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         if (toCpu)
         {
             rv = hwbcm_l3_egress_cpu_create(intf, &egr);
+        }
+        else if (vpGport != -1)
+        {
+            rv = hwbcm_vxlan_overlay_egress_create(ovlIntf, macAttr->value.mac, vpGport, &egr);
         }
         else
         {
@@ -1045,8 +999,8 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
 
     m_neighborEgr[serialized] = egr;
 
-    SWSS_LOG_NOTICE("neighbor %s -> egress %d (intf %d vrf %d port %d trunk %d cpu %d host %d)",
-            serialized.c_str(), egr, intf, vrf, port, trunk, toCpu ? 1 : 0, noHostRoute ? 0 : 1);
+    SWSS_LOG_NOTICE("neighbor %s -> egress %d (intf %d vrf %d port %d trunk %d vp 0x%x/ovl %d cpu %d host %d)",
+            serialized.c_str(), egr, intf, vrf, port, trunk, vpGport, ovlIntf, toCpu ? 1 : 0, noHostRoute ? 0 : 1);
 
     if (m_hwReady)
     {
@@ -1891,4 +1845,309 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
     {
         hwVxlanRetryPending(); // a tunnel cloned from this egress is stale now -> pending
     }
+}
+
+// ---------------------------------------------------------------------------
+// neighbor target resolution (shared by create and re-resolve)
+// ---------------------------------------------------------------------------
+
+bool SwitchBCM56860HW::neighborTarget(
+        _In_ sai_object_id_t rif_id,
+        _In_ const sai_mac_t mac,
+        _Out_ int &port,
+        _Out_ int &trunk,
+        _Out_ int &vpGport,
+        _Out_ int &ovlIntf)
+{
+    SWSS_LOG_ENTER();
+
+    port = -1;
+    trunk = -1;
+    vpGport = -1;
+    ovlIntf = -1;
+
+    sai_attribute_t rifType;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType))
+    {
+        SWSS_LOG_ERROR("rif %s has no TYPE attribute", sai_serialize_object_id(rif_id).c_str());
+        return false;
+    }
+
+    if (rifType.value.s32 == SAI_ROUTER_INTERFACE_TYPE_PORT)
+    {
+        sai_attribute_t portAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_PORT_ID, portAttr))
+        {
+            sai_object_id_t target = portAttr.value.oid;
+
+            if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
+            {
+                trunk = trunkOf(target);
+            }
+            else
+            {
+                port = bcmPortOf(target);
+            }
+        }
+
+        return port >= 0 || trunk >= 0;
+    }
+
+    if (rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN)
+    {
+        return false;
+    }
+
+    sai_attribute_t vlanAttr;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr))
+    {
+        return false;
+    }
+
+    sai_object_id_t vlanOid = vlanAttr.value.oid;
+
+    auto fdbIt = m_objectHash.find(SAI_OBJECT_TYPE_FDB_ENTRY);
+
+    if (fdbIt == m_objectHash.end())
+    {
+        return false;
+    }
+
+    for (auto &kv: fdbIt->second)
+    {
+        sai_fdb_entry_t fe;
+        sai_deserialize_fdb_entry(kv.first, fe);
+
+        if (fe.bv_id != vlanOid || !macEqual(fe.mac_address, mac))
+        {
+            continue;
+        }
+
+        auto bp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
+
+        if (bp == kv.second.end())
+        {
+            continue;
+        }
+
+        sai_object_id_t bridgePort = bp->second->getAttr()->value.oid;
+
+        // RIOT: MAC behind a remote VTEP -> routed into the VPN over the
+        // VTEP's network VP (needs the VPN's SVI binding and a live VP).
+        auto rip = m_bridgePortRemoteIp.find(bridgePort);
+
+        if (rip != m_bridgePortRemoteIp.end())
+        {
+            int vpn = vxlanVpnOfVid(vidOf(vlanOid));
+            int ovl = (vpn >= 0) ? hwbcm_vxlan_vpn_l3_intf(vpn) : -1;
+            auto vt = m_vtepByIp.find(rip->second);
+
+            if (ovl >= 0 && vt != m_vtepByIp.end() && vt->second.vpReady)
+            {
+                vpGport = vt->second.vp;
+                ovlIntf = ovl;
+                return true;
+            }
+
+            return false;
+        }
+
+        sai_object_id_t target = bridgePortTarget(bridgePort);
+
+        if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
+        {
+            trunk = trunkOf(target);
+        }
+        else
+        {
+            port = bcmPortOf(target);
+        }
+
+        return port >= 0 || trunk >= 0;
+    }
+
+    return false;
+}
+
+void SwitchBCM56860HW::hwReresolveNeighborsOnVlan(
+        _In_ int vid,
+        _In_ bool punt)
+{
+    SWSS_LOG_ENTER();
+
+    bool changed = false;
+
+    for (auto &kv: m_neighborEgr)
+    {
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(kv.first, ne);
+
+        auto vit = m_rifToVid.find(ne.rif_id);
+        auto rit = m_rifToIntf.find(ne.rif_id);
+
+        if (vit == m_rifToVid.end() || vit->second != vid || rit == m_rifToIntf.end())
+        {
+            continue;
+        }
+
+        sai_attribute_t rifType, macAttr, paAttr;
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
+                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
+                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr))
+        {
+            continue;
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+                paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
+        {
+            continue;
+        }
+
+        int port, trunk, vpGport, ovlIntf;
+        int rv;
+
+        if (punt || !neighborTarget(ne.rif_id, macAttr.value.mac, port, trunk, vpGport, ovlIntf))
+        {
+            port = trunk = vpGport = ovlIntf = -1;
+            rv = hwbcm_l3_egress_cpu_replace(kv.second, rit->second);
+        }
+        else if (vpGport != -1)
+        {
+            rv = hwbcm_vxlan_overlay_egress_replace(kv.second, ovlIntf, macAttr.value.mac, vpGport);
+        }
+        else
+        {
+            rv = hwbcm_l3_egress_replace(kv.second, rit->second, macAttr.value.mac, port, trunk);
+        }
+
+        if (rv < 0)
+        {
+            SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve failed: %d", kv.first.c_str(), kv.second, rv);
+            continue;
+        }
+
+        SWSS_LOG_INFO("neighbor %s: egress %d re-resolved (port %d trunk %d vp 0x%x ovl %d)",
+                kv.first.c_str(), kv.second, port, trunk, vpGport, ovlIntf);
+        changed = true;
+    }
+
+    // Remote VTEPs only depend on underlay neighbors; a VNI-mapped VLAN is
+    // overlay, and re-checking the VTEPs from here fed back into this function
+    // (VTEP rebuild -> remote MAC install -> re-resolve).
+    if (changed && m_hwReady && vxlanVpnOfVid(vid) < 0)
+    {
+        hwVxlanRetryPending();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RIOT: SVI (L3 gateway) on a VNI-mapped VLAN
+// ---------------------------------------------------------------------------
+
+void SwitchBCM56860HW::vxlanSviSync(
+        _In_ int vid,
+        _In_ sai_object_id_t removingRif)
+{
+    SWSS_LOG_ENTER();
+
+    if (!m_hwReady || !hwbcm_riot_enabled())
+    {
+        return;
+    }
+
+    int vpn = vxlanVpnOfVid(vid);
+
+    if (vpn < 0)
+    {
+        return; // no VNI: hwbcm_vxlan_vpn_destroy already dropped any binding
+    }
+
+    // the VLAN RIF of vid (not a port RIF's internal VLAN)
+    sai_object_id_t rif = SAI_NULL_OBJECT_ID;
+
+    for (auto &kv: m_rifToVid)
+    {
+        sai_attribute_t rt;
+
+        if (kv.second != vid || kv.first == removingRif)
+        {
+            continue;
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kv.first, SAI_ROUTER_INTERFACE_ATTR_TYPE, rt) &&
+                rt.value.s32 == SAI_ROUTER_INTERFACE_TYPE_VLAN)
+        {
+            rif = kv.first;
+            break;
+        }
+    }
+
+    if (rif == SAI_NULL_OBJECT_ID)
+    {
+        if (hwbcm_vxlan_vpn_l3_intf(vpn) >= 0)
+        {
+            hwReresolveNeighborsOnVlan(vid, true); // release overlay egresses first
+            int rc = hwbcm_vxlan_vpn_l3_unbind(vpn);
+            SWSS_LOG_NOTICE("vlan %d (vpn 0x%x): SVI removed, L3 gateway unbound: %d", vid, vpn, rc);
+        }
+        return;
+    }
+
+    if (hwbcm_vxlan_vpn_l3_intf(vpn) >= 0)
+    {
+        return; // already bound
+    }
+
+    sai_mac_t mac;
+    memset(mac, 0, sizeof(mac));
+    sai_attribute_t a;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif, SAI_ROUTER_INTERFACE_ATTR_SRC_MAC_ADDRESS, a))
+    {
+        memcpy(mac, a.value.mac, sizeof(mac));
+    }
+    else if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_SRC_MAC_ADDRESS, a))
+    {
+        memcpy(mac, a.value.mac, sizeof(mac));
+    }
+
+    int mtu = 9100;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif, SAI_ROUTER_INTERFACE_ATTR_MTU, a))
+    {
+        mtu = (int)a.value.u32;
+    }
+
+    int vrf = 0;
+
+    if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, a))
+    {
+        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
+        sai_attribute_t sw;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+        {
+            defaultVr = sw.value.oid;
+        }
+
+        vrf = resolveVrf(m_vrToVrf, defaultVr, a.value.oid, true, "svi");
+    }
+
+    int ovl = -1;
+    int rc = hwbcm_vxlan_vpn_l3_bind(vpn, mac, vrf, mtu, &ovl);
+
+    if (rc < 0)
+    {
+        SWSS_LOG_ERROR("vlan %d (vpn 0x%x): L3 gateway bind failed: %d", vid, vpn, rc);
+        return;
+    }
+
+    SWSS_LOG_NOTICE("vlan %d (vpn 0x%x): SVI bound, overlay intf %d vrf %d mtu %d", vid, vpn, ovl, vrf, mtu);
+
+    hwReresolveNeighborsOnVlan(vid); // remote hosts can now be routed in hardware
 }

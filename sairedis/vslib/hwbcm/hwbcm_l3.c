@@ -39,6 +39,7 @@
 /* ------------------------------------------------------------------------ */
 
 static int s_l3_ready = 0;
+static int s_l3_ingress_mode = 0;   /* 1: explicit L3 ingress objects (RIOT) */
 
 static int hwbcm_l3_lazy_init(void)
 {
@@ -63,7 +64,25 @@ static int hwbcm_l3_lazy_init(void)
         hwbcm_log(HWBCM_LOG_INFO, "l3: egress mode enabled");
     }
 
-    /* Keep L3 ingress mode off on purpose: VRF is taken from the VLAN table. */
+    /* Without RIOT, L3 ingress mode stays off: the SDK maps VLAN v to L3_IIF v
+     * and the VRF is taken from the VLAN table. With RIOT (riot_enable=1) a
+     * VXLAN VFI needs an explicit L3 ingress interface, which only exists in
+     * ingress mode, so every L3 interface then gets its own ingress object
+     * (same id as the intf) mapped from its VLAN/VFI (hwbcm_l3_iif_bind). */
+    if (hwbcm_riot_enabled()) {
+        rv = bcm_switch_control_set(U, bcmSwitchL3IngressMode, 1);
+        if (rv < 0) {
+            hwbcm_log(HWBCM_LOG_ERR, "l3: switch_control_set(L3IngressMode,1): %s", bcm_errmsg(rv));
+            return rv;
+        }
+        rv = bcm_switch_control_set(U, bcmSwitchL3IngressInterfaceMapSet, 1);
+        if (rv < 0) {
+            hwbcm_log(HWBCM_LOG_ERR, "l3: switch_control_set(L3IngressInterfaceMapSet,1): %s", bcm_errmsg(rv));
+            return rv;
+        }
+        s_l3_ingress_mode = 1;
+        hwbcm_log(HWBCM_LOG_INFO, "l3: RIOT, ingress mode enabled");
+    }
 
     rv = bcm_l3_enable_set(U, 1);
     if (rv < 0 && rv != BCM_E_UNAVAIL) {
@@ -179,7 +198,7 @@ static void hwbcm_l3_addr_str(int af, const uint8_t *a, char *buf, size_t len)
 }
 
 /* Program VRF + enable IPv4/IPv6 routing on a VLAN (ingress side). */
-static int hwbcm_l3_vlan_routing_set(int vid, int vrf)
+static int hwbcm_l3_vlan_routing_set(int vid, int vrf, int ingress_if)
 {
     bcm_vlan_control_vlan_t vc;
     int rv;
@@ -191,6 +210,9 @@ static int hwbcm_l3_vlan_routing_set(int vid, int vrf)
         return rv;
     }
     vc.vrf = (bcm_vrf_t)vrf;
+    if (ingress_if >= 0) {
+        vc.ingress_if = (bcm_if_t)ingress_if;
+    }
     vc.flags &= ~(uint32)(BCM_VLAN_IP4_DISABLE | BCM_VLAN_IP6_DISABLE);
     rv = bcm_vlan_control_vlan_set(U, (bcm_vlan_t)vid, vc);
     if (rv < 0) {
@@ -198,6 +220,29 @@ static int hwbcm_l3_vlan_routing_set(int vid, int vrf)
         return rv;
     }
     return 0;
+}
+
+/* L3 ingress interface with the same id as L3 intf intf_id (ingress mode). */
+int hwbcm_l3_iif_create(int intf_id, int vrf)
+{
+    bcm_l3_ingress_t ing;
+    bcm_if_t id = (bcm_if_t)intf_id;
+    int rv;
+
+    bcm_l3_ingress_t_init(&ing);
+    ing.flags = BCM_L3_INGRESS_WITH_ID | BCM_L3_INGRESS_REPLACE;
+    ing.vrf = (bcm_vrf_t)vrf;
+    rv = bcm_l3_ingress_create(U, &ing, &id);
+    if (rv < 0) {
+        hwbcm_log(HWBCM_LOG_ERR, "l3: ingress_create(id=%d vrf=%d): %s", intf_id, vrf, bcm_errmsg(rv));
+        return rv;
+    }
+    return 0;
+}
+
+int hwbcm_l3_ingress_mode(void)
+{
+    return s_l3_ingress_mode;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -234,8 +279,18 @@ int hwbcm_l3_intf_create(const uint8_t mac[6], int vid, int vrf, int mtu, int *i
         return rv;
     }
 
-    rv = hwbcm_l3_vlan_routing_set(vid, vrf);
+    if (s_l3_ingress_mode) {
+        rv = hwbcm_l3_iif_create((int)intf.l3a_intf_id, vrf);
+        if (rv < 0) {
+            (void)bcm_l3_intf_delete(U, &intf);
+            return rv;
+        }
+    }
+    rv = hwbcm_l3_vlan_routing_set(vid, vrf, s_l3_ingress_mode ? (int)intf.l3a_intf_id : -1);
     if (rv < 0) {
+        if (s_l3_ingress_mode) {
+            (void)bcm_l3_ingress_destroy(U, intf.l3a_intf_id);
+        }
         (void)bcm_l3_intf_delete(U, &intf);
         return rv;
     }
@@ -254,6 +309,12 @@ int hwbcm_l3_intf_destroy(int intf_id)
     bcm_l3_intf_t_init(&intf);
     intf.l3a_intf_id = (bcm_if_t)intf_id;
 
+    if (s_l3_ingress_mode) {
+        rv = bcm_l3_ingress_destroy(U, (bcm_if_t)intf_id);
+        if (rv < 0 && rv != BCM_E_NOT_FOUND) {
+            hwbcm_log(HWBCM_LOG_WARN, "l3: ingress_destroy(%d): %s", intf_id, bcm_errmsg(rv));
+        }
+    }
     rv = bcm_l3_intf_delete(U, &intf);
     if (rv < 0) {
         hwbcm_log(HWBCM_LOG_ERR, "l3: intf_delete(%d): %s", intf_id, bcm_errmsg(rv));

@@ -270,6 +270,8 @@ void SwitchBCM56860HW::vxlanInstallVtepMacs(
         return;
     }
 
+    std::set<int> vids;
+
     for (const auto &kv: vtep.macs)
     {
         const VxlanMac &m = kv.second;
@@ -293,6 +295,13 @@ void SwitchBCM56860HW::vxlanInstallVtepMacs(
             SWSS_LOG_WARN("remote MAC %s (vlan %d) on %s not installed: %d",
                     sai_serialize_mac(m.mac).c_str(), m.vid, vtep.ip.c_str(), rc);
         }
+
+        vids.insert(m.vid);
+    }
+
+    for (int v: vids)
+    {
+        hwReresolveNeighborsOnVlan(v); // neighbors behind this VTEP were punted while its VP was down
     }
 }
 
@@ -1324,6 +1333,8 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnelMapEntry(
         }
     }
 
+    vxlanSviSync(vid); // RIOT: an SVI on this VLAN becomes the VPN's L3 gateway
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -1398,6 +1409,11 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
         }
     }
 
+    if (hwbcm_vxlan_vpn_l3_intf(vpn) >= 0)
+    {
+        hwReresolveNeighborsOnVlan(vid, true); // overlay egresses go before the VPN
+    }
+
     vxlanRemoveAccessPorts(vpn);
 
     int rc = hwbcm_vxlan_vpn_destroy(vpn);
@@ -1411,6 +1427,8 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
     m_vidToVni.erase(vid);
 
     SWSS_LOG_NOTICE("vni %u <-> vlan %d: vpn 0x%x destroyed", vni, vid, vpn);
+
+    hwReresolveNeighborsOnVlan(vid); // back to plain VLAN egresses
 
     for (const auto &key: rehome)
     {
@@ -1713,6 +1731,8 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
         }
 
         SWSS_LOG_INFO("fdb %s -> remote VTEP %s (vpn 0x%x, vp 0x%x)", key.c_str(), vtep.ip.c_str(), vpn, vtep.vp);
+
+        hwReresolveNeighborsOnVlan(vid); // a neighbor with this MAC can now be routed over the tunnel
 
         return SAI_STATUS_SUCCESS;
     }

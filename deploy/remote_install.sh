@@ -187,6 +187,17 @@ cfg_ct="${cfg_line#*=}"
 cfg_host="${cfg_ct/\/usr\/share\/sonic\/hwsku/$HWSKU}"
 [ -f "$cfg_host" ] || die "config.bcm from profile not found on host: $cfg_host"
 
+# RIOT (routing in/out of VXLAN VFIs) for the SVI on VNI-mapped VLANs: the
+# SDK only enables it from config.bcm. Backup once, append once.
+if ! grep -q '^riot_enable=1' "$cfg_host"; then
+    [ -f "$cfg_host.pre-riot" ] || sudo cp -p "$cfg_host" "$cfg_host.pre-riot"
+    printf '\n# sai-td2p: RIOT for the VXLAN L3 gateway (SVI on VNI-mapped VLANs)\nriot_enable=1\nriot_overlay_l3_intf_mem_size=4096\nriot_overlay_l3_egress_mem_size=16384\n' \
+        | sudo tee -a "$cfg_host" >/dev/null
+    log "enabled RIOT in $cfg_host (backup $cfg_host.pre-riot)"
+else
+    log "RIOT already enabled in $cfg_host"
+fi
+
 python3 -I "$GEN" "$HWSKU/port_config.ini" -c "$cfg_host" -o "$TMP/lanemap.ini"
 sudo install -m 644 -o root -g root "$TMP/lanemap.ini" "$HWSKU/lanemap.ini"
 log "wrote $HWSKU/lanemap.ini ($(grep -vc '^#' "$HWSKU/lanemap.ini") ports)"

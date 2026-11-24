@@ -124,10 +124,21 @@ typedef struct {
 static hwbcm_vxlan_acc_intf_t s_acc_intf[BCM_VLAN_MAX + 1];
 
 static int s_vxlan_inited = 0;
+/* RIOT L3 gateway per VPN (indexed by VFI = vpn & 0xfff): overlay L3 intf,
+ * L3 ingress object of the same id, router MAC L2 entry to the CPU. */
+#define HWBCM_VXLAN_MAX_VFI 8192
+typedef struct {
+    int bound;
+    int ovl_intf;
+    uint8_t mac[6];
+} hwbcm_vxlan_vpn_l3_t;
+static hwbcm_vxlan_vpn_l3_t s_vpn_l3[HWBCM_VXLAN_MAX_VFI];
 static int s_udp_port = HWBCM_VXLAN_UDP_PORT_DEFAULT;
 
 /* Dummy MAC for access-side egress objects (never appears on the wire). */
 static const bcm_mac_t s_acc_dummy_mac = { 0x00, 0x00, 0x01, 0x00, 0x00, 0x01 };
+
+static void hwbcm_vxlan_vp_l3_apply(int vpn_id, int vp_gport);
 
 /* ------------------------------------------------------------------------ */
 /* helpers                                                                  */
@@ -321,6 +332,9 @@ int hwbcm_vxlan_vpn_destroy(int vpn_id)
     if (!have_cfg) {
         hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_vxlan_vpn_get(0x%x): %s", vpn_id, bcm_errmsg(rv));
     }
+
+    /* An SVI bound to the VPN goes first (overlay intf, ingress, router MAC). */
+    (void)hwbcm_vxlan_vpn_l3_unbind(vpn_id);
 
     /* Remote MACs point at VPs of this VPN; flush them first. */
     (void)hwbcm_vxlan_l2_flush_vpn(vpn_id);
@@ -619,7 +633,11 @@ int hwbcm_vxlan_egress_is_stale(int l3_egr_or_ecmp_id, int vxlan_egr_id, int *st
         return BCM_E_NONE;
     }
 
-    if (cur.intf != src.intf || memcmp(cur.mac_addr, src.mac_addr, 6) != 0 || cur.vlan != src.vlan) {
+    /* No vlan compare: the VLAN comes from the L3 intf (same intf -> same
+     * VLAN), and in L3 ingress mode (RIOT) bcm_l3_egress_get leaves src.vlan
+     * at 0 while the clone carries the intf VLAN, which made every check
+     * "stale" and rebuilt the network VP in a loop (2026-11-24). */
+    if (cur.intf != src.intf || memcmp(cur.mac_addr, src.mac_addr, 6) != 0) {
         *stale = 1;
     } else if (src.flags & BCM_L3_TGID) {
         if (!BCM_GPORT_IS_TRUNK(cur.port) || BCM_GPORT_TRUNK_GET(cur.port) != src.trunk) {
@@ -1054,6 +1072,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
         return rv;
     }
 
+    hwbcm_vxlan_vp_l3_apply(vpn_id, (int)vxp.vxlan_port_id);
     *vp_id = (int)vxp.vxlan_port_id;
     hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x (vp %d) in vpn 0x%x, port %d, egress %d, init 0x%x term 0x%x",
               vxp.vxlan_port_id, vp, vpn_id, port, l3_egr_id, tunnel_init_id, tunnel_term_id);
@@ -1216,6 +1235,7 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
         return rv;
     }
 
+    hwbcm_vxlan_vp_l3_apply(vpn_id, (int)vxp.vxlan_port_id);
     *vp_id = (int)vxp.vxlan_port_id;
     hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: access vp 0x%x (vp %d) vpn 0x%x port %d trunk %d vlan %d %s",
               vxp.vxlan_port_id, vp, vpn_id, port, trunk_id, vid, tagged ? "tagged" : "untagged");
@@ -1401,4 +1421,225 @@ int hwbcm_vxlan_station_delete(int station_id)
     }
     HWBCM_CHECK(rv, "bcm_l2_station_delete");
     return BCM_E_NONE;
+}
+
+/* ------------------------------------------------------------------------ */
+/* RIOT: L3 gateway on a VPN (SVI on a VNI-mapped VLAN)                     */
+/* ------------------------------------------------------------------------ */
+/*
+ * Recipe (verified step by step on the AS5812-54T with cint, 2026-11-24, see
+ * DESIGN.md "VXLAN VLAN の SVI (RIOT)"):
+ *   - L3 ingress mode (hwbcm_l3.c) and the "any VFI" my-station entry
+ *     (hwbcm_core.c ip2me_station_apply) are global.
+ *   - per VPN: overlay L3 intf with l3a_vid = VPN id, L3 ingress object of the
+ *     same id carrying the VRF, VFI ingress_if/vrf, BCM_VLAN_NON_UCAST_TOCPU
+ *     (ARP requests to the gateway are VFI broadcasts), a static L2 entry
+ *     router MAC -> CPU in the VPN (ARP replies to the gateway are VFI unicast
+ *     to the router MAC and are not caught by the station entry), and
+ *     IPv4/IPv6 enabled on every VP of the VPN.
+ *   - routed egress into the VPN toward a host behind a VP: egress object
+ *     intf = overlay intf, port = VP gport (hwbcm_vxlan_overlay_egress_*).
+ */
+
+static int hwbcm_vxlan_vfi_of(int vpn_id)
+{
+    int vfi = vpn_id & 0xfff;
+
+    return (vfi >= 0 && vfi < HWBCM_VXLAN_MAX_VFI) ? vfi : -1;
+}
+
+static void hwbcm_vxlan_vp_l3_set(int vp_gport, int enable)
+{
+    int rv;
+
+    rv = bcm_port_control_set(U, (bcm_gport_t)vp_gport, bcmPortControlIP4, enable);
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vp 0x%x IP4 %d: %s", vp_gport, enable, bcm_errmsg(rv));
+    }
+    rv = bcm_port_control_set(U, (bcm_gport_t)vp_gport, bcmPortControlIP6, enable);
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vp 0x%x IP6 %d: %s", vp_gport, enable, bcm_errmsg(rv));
+    }
+}
+
+/* Called for every new VP: routing is on for the VPs of an L3-bound VPN only,
+ * so a VNI without an SVI never routes router-MAC frames. */
+static void hwbcm_vxlan_vp_l3_apply(int vpn_id, int vp_gport)
+{
+    int vfi = hwbcm_vxlan_vfi_of(vpn_id);
+
+    if (vfi >= 0 && s_vpn_l3[vfi].bound) {
+        hwbcm_vxlan_vp_l3_set(vp_gport, 1);
+    }
+}
+
+static void hwbcm_vxlan_vpn_vps_l3_set(int vpn_id, int enable)
+{
+    int i;
+
+    for (i = 0; i < HWBCM_VXLAN_MAX_VP; i++) {
+        if (s_vp[i].in_use && s_vp[i].vpn_id == vpn_id) {
+            bcm_gport_t g;
+
+            BCM_GPORT_VXLAN_PORT_ID_SET(g, i);
+            hwbcm_vxlan_vp_l3_set((int)g, enable);
+        }
+    }
+}
+
+static int hwbcm_vxlan_vpn_ctrl_set(int vpn_id, int vrf, int ingress_if, int to_cpu)
+{
+    bcm_vlan_control_vlan_t vc;
+    int rv;
+
+    bcm_vlan_control_vlan_t_init(&vc);
+    rv = bcm_vlan_control_vlan_get(U, (bcm_vlan_t)vpn_id, &vc);
+    HWBCM_CHECK(rv, "bcm_vlan_control_vlan_get(vpn)");
+    vc.vrf = (bcm_vrf_t)vrf;
+    vc.ingress_if = (bcm_if_t)ingress_if;
+    if (to_cpu) {
+        vc.flags |= BCM_VLAN_NON_UCAST_TOCPU;
+    } else {
+        vc.flags &= ~(uint32)BCM_VLAN_NON_UCAST_TOCPU;
+    }
+    rv = bcm_vlan_control_vlan_set(U, (bcm_vlan_t)vpn_id, vc);
+    HWBCM_CHECK(rv, "bcm_vlan_control_vlan_set(vpn)");
+    return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_vpn_l3_bind(int vpn_id, const uint8_t mac[6], int vrf, int mtu, int *ovl_intf_id)
+{
+    bcm_l3_intf_t intf;
+    bcm_l2_addr_t l2;
+    int vfi = hwbcm_vxlan_vfi_of(vpn_id);
+    int rv;
+
+    if (mac == NULL || ovl_intf_id == NULL || vfi < 0) {
+        return BCM_E_PARAM;
+    }
+    if (!hwbcm_riot_enabled() || !hwbcm_l3_ingress_mode()) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vpn 0x%x: SVI needs riot_enable=1 in config.bcm, not bound", vpn_id);
+        return BCM_E_UNAVAIL;
+    }
+    if (s_vpn_l3[vfi].bound) {
+        *ovl_intf_id = s_vpn_l3[vfi].ovl_intf;
+        return BCM_E_NONE;
+    }
+
+    bcm_l3_intf_t_init(&intf);
+    memcpy(intf.l3a_mac_addr, mac, 6);
+    intf.l3a_vid = (bcm_vlan_t)vpn_id;
+    intf.l3a_vrf = (bcm_vrf_t)vrf;
+    intf.l3a_mtu = (mtu > 0) ? mtu : 9100;
+    rv = bcm_l3_intf_create(U, &intf);
+    HWBCM_CHECK(rv, "bcm_l3_intf_create(overlay)");
+
+    rv = hwbcm_l3_iif_create((int)intf.l3a_intf_id, vrf);
+    if (BCM_FAILURE(rv)) {
+        (void)bcm_l3_intf_delete(U, &intf);
+        return rv;
+    }
+    rv = hwbcm_vxlan_vpn_ctrl_set(vpn_id, vrf, (int)intf.l3a_intf_id, 1);
+    if (BCM_FAILURE(rv)) {
+        (void)bcm_l3_ingress_destroy(U, intf.l3a_intf_id);
+        (void)bcm_l3_intf_delete(U, &intf);
+        return rv;
+    }
+
+    bcm_l2_addr_t_init(&l2, mac, (bcm_vlan_t)vpn_id);
+    l2.port = 0;                /* CPU (CMIC) port */
+    l2.flags = BCM_L2_STATIC;
+    rv = bcm_l2_addr_add(U, &l2);
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vpn 0x%x router mac -> cpu: %s (ARP replies to the gateway will be lost)",
+                  vpn_id, bcm_errmsg(rv));
+    }
+
+    s_vpn_l3[vfi].bound = 1;
+    s_vpn_l3[vfi].ovl_intf = (int)intf.l3a_intf_id;
+    memcpy(s_vpn_l3[vfi].mac, mac, 6);
+    hwbcm_vxlan_vpn_vps_l3_set(vpn_id, 1);
+
+    *ovl_intf_id = (int)intf.l3a_intf_id;
+    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x L3 bound: overlay intf %d vrf %d", vpn_id, *ovl_intf_id, vrf);
+    return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_vpn_l3_unbind(int vpn_id)
+{
+    bcm_l3_intf_t intf;
+    int vfi = hwbcm_vxlan_vfi_of(vpn_id);
+    int rv;
+
+    if (vfi < 0) {
+        return BCM_E_PARAM;
+    }
+    if (!s_vpn_l3[vfi].bound) {
+        return BCM_E_NONE;
+    }
+    hwbcm_vxlan_vpn_vps_l3_set(vpn_id, 0);
+    (void)bcm_l2_addr_delete(U, s_vpn_l3[vfi].mac, (bcm_vlan_t)vpn_id);
+    (void)hwbcm_vxlan_vpn_ctrl_set(vpn_id, 0, 0, 0);
+    rv = bcm_l3_ingress_destroy(U, (bcm_if_t)s_vpn_l3[vfi].ovl_intf);
+    if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vpn 0x%x ingress_destroy(%d): %s", vpn_id, s_vpn_l3[vfi].ovl_intf, bcm_errmsg(rv));
+    }
+    bcm_l3_intf_t_init(&intf);
+    intf.l3a_intf_id = (bcm_if_t)s_vpn_l3[vfi].ovl_intf;
+    rv = bcm_l3_intf_delete(U, &intf);
+    if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vpn 0x%x intf_delete(%d): %s", vpn_id, s_vpn_l3[vfi].ovl_intf, bcm_errmsg(rv));
+    }
+    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x L3 unbound (overlay intf %d)", vpn_id, s_vpn_l3[vfi].ovl_intf);
+    memset(&s_vpn_l3[vfi], 0, sizeof(s_vpn_l3[vfi]));
+    return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_vpn_l3_intf(int vpn_id)
+{
+    int vfi = hwbcm_vxlan_vfi_of(vpn_id);
+
+    return (vfi >= 0 && s_vpn_l3[vfi].bound) ? s_vpn_l3[vfi].ovl_intf : -1;
+}
+
+static int hwbcm_vxlan_overlay_egress_do(uint32 flags, int egr_id, int ovl_intf_id, const uint8_t mac[6],
+                                         int vp_gport, int *out_id)
+{
+    bcm_l3_egress_t e;
+    bcm_if_t id = (bcm_if_t)egr_id;
+    int rv;
+
+    if (mac == NULL || ovl_intf_id < 0) {
+        return BCM_E_PARAM;
+    }
+    bcm_l3_egress_t_init(&e);
+    memcpy(e.mac_addr, mac, 6);
+    e.intf = (bcm_if_t)ovl_intf_id;
+    e.port = (bcm_gport_t)vp_gport;
+    rv = bcm_l3_egress_create(U, flags, &e, &id);
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_ERR, "hwbcm_vxlan: overlay egress (intf %d vp 0x%x flags 0x%x): %s",
+                  ovl_intf_id, vp_gport, (unsigned)flags, bcm_errmsg(rv));
+        return rv;
+    }
+    if (out_id != NULL) {
+        *out_id = (int)id;
+    }
+    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: overlay egress %d %s (intf %d vp 0x%x %02x:%02x:%02x:%02x:%02x:%02x)",
+              (int)id, (flags & BCM_L3_REPLACE) ? "replaced" : "created", ovl_intf_id, vp_gport,
+              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_overlay_egress_create(int ovl_intf_id, const uint8_t mac[6], int vp_gport, int *egr_id)
+{
+    if (egr_id == NULL) {
+        return BCM_E_PARAM;
+    }
+    return hwbcm_vxlan_overlay_egress_do(0, 0, ovl_intf_id, mac, vp_gport, egr_id);
+}
+
+int hwbcm_vxlan_overlay_egress_replace(int egr_id, int ovl_intf_id, const uint8_t mac[6], int vp_gport)
+{
+    return hwbcm_vxlan_overlay_egress_do(BCM_L3_REPLACE | BCM_L3_WITH_ID, egr_id, ovl_intf_id, mac, vp_gport, NULL);
 }

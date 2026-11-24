@@ -18,6 +18,8 @@
  *                               NEXT_HOP_GROUP(+MEMBER), ROUTE_ENTRY, VIRTUAL_ROUTER (A3)
  *   SwitchBCM56860HW_vxlan.cpp  TUNNEL, TUNNEL_MAP(+ENTRY), TUNNEL_TERM_TABLE_ENTRY,
  *                               1D BRIDGE / tunnel BRIDGE_PORT, FDB on tunnels   (A4)
+ *   SwitchBCM56860HW_copp.cpp   POLICER, HOSTIF_TRAP_GROUP, hostif trap policing (CoPP)
+ *   SwitchBCM56860HW_qos.cpp    QOS_MAP, SCHEDULER, WRED, BUFFER_POOL/PROFILE, QUEUE/SG/PG (A6)
  */
 
 #include "SwitchBCM56850.h"
@@ -69,6 +71,12 @@ namespace saivs
                     _In_ sai_object_type_t objectType,
                     _In_ const std::string &serializedObjectId,
                     _In_ const sai_attribute_t* attr) override;
+
+            virtual sai_status_t get(
+                    _In_ sai_object_type_t objectType,
+                    _In_ const std::string &serializedObjectId,
+                    _In_ uint32_t attr_count,
+                    _Out_ sai_attribute_t *attr_list) override;
 
             virtual sai_status_t initialize_default_objects(
                     _In_ uint32_t attr_count,
@@ -217,6 +225,16 @@ namespace saivs
             sai_status_t hwRemoveNeighbor(_In_ const std::string &serialized);
             void hwRefreshNeighborsOnLearn(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6], _In_ int port, _In_ int trunk);
             void hwPuntNeighborsOnAge(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6]);
+
+            /* Where a neighbor's MAC lives, from the FDB: port / trunk, or (RIOT
+             * SVI on a VNI-mapped VLAN, MAC behind a remote VTEP) the network VP
+             * plus the VPN's overlay L3 intf. Returns false when unresolved. */
+            bool neighborTarget(_In_ sai_object_id_t rif_id, _In_ const sai_mac_t mac,
+                    _Out_ int &port, _Out_ int &trunk, _Out_ int &vpGport, _Out_ int &ovlIntf);
+            /* Re-point the egress of every neighbor on vid's VLAN RIF at its current target. */
+            void hwReresolveNeighborsOnVlan(_In_ int vid, _In_ bool punt = false);
+            /* RIOT: bind/unbind the L3 gateway of vid's VPN to match "VLAN RIF exists && VLAN has a VNI". */
+            void vxlanSviSync(_In_ int vid, _In_ sai_object_id_t removingRif = SAI_NULL_OBJECT_ID);
             sai_status_t hwCreateNextHop(_In_ sai_object_id_t nh_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwRemoveNextHop(_In_ sai_object_id_t nh_id);
             sai_status_t hwCreateNextHopGroup(_In_ sai_object_id_t nhg_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
@@ -413,5 +431,9 @@ namespace saivs
             sai_status_t vxlanAddAccessPort(_In_ sai_object_id_t member_oid, _In_ int vid, _In_ int vpn);
             void vxlanRemoveAccessPorts(_In_ int vpn);
             int vxlanVpnOfVid(_In_ int vid) const;
+#include "SwitchBCM56860HW_stats.inc.h"
+#include "SwitchBCM56860HW_acl.inc.h"
+#include "SwitchBCM56860HW_copp.inc.h"
+#include "SwitchBCM56860HW_qos.inc.h"
     };
 }

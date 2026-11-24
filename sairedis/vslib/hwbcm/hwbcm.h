@@ -451,6 +451,27 @@ int hwbcm_vxlan_l2_flush_vpn(int vpn_id);
  * to. Returns BCM_E_NOT_FOUND when gport is not one of our VPs. */
 int hwbcm_vxlan_vp_info(int vp_gport, int *is_network, int *port, int *trunk_id, int *vpn_id);
 
+/* RIOT (config.bcm riot_enable=1): routing in and out of VXLAN VFIs. */
+int hwbcm_riot_enabled(void);
+/* L3 ingress mode (on with RIOT): every L3 intf has an ingress object of the
+ * same id. hwbcm_l3_iif_create makes/replaces one with the given VRF. */
+int hwbcm_l3_ingress_mode(void);
+int hwbcm_l3_iif_create(int intf_id, int vrf);
+
+/* L3 gateway (SVI) on a VXLAN VPN: overlay L3 intf on the VFI with the router
+ * MAC, its ingress object (VRF), VFI ingress_if, non-unicast copy to CPU,
+ * router MAC -> CPU in the VFI, IPv4/IPv6 on all VPs of the VPN (and on VPs
+ * created later). Idempotent; returns the overlay intf (egress for routing
+ * into the VPN). BCM_E_UNAVAIL without RIOT. */
+int hwbcm_vxlan_vpn_l3_bind(int vpn_id, const uint8_t mac[6], int vrf, int mtu, int *ovl_intf_id);
+int hwbcm_vxlan_vpn_l3_unbind(int vpn_id);
+/* Overlay intf of a bound VPN, -1 if not bound. */
+int hwbcm_vxlan_vpn_l3_intf(int vpn_id);
+/* Routed egress into a VPN toward a host behind a VXLAN VP (network VP for a
+ * remote host, access VP for a local one). */
+int hwbcm_vxlan_overlay_egress_create(int ovl_intf_id, const uint8_t mac[6], int vp_gport, int *egr_id);
+int hwbcm_vxlan_overlay_egress_replace(int egr_id, int ovl_intf_id, const uint8_t mac[6], int vp_gport);
+
 #ifdef __cplusplus
 }
 #endif

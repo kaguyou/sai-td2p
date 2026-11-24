@@ -224,6 +224,7 @@ static void *g_link_cookie = NULL;
 static uint8_t g_switch_mac[6];
 static int g_switch_mac_valid = 0;
 static int g_ip2me_station_id = -1;
+static int g_ip2me_vfi_station_id = -1;   /* RIOT: same MAC, any VXLAN VFI */
 static int g_ip2me_wanted = 0;
 
 /* knet netif -> filter(s) bookkeeping */
@@ -234,6 +235,7 @@ typedef struct {
     int filter_id;       /* ingress-port filter (prio 50, tag kept), 0 = none */
     int pvid_filter_id;  /* ingress-port + PVID filter (prio 49, tag stripped), 0 = none */
     int pvid;            /* PVID the strip filter was built for */
+    int vfi_filter_id;   /* RIOT: ingress-port + DCB VLAN 0 filter (prio 48, tag stripped), 0 = none */
 } hwbcm_knet_slot_t;
 static hwbcm_knet_slot_t g_knet[HWBCM_KNET_MAX];
 
@@ -277,6 +279,129 @@ static int knet_pvid_filter_create(hwbcm_knet_slot_t *slot, const char *name)
     }
     slot->pvid_filter_id = f.id;
     HWBCM_LOGI("knet: netif %d port %d pvid %d strip filter %d", slot->netif_id, slot->port, slot->pvid, f.id);
+    return 0;
+}
+
+/* RIOT: frames that reach the CPU from a VXLAN VFI (routed to the IP2ME
+ * host, or switched to the router MAC entry of the VFI) carry DCB VLAN 0 and
+ * an in-band tag (VID 0 or the VFI index), so neither the PVID filter nor the
+ * Linux bridge takes them. Strip the tag for DCB VLAN 0 on the port; the
+ * bridge then classifies them to the port PVID (the access VLAN). */
+static int knet_vfi_filter_create(hwbcm_knet_slot_t *slot, const char *name)
+{
+    bcm_knet_filter_t f;
+    int rv;
+
+    bcm_knet_filter_t_init(&f);
+    f.type = BCM_KNET_FILTER_T_RX_PKT;
+    f.priority = 48;
+    f.flags = BCM_KNET_FILTER_F_STRIP_TAG;
+    f.dest_type = BCM_KNET_DEST_T_NETIF;
+    f.dest_id = slot->netif_id;
+    f.match_flags = BCM_KNET_FILTER_M_INGPORT | BCM_KNET_FILTER_M_VLAN;
+    f.m_ingport = slot->port;
+    f.m_vlan = 0;
+    snprintf(f.desc, BCM_KNET_FILTER_DESC_MAX, "%s vfi", name);
+    rv = bcm_knet_filter_create(HWBCM_UNIT, &f);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("bcm_knet_filter_create(port %d vlan 0 strip -> netif %d): %s",
+                   slot->port, slot->netif_id, bcm_errmsg(rv));
+        slot->vfi_filter_id = 0;
+        return rv;
+    }
+    slot->vfi_filter_id = f.id;
+    return 0;
+}
+
+/* Leftovers of a previous syncd that died without hwbcm_deinit (docker stop
+ * timeout -> SIGKILL): its netifs and netif filters stay in the kernel KNET
+ * module, and the next process then fails every hostif create with
+ * BCM_E_RESOURCE (seen 2026-11-24: 72 stale netifs + 72 new > 128). Remove
+ * them before creating ours. Only NETIF-destination filters are ours. */
+#define HWBCM_KNET_STALE_MAX 2048
+typedef struct {
+    int ids[HWBCM_KNET_STALE_MAX];
+    int n;
+} knet_id_list_t;
+
+static int knet_netif_collect(int unit, bcm_knet_netif_t *netif, void *user_data)
+{
+    knet_id_list_t *l = (knet_id_list_t *)user_data;
+
+    (void)unit;
+    if (l->n < HWBCM_KNET_STALE_MAX) {
+        l->ids[l->n++] = netif->id;
+    }
+    return BCM_E_NONE;
+}
+
+static int knet_filter_collect(int unit, bcm_knet_filter_t *filter, void *user_data)
+{
+    knet_id_list_t *l = (knet_id_list_t *)user_data;
+
+    (void)unit;
+    if (filter->dest_type == BCM_KNET_DEST_T_NETIF && l->n < HWBCM_KNET_STALE_MAX) {
+        l->ids[l->n++] = filter->id;
+    }
+    return BCM_E_NONE;
+}
+
+static void knet_stale_cleanup(void)
+{
+    static knet_id_list_t l;
+    int i, nf, nn;
+
+    l.n = 0;
+    (void)bcm_knet_filter_traverse(HWBCM_UNIT, knet_filter_collect, &l);
+    for (i = 0; i < l.n; i++) {
+        (void)bcm_knet_filter_destroy(HWBCM_UNIT, l.ids[i]);
+    }
+    nf = l.n;
+    l.n = 0;
+    (void)bcm_knet_netif_traverse(HWBCM_UNIT, knet_netif_collect, &l);
+    for (i = 0; i < l.n; i++) {
+        (void)bcm_knet_netif_destroy(HWBCM_UNIT, l.ids[i]);
+    }
+    nn = l.n;
+    if (nf || nn) {
+        HWBCM_LOGW("knet: removed %d stale filters and %d stale netifs of a previous process", nf, nn);
+    }
+}
+
+int hwbcm_riot_enabled(void)
+{
+    return soc_feature(HWBCM_UNIT, soc_feature_riot) ? 1 : 0;
+}
+
+/* RIOT: a packet from a VFI that is routed to the CPU (IP2ME host entry, the
+ * reserved L2-to-CPU next hop keeps the forwarding domain) leaves the CPU port
+ * with egress VLAN 0. EGR_VLAN[0] is invalid by default, so the egress drops it
+ * as "invalid VLAN" (TVLAND on cpu0, seen 2026-11-24). Make entry 0 valid for
+ * the CPU only: default STG, no egress membership filter. */
+static int riot_cpu_egress_vlan0_fix(void)
+{
+    egr_vlan_entry_t e;
+    int rv;
+
+    if (!SOC_MEM_IS_VALID(HWBCM_UNIT, EGR_VLANm)) {
+        return 0;
+    }
+    rv = soc_mem_read(HWBCM_UNIT, EGR_VLANm, MEM_BLOCK_ANY, 0, &e);
+    if (SOC_FAILURE(rv)) {
+        HWBCM_LOGE("riot: EGR_VLAN[0] read: %d", rv);
+        return rv;
+    }
+    soc_mem_field32_set(HWBCM_UNIT, EGR_VLANm, &e, VALIDf, 1);
+    soc_mem_field32_set(HWBCM_UNIT, EGR_VLANm, &e, STGf, 1);
+    if (soc_mem_field_valid(HWBCM_UNIT, EGR_VLANm, EN_EFILTERf)) {
+        soc_mem_field32_set(HWBCM_UNIT, EGR_VLANm, &e, EN_EFILTERf, 0);
+    }
+    rv = soc_mem_write(HWBCM_UNIT, EGR_VLANm, MEM_BLOCK_ALL, 0, &e);
+    if (SOC_FAILURE(rv)) {
+        HWBCM_LOGE("riot: EGR_VLAN[0] write: %d", rv);
+        return rv;
+    }
+    HWBCM_LOGI("riot: EGR_VLAN[0] valid for VFI -> CPU");
     return 0;
 }
 
@@ -1052,6 +1177,8 @@ int hwbcm_init(const char *config_bcm)
      * channel setup is still driven by rx start from user space. bcm_init
      * already ran bcm_esw_knet_init, so we do not call bcm_knet_init again
      * (it would reset the kernel-side netif table). */
+    knet_stale_cleanup();
+
     if (!bcm_rx_active(unit)) {
         rv = bcm_rx_start(unit, NULL);
         if (BCM_FAILURE(rv)) {
@@ -1083,6 +1210,11 @@ int hwbcm_init(const char *config_bcm)
     }
 
     hwbcm_port_map_build();
+
+    if (hwbcm_riot_enabled()) {
+        HWBCM_LOGI("riot: enabled (routing in/out of VXLAN VFIs)");
+        (void)riot_cpu_egress_vlan0_fix();
+    }
 
     /* Load balancing: not fatal, the switch forwards without it. */
     rv = hash_init();
@@ -1119,6 +1251,7 @@ int hwbcm_deinit(void)
     for (i = 0; i < HWBCM_KNET_MAX; i++) {
         if (g_knet[i].netif_id != 0) {
             knet_filter_destroy_quiet(&g_knet[i].pvid_filter_id);
+            knet_filter_destroy_quiet(&g_knet[i].vfi_filter_id);
             knet_filter_destroy_quiet(&g_knet[i].filter_id);
             (void)bcm_knet_netif_destroy(unit, g_knet[i].netif_id);
             memset(&g_knet[i], 0, sizeof(g_knet[i]));
@@ -1670,6 +1803,13 @@ static int ip2me_station_apply(void)
         }
         g_ip2me_station_id = -1;
     }
+    if (g_ip2me_vfi_station_id >= 0) {
+        rv = bcm_l2_station_delete(unit, g_ip2me_vfi_station_id);
+        if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+            HWBCM_LOGW("bcm_l2_station_delete(%d): %s", g_ip2me_vfi_station_id, bcm_errmsg(rv));
+        }
+        g_ip2me_vfi_station_id = -1;
+    }
     if (!g_ip2me_wanted || !g_switch_mac_valid) {
         return 0;
     }
@@ -1687,7 +1827,27 @@ static int ip2me_station_apply(void)
         g_ip2me_station_id = -1;
         return rv;
     }
-    HWBCM_LOGI("IP2ME station %d for %02x:%02x:%02x:%02x:%02x:%02x", g_ip2me_station_id,
+    /* RIOT: MY_STATION_TCAM_2 keys on the forwarding domain type, and the
+     * entry above only matches the VLAN domain. A VFI-type VPN id with mask 0
+     * (_BCM_VPN_VFI_IS_SET -> FORWARDING_FIELD_TYPE=1, VFI_ID_MASK=0) matches
+     * every VXLAN VFI, which is what the VFI L3 gateway needs. */
+    if (hwbcm_riot_enabled()) {
+        bcm_l2_station_t vst;
+
+        bcm_l2_station_t_init(&vst);
+        vst.flags = BCM_L2_STATION_IPV4 | BCM_L2_STATION_IPV6 | BCM_L2_STATION_ARP_RARP;
+        vst.priority = 1000;
+        memcpy(vst.dst_mac, g_switch_mac, 6);
+        memset(vst.dst_mac_mask, 0xff, 6);
+        vst.vlan = 0x7000;      /* VPN id of VFI 0; the mask makes it "any VFI" */
+        vst.vlan_mask = 0;
+        rv = bcm_l2_station_add(unit, &g_ip2me_vfi_station_id, &vst);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGE("bcm_l2_station_add(switch mac, any VFI): %s", bcm_errmsg(rv));
+            g_ip2me_vfi_station_id = -1;
+        }
+    }
+    HWBCM_LOGI("IP2ME station %d (VFI %d) for %02x:%02x:%02x:%02x:%02x:%02x", g_ip2me_station_id, g_ip2me_vfi_station_id,
                g_switch_mac[0], g_switch_mac[1], g_switch_mac[2],
                g_switch_mac[3], g_switch_mac[4], g_switch_mac[5]);
     return 0;
@@ -1800,6 +1960,9 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
         memset(slot, 0, sizeof(*slot));
         return rv;
     }
+    if (hwbcm_riot_enabled()) {
+        (void)knet_vfi_filter_create(slot, netif.name);   /* not fatal */
+    }
 
     /* Filter (b): everything else that ingressed on this port, tag kept
      * (tagged VLAN members for the Linux bridge / VLAN subinterfaces). */
@@ -1896,6 +2059,7 @@ int hwbcm_knet_netif_destroy(int netif_id)
     slot = knet_slot_find(netif_id);
     if (slot != NULL) {
         knet_filter_destroy_quiet(&slot->pvid_filter_id);
+        knet_filter_destroy_quiet(&slot->vfi_filter_id);
         knet_filter_destroy_quiet(&slot->filter_id);
     }
     rv = bcm_knet_netif_destroy(unit, netif_id);

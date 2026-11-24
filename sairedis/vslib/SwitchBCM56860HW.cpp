@@ -17,6 +17,7 @@
 #include "meta/sai_serialize.h"
 
 #include "hwbcm/hwbcm.h"
+#include "hwbcm/hwbcm_stats.h"
 
 #include <sys/eventfd.h>
 #include <poll.h>
@@ -210,6 +211,9 @@ sai_status_t SwitchBCM56860HW::hwInitialize()
         SWSS_LOG_NOTICE("attached to %s (device 0x%04x rev 0x%02x)", name, devId, revId);
     }
 
+    // BST (buffer watermarks) + counter baselines for queue/PG/pool stats
+    (void)hwbcm_stats_init();
+
     m_hwReady = true;
 
     // link notification thread
@@ -254,6 +258,8 @@ sai_status_t SwitchBCM56860HW::initialize_default_objects(
 
     CHECK_STATUS(SwitchBCM56850::initialize_default_objects(attr_count, attr_list));
 
+    (void)qosBuildHwMap();
+
     // switch create attributes with a HW effect (e.g. SRC_MAC_ADDRESS)
 
     for (uint32_t i = 0; i < attr_count; i++)
@@ -281,7 +287,9 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
 
     CHECK_STATUS(hwInitialize());
 
-    return buildPortMaps(true);
+    CHECK_STATUS(buildPortMaps(true));
+
+    return qosBuildHwMap();
 }
 
 sai_status_t SwitchBCM56860HW::set_switch_default_attributes()
@@ -533,6 +541,8 @@ sai_status_t SwitchBCM56860HW::hwCreatePort(
 
     mapPort(port_id, bcm, lane);
 
+    qosOnPortMapped(port_id);
+
     for (uint32_t i = 0; i < attr_count; i++)
     {
         sai_status_t status = hwSetPort(port_id, &attr_list[i]);
@@ -557,6 +567,11 @@ sai_status_t SwitchBCM56860HW::hwSetPort(
     if (attr == NULL)
     {
         return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    if (qosIsPortAttr(attr->id))
+    {
+        return qosHwSetPort(port_id, attr);
     }
 
     int bcm = bcmPortOf(port_id);
@@ -675,6 +690,8 @@ sai_status_t SwitchBCM56860HW::hwRemovePort(
             SWSS_LOG_WARN("hwbcm_port_enable_set(%d, 0) failed: %d", bcm, rv);
         }
     }
+
+    qosOnPortRemoved(port_id);
 
     unmapPort(port_id);
 
@@ -847,6 +864,12 @@ static int hwPstatOf(
     }
 }
 
+int SwitchBCM56860HW::hwPortPstatOf(
+        _In_ sai_stat_id_t id)
+{
+    return hwPstatOf(id);
+}
+
 sai_status_t SwitchBCM56860HW::getStatsExt(
         _In_ sai_object_type_t object_type,
         _In_ sai_object_id_t object_id,
@@ -856,6 +879,21 @@ sai_status_t SwitchBCM56860HW::getStatsExt(
         _Out_ uint64_t *counters)
 {
     SWSS_LOG_ENTER();
+
+    // queues / priority groups / buffer pools (SwitchBCM56860HW_stats.cpp)
+    sai_status_t hwStatus;
+
+    if (hwGetObjectStats(object_type, object_id, number_of_counters, counter_ids, mode, counters, hwStatus))
+    {
+        return hwStatus;
+    }
+
+    // hostif trap flow counters (SwitchBCM56860HW_copp.cpp)
+    if (object_type == SAI_OBJECT_TYPE_COUNTER && m_hwReady && !(number_of_counters & VS_COUNTERS_COUNT_MSB) &&
+            hwCoppCounterStats(object_id, number_of_counters, counter_ids, mode, counters))
+    {
+        return SAI_STATUS_SUCCESS;
+    }
 
     int bcm = (object_type == SAI_OBJECT_TYPE_PORT && m_hwReady) ? bcmPortOf(object_id) : -1;
 
@@ -884,6 +922,14 @@ sai_status_t SwitchBCM56860HW::getStatsExt(
         return SAI_STATUS_FAILURE;
     }
 
+    // port counters that are not bcm_stat_val_t (MMU drops, WRED, >1518 buckets, IP)
+    sai_status_t xs = hwPortStatsOverlay(bcm, number_of_counters, counter_ids, mode, counters);
+
+    if (xs != SAI_STATUS_SUCCESS)
+    {
+        return xs;
+    }
+
     if (mode == SAI_STATS_MODE_READ_AND_CLEAR)
     {
         rv = hwbcm_port_stat_multi_clear(bcm, n, ids.data());
@@ -910,6 +956,11 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
     if (attr == NULL || !m_hwReady)
     {
         return SAI_STATUS_SUCCESS;
+    }
+
+    if (qosIsSwitchAttr(attr->id))
+    {
+        return qosHwSetSwitch(attr);
     }
 
     int rv = 0;
@@ -2318,6 +2369,8 @@ sai_status_t SwitchBCM56860HW::hwCreateLagMember(
 
     syncLagMemberPort(lag->value.oid, port->value.oid, true);
 
+    hwAclLagMembersChanged(lag->value.oid);
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -2455,6 +2508,8 @@ sai_status_t SwitchBCM56860HW::hwRemoveLagMember(
 
     syncLagMemberPort(lag, port, false);
 
+    hwAclLagMembersChanged(lag);
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -2504,7 +2559,12 @@ sai_status_t SwitchBCM56860HW::create(
         // core / L2 (A2)
         case SAI_OBJECT_TYPE_PORT:            hw = hwCreatePort(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_HOSTIF:          hw = hwCreateHostif(oid, attr_count, attr_list); break;
-        case SAI_OBJECT_TYPE_HOSTIF_TRAP:     hw = hwCreateHostifTrap(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_HOSTIF_TRAP:
+            hw = hwCreateHostifTrap(oid, attr_count, attr_list);
+            if (hw == SAI_STATUS_SUCCESS) hw = hwCoppOnTrapCreate(oid);
+            break;
+        case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwCreateHostifTrapGroup(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_POLICER:         hw = hwCreatePolicer(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_VLAN:            hw = hwCreateVlan(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_VLAN_MEMBER:     hw = hwCreateVlanMember(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_FDB_ENTRY:       hw = hwCreateFdbEntry(serializedObjectId, attr_count, attr_list); break;
@@ -2518,7 +2578,10 @@ sai_status_t SwitchBCM56860HW::create(
         case SAI_OBJECT_TYPE_NEXT_HOP:              hw = hwCreateNextHop(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_NEXT_HOP_GROUP:        hw = hwCreateNextHopGroup(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER: hw = hwCreateNextHopGroupMember(oid, attr_count, attr_list); break;
-        case SAI_OBJECT_TYPE_ROUTE_ENTRY:           hw = hwCreateRoute(serializedObjectId, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ROUTE_ENTRY:
+            hw = hwCreateRoute(serializedObjectId, attr_count, attr_list);
+            if (hw == SAI_STATUS_SUCCESS) hwCoppOnRoute(serializedObjectId);
+            break;
 
         // VXLAN / bridge (A4)
         case SAI_OBJECT_TYPE_TUNNEL:                 hw = hwCreateTunnel(oid, attr_count, attr_list); break;
@@ -2528,10 +2591,32 @@ sai_status_t SwitchBCM56860HW::create(
         case SAI_OBJECT_TYPE_BRIDGE:                 hw = hwCreateBridge(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_BRIDGE_PORT:            hw = hwCreateBridgePort(oid, attr_count, attr_list); break;
 
+        // ACL
+        case SAI_OBJECT_TYPE_ACL_TABLE:              hw = hwCreateAclTable(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ACL_ENTRY:              hw = hwCreateAclEntry(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ACL_COUNTER:            hw = hwCreateAclCounter(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ACL_RANGE:              hw = hwCreateAclRange(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ACL_TABLE_GROUP:        hw = hwCreateAclTableGroup(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_ACL_TABLE_GROUP_MEMBER: hw = hwCreateAclTableGroupMember(oid, attr_count, attr_list); break;
+
+        // QoS / buffers (A6)
+        case SAI_OBJECT_TYPE_QOS_MAP:                hw = hwCreateQosMap(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_SCHEDULER:              hw = hwCreateScheduler(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_WRED:                   hw = hwCreateWred(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_BUFFER_POOL:            hw = hwCreateBufferPool(oid, attr_count, attr_list); break;
+        case SAI_OBJECT_TYPE_BUFFER_PROFILE:         hw = hwCreateBufferProfile(oid, attr_count, attr_list); break;
+
         default:
 
             // virtual switch behaviour only
             return SAI_STATUS_SUCCESS;
+    }
+
+    if (hw == SAI_STATUS_SUCCESS &&
+        (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
+         object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE))
+    {
+        hw = hwAclBindOnCreate(object_type, oid, attr_count, attr_list);
     }
 
     if (hw != SAI_STATUS_SUCCESS)
@@ -2575,11 +2660,20 @@ sai_status_t SwitchBCM56860HW::remove(
 
         sai_status_t hw = SAI_STATUS_SUCCESS;
 
+        if (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
+            object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE)
+        {
+            hwAclObjectRemoved(oid);   // drops its bindings, reprograms affected tables
+        }
+
         switch (object_type)
         {
             // core / L2 (A2)
             case SAI_OBJECT_TYPE_PORT:            hw = hwRemovePort(oid); break;
             case SAI_OBJECT_TYPE_HOSTIF:          hw = hwRemoveHostif(oid); break;
+            case SAI_OBJECT_TYPE_HOSTIF_TRAP:     hw = hwCoppOnTrapRemove(oid); break;
+            case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwRemoveHostifTrapGroup(oid); break;
+            case SAI_OBJECT_TYPE_POLICER:         hw = hwRemovePolicer(oid); break;
             case SAI_OBJECT_TYPE_VLAN:            hw = hwRemoveVlan(oid); break;
             case SAI_OBJECT_TYPE_VLAN_MEMBER:     hw = hwRemoveVlanMember(oid); break;
             case SAI_OBJECT_TYPE_FDB_ENTRY:       hw = hwRemoveFdbEntry(serializedObjectId); break;
@@ -2602,6 +2696,21 @@ sai_status_t SwitchBCM56860HW::remove(
             case SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY: hw = hwRemoveTunnelTermEntry(oid); break;
             case SAI_OBJECT_TYPE_BRIDGE:                 hw = hwRemoveBridge(oid); break;
             case SAI_OBJECT_TYPE_BRIDGE_PORT:            hw = hwRemoveBridgePort(oid); break;
+
+            // ACL
+            case SAI_OBJECT_TYPE_ACL_TABLE:              hw = hwRemoveAclTable(oid); break;
+            case SAI_OBJECT_TYPE_ACL_ENTRY:              hw = hwRemoveAclEntry(oid); break;
+            case SAI_OBJECT_TYPE_ACL_COUNTER:            hw = hwRemoveAclCounter(oid); break;
+            case SAI_OBJECT_TYPE_ACL_RANGE:              hw = hwRemoveAclRange(oid); break;
+            case SAI_OBJECT_TYPE_ACL_TABLE_GROUP:        hw = hwRemoveAclTableGroup(oid); break;
+            case SAI_OBJECT_TYPE_ACL_TABLE_GROUP_MEMBER: hw = hwRemoveAclTableGroupMember(oid); break;
+
+            // QoS / buffers (A6)
+            case SAI_OBJECT_TYPE_QOS_MAP:                hw = hwRemoveQosMap(oid); break;
+            case SAI_OBJECT_TYPE_SCHEDULER:              hw = hwRemoveScheduler(oid); break;
+            case SAI_OBJECT_TYPE_WRED:                   hw = hwRemoveWred(oid); break;
+            case SAI_OBJECT_TYPE_BUFFER_POOL:            hw = hwRemoveBufferPool(oid); break;
+            case SAI_OBJECT_TYPE_BUFFER_PROFILE:         hw = hwRemoveBufferProfile(oid); break;
 
             default:
                 break;
@@ -2646,13 +2755,37 @@ sai_status_t SwitchBCM56860HW::set(
 
     sai_status_t hw = SAI_STATUS_SUCCESS;
 
-    switch (objectType)
+    if (hwAclIsBindAttr(objectType, attr->id))
     {
-        case SAI_OBJECT_TYPE_SWITCH:           hw = hwSetSwitch(attr); break;
+        // PORT/LAG/VLAN/RIF *_INGRESS_ACL/_EGRESS_ACL, SWITCH INGRESS/EGRESS/PRE_INGRESS_ACL
+        hw = hwAclBind(objectType, oid, attr);
+    }
+    else switch (objectType)
+    {
+        case SAI_OBJECT_TYPE_SWITCH:
+            hw = hwSetSwitch(attr);
+            if (hw == SAI_STATUS_SUCCESS && attr->id == SAI_SWITCH_ATTR_SRC_MAC_ADDRESS) hwCoppRefresh();
+            break;
         case SAI_OBJECT_TYPE_PORT:             hw = hwSetPort(oid, attr); break;
+        case SAI_OBJECT_TYPE_HOSTIF_TRAP:      hw = hwCoppOnTrapSet(oid, attr); break;
+        case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwSetHostifTrapGroup(oid, attr); break;
+        case SAI_OBJECT_TYPE_POLICER:          hw = hwSetPolicer(oid, attr); break;
         case SAI_OBJECT_TYPE_ROUTER_INTERFACE: hw = hwSetRouterInterface(oid, attr); break;
-        case SAI_OBJECT_TYPE_ROUTE_ENTRY:      hw = hwSetRoute(serializedObjectId, attr); break;
+        case SAI_OBJECT_TYPE_ROUTE_ENTRY:
+            hw = hwSetRoute(serializedObjectId, attr);
+            if (hw == SAI_STATUS_SUCCESS) hwCoppOnRoute(serializedObjectId);
+            break;
         case SAI_OBJECT_TYPE_HASH:             hw = hwSetHash(oid, attr); break;
+        case SAI_OBJECT_TYPE_ACL_ENTRY:              hw = hwSetAclEntry(oid, attr); break;
+        case SAI_OBJECT_TYPE_ACL_COUNTER:            hw = hwSetAclCounter(oid, attr); break;
+        case SAI_OBJECT_TYPE_QOS_MAP:                hw = hwSetQosMap(oid, attr); break;
+        case SAI_OBJECT_TYPE_SCHEDULER:              hw = hwSetScheduler(oid, attr); break;
+        case SAI_OBJECT_TYPE_WRED:                   hw = hwSetWred(oid, attr); break;
+        case SAI_OBJECT_TYPE_BUFFER_POOL:            hw = hwSetBufferPool(oid, attr); break;
+        case SAI_OBJECT_TYPE_BUFFER_PROFILE:         hw = hwSetBufferProfile(oid, attr); break;
+        case SAI_OBJECT_TYPE_QUEUE:                  hw = hwSetQueue(oid, attr); break;
+        case SAI_OBJECT_TYPE_SCHEDULER_GROUP:        hw = hwSetSchedulerGroup(oid, attr); break;
+        case SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP: hw = hwSetIngressPriorityGroup(oid, attr); break;
 
         default:
             break;
@@ -2667,6 +2800,24 @@ sai_status_t SwitchBCM56860HW::set(
                 sai_serialize_status(hw).c_str());
 
         return hw;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::get(
+        _In_ sai_object_type_t objectType,
+        _In_ const std::string &serializedObjectId,
+        _In_ uint32_t attr_count,
+        _Out_ sai_attribute_t *attr_list)
+{
+    SWSS_LOG_ENTER();
+
+    CHECK_STATUS(SwitchBCM56850::get(objectType, serializedObjectId, attr_count, attr_list));
+
+    if (objectType == SAI_OBJECT_TYPE_ACL_COUNTER)
+    {
+        return hwAclCounterGet(serializedObjectId, attr_count, attr_list);
     }
 
     return SAI_STATUS_SUCCESS;

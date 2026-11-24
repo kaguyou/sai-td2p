@@ -10,6 +10,6 @@ git rev-parse HEAD > "$HERE/BASE_COMMIT"
 git diff -- vslib > "$HERE/vslib.patch"
 rm -rf "$HERE/vslib"
 mkdir -p "$HERE/vslib/hwbcm"
-cp vslib/SwitchBCM56860HW.h vslib/SwitchBCM56860HW.cpp vslib/SwitchBCM56860HW_l3.cpp vslib/SwitchBCM56860HW_vxlan.cpp "$HERE/vslib/"
+cp vslib/SwitchBCM56860HW*.h vslib/SwitchBCM56860HW*.cpp "$HERE/vslib/"
 cp vslib/hwbcm/*.c vslib/hwbcm/*.h "$HERE/vslib/hwbcm/"
 echo "base $(cat "$HERE/BASE_COMMIT")"; wc -l "$HERE/vslib.patch"; find "$HERE/vslib" -type f | sort
