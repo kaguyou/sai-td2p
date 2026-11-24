@@ -198,6 +198,15 @@ else
     log "RIOT already enabled in $cfg_host"
 fi
 
+# Lossy by default like the Broadcom SAI SKUs: with the SDK default
+# mmu_lossless=1 PG7 is lossless and over-subscribed traffic is dropped at
+# ingress (not counted as queue drops) or paused. SONiC programs lossless PGs
+# itself (PFC) when a buffer config asks for them.
+if ! grep -q '^mmu_lossless=' "$cfg_host"; then
+    printf '# sai-td2p: lossy MMU default (SONiC buffer config adds lossless PGs)\nmmu_lossless=0\n' | sudo tee -a "$cfg_host" >/dev/null
+    log "set mmu_lossless=0 in $cfg_host"
+fi
+
 python3 -I "$GEN" "$HWSKU/port_config.ini" -c "$cfg_host" -o "$TMP/lanemap.ini"
 sudo install -m 644 -o root -g root "$TMP/lanemap.ini" "$HWSKU/lanemap.ini"
 log "wrote $HWSKU/lanemap.ini ($(grep -vc '^#' "$HWSKU/lanemap.ini") ports)"

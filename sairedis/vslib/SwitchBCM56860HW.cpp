@@ -471,6 +471,26 @@ sai_status_t SwitchBCM56860HW::buildPortMaps(
             SWSS_LOG_WARN("hwbcm_port_enable_set(%d, %d) failed: %d", bcm, enable, rv);
         }
 
+        // flow control: SAI default is SAI_PORT_FLOW_CONTROL_MODE_DISABLE, the
+        // SDK leaves 802.3x pause on, so a congested egress paused the sender
+        // instead of dropping (2026-11-24, shaper test). Apply the stored mode.
+        {
+            int tx = 0, rx = 0;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_GLOBAL_FLOW_CONTROL_MODE, attr))
+            {
+                tx = (attr.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_TX_ONLY || attr.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_BOTH_ENABLE) ? 1 : 0;
+                rx = (attr.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_RX_ONLY || attr.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_BOTH_ENABLE) ? 1 : 0;
+            }
+
+            int prv = hwbcm_port_pause_set(bcm, tx, rx);
+
+            if (prv < 0)
+            {
+                SWSS_LOG_WARN("hwbcm_port_pause_set(%d, %d, %d) failed: %d", bcm, tx, rx, prv);
+            }
+        }
+
         // speed: the base class default (40G) is a placeholder, store what the
         // hardware really has so GET returns the truth until orchagent sets it
 
