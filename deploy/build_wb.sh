@@ -1,7 +1,10 @@
 #!/bin/bash
 # build_wb.sh - build warm-boot-enabled libsaivs.so.0.0.0
-#               (sonic-sairedis-wb vslib + hwbcm + static OpenBCM sdk-6.5.27-wb)
+#               (sonic-sairedis vslib + hwbcm + static OpenBCM sdk-6.5.27-wb)
 #               inside the `saibuild` podman container, then sanity-check the result.
+#               This is the default variant going forward; deploy/build.sh is the cold-only
+#               build against sdk-6.5.27. Both write deploy/build/libsaivs.so.0.0.0 (last one
+#               wins, see libsaivs.so.0.0.0.variant); the tracked nm-*.txt lists come from here.
 #
 # Run on the PC:
 #     deploy/build_wb.sh [-j N] [--dry-run] [--check-only] [--force-archive] [--no-meta]
@@ -13,18 +16,42 @@
 #   --force-archive  rebuild the merged SDK archive even if it looks up to date
 #   --no-meta        do not run `make -C meta` first
 #   env C_STD        extra CFLAGS for the C (hwbcm) objects, default "-std=gnu99"
+#   env SAI_TD2P_DIR this repo (sdk_cflags_wb.txt, sdk_incs_wb.txt, deploy/build/), default = the
+#                    checkout this script lives in
+#   env SAIREDIS_DIR configured sonic-sairedis tree with sairedis/ applied, default $HOST_ROOT/sonic-sairedis
+#   env SDK_DIR      warm-boot OpenBCM SDK, default $HOST_ROOT/openbcm-src/sdk-6.5.27-wb
+#   env LINK_LIST    SDK link list, default $HOST_ROOT/as5812-bdeshim/sdk_link_list_wb.txt
+#   All paths are PC paths under $HOST_ROOT (the only directory mounted in saibuild, as /w).
+#   SAIREDIS_DIR may be shared with deploy/build.sh: a flags stamp in vslib/hwbcm forces the hwbcm
+#   objects to be recompiled whenever the SDK flags differ from the last build in that tree.
 set -euo pipefail
 
-HOST_ROOT=/home/kaguyou/homelab          # mounted as /w inside saibuild
+HOST_ROOT=${HOST_ROOT:-/home/kaguyou/homelab}   # mounted as /w inside saibuild
 CT_ROOT=/w
 CT_NAME=saibuild
+# include paths inside sdk_*_wb.txt were captured from this SDK root (rewritten when SDK_DIR differs)
+CAPTURED_SDK=$CT_ROOT/openbcm-src/sdk-6.5.27-wb
 
 # ---------------------------------------------------------------- outer (PC) --
 if [ "${1:-}" != "--inner" ]; then
+    to_ct() {
+        local p
+        p=$(realpath -m "$1")
+        case "$p" in
+            "$HOST_ROOT"/*) echo "$CT_ROOT${p#"$HOST_ROOT"}" ;;
+            *) echo "ERROR: $p is not under $HOST_ROOT (only that is mounted in $CT_NAME)" >&2; return 1 ;;
+        esac
+    }
     command -v podman >/dev/null 2>&1 || { echo "ERROR: podman not found" >&2; exit 1; }
     state=$(podman inspect -f '{{.State.Running}}' "$CT_NAME" 2>/dev/null || true)
     [ "$state" = "true" ] || { echo "ERROR: container $CT_NAME is not running (podman start $CT_NAME)" >&2; exit 1; }
-    exec podman exec -e HOST_ROOT="$HOST_ROOT" -e C_STD="${C_STD:--std=gnu99}" "$CT_NAME" bash "$CT_ROOT/sai-td2p-wb/deploy/build_wb.sh" --inner "$@"
+    CT_SAI_TD2P=$(to_ct "${SAI_TD2P_DIR:-$(dirname "$(realpath "$0")")/..}") || exit 1
+    CT_SAIREDIS=$(to_ct "${SAIREDIS_DIR:-$HOST_ROOT/sonic-sairedis}") || exit 1
+    CT_SDK=$(to_ct "${SDK_DIR:-$HOST_ROOT/openbcm-src/sdk-6.5.27-wb}") || exit 1
+    CT_LINK_LIST=$(to_ct "${LINK_LIST:-$HOST_ROOT/as5812-bdeshim/sdk_link_list_wb.txt}") || exit 1
+    exec podman exec -e HOST_ROOT="$HOST_ROOT" -e C_STD="${C_STD:--std=gnu99}" \
+        -e SAI_TD2P_DIR="$CT_SAI_TD2P" -e SAIREDIS_DIR="$CT_SAIREDIS" -e SDK_DIR="$CT_SDK" -e LINK_LIST="$CT_LINK_LIST" \
+        "$CT_NAME" bash "$CT_SAI_TD2P/deploy/build_wb.sh" --inner "$@"
 fi
 shift
 
@@ -43,24 +70,25 @@ while [ $# -gt 0 ]; do
         --check-only) CHECK_ONLY=1 ;;
         --force-archive) FORCE_ARCHIVE=1 ;;
         --no-meta) DO_META=0 ;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
 done
 
-SR=$CT_ROOT/sonic-sairedis-wb
-SDK=$CT_ROOT/openbcm-src/sdk-6.5.27-wb
+# container paths, set by the outer half
+SAI_TD2P=${SAI_TD2P_DIR:?run deploy/build_wb.sh from the PC, not with --inner}
+SR=${SAIREDIS_DIR:?}
+SDK=${SDK_DIR:?}
+LINK_LIST=${LINK_LIST:?}
 SDKB=$SDK/build/unix-user/x86-smp_generic_64-2_6
-LINK_LIST=$CT_ROOT/as5812-bdeshim/sdk_link_list_wb.txt
-OUT=$CT_ROOT/sai-td2p-wb/deploy/build
+OUT=$SAI_TD2P/deploy/build
 MERGED=$OUT/libopenbcm_td2p_wb.a
 BUILT_SO=$SR/vslib/.libs/libsaivs.so.0.0.0
 SO=$OUT/libsaivs.so.0.0.0
 
-CFLAGS_WB_FILE=$CT_ROOT/sai-td2p-wb/sdk_cflags_wb.txt
-[ -f "$CFLAGS_WB_FILE" ] || CFLAGS_WB_FILE=$CT_ROOT/sai-td2p/sdk_cflags_wb.txt
-INCS_WB_FILE=$CT_ROOT/sai-td2p-wb/sdk_incs_wb.txt
+CFLAGS_WB_FILE=$SAI_TD2P/sdk_cflags_wb.txt
+INCS_WB_FILE=$SAI_TD2P/sdk_incs_wb.txt
 
 # target = SONiC 202505, Debian 12 (bookworm): glibc 2.36, libstdc++ 12
 TARGET_GLIBC_MAX=2.36
@@ -130,18 +158,22 @@ fi
 CFLAGS_BASE=$(sed -n 's/^CFLAGS = *//p' "$SR/vslib/Makefile" | head -1)
 CFLAGS_VALUE="$CFLAGS_BASE $C_STD"
 SDK_CFLAGS_VALUE="$(cat "$CFLAGS_WB_FILE") $(cat "$INCS_WB_FILE")"
+if [ "$SDK" != "$CAPTURED_SDK" ]; then
+    SDK_CFLAGS_VALUE=$(printf '%s' "$SDK_CFLAGS_VALUE" | sed -E "s#${CAPTURED_SDK//./\\.}(/| |\$)#$SDK\1#g")
+fi
 # -Wl,-lm ... after the archive: libtool emits plain -lm before the -Wl, items, so the SDK's libm
 # references would stay unbound (unversioned exp/log/pow/sqrt, libm not in NEEDED) without this.
 LIBS_VALUE="-Wl,$SDKB/platform_defines.o -Wl,$MERGED -Wl,-lm -Wl,-lrt -Wl,-ldl -Wl,-lpthread libSaiVS.a -lpthread -lrt -lm -ldl"
 
-# Ensure hwbcm/*.o are never stale non-WB objects copied from sonic-sairedis.
-WB_STAMP="$SR/vslib/hwbcm/.wb_cflags_stamp"
-WB_STAMP_SIG=$(sha256sum "$CFLAGS_WB_FILE" "$INCS_WB_FILE" | sha256sum | awk '{print $1}')
+# hwbcm/*.o must never be stale objects built with other SDK flags (deploy/build.sh, cold SDK, may
+# use the same sonic-sairedis tree). Same stamp file and signature scheme as deploy/build.sh.
+FLAGS_STAMP="$SR/vslib/hwbcm/.sdk_cflags_stamp"
+FLAGS_SIG=$(printf '%s' "$SDK_CFLAGS_VALUE" | sha256sum | awk '{print $1}')
 if [ $CHECK_ONLY = 0 ] && [ $DRY = 0 ]; then
-    if [ ! -f "$WB_STAMP" ] || [ "$(cat "$WB_STAMP")" != "$WB_STAMP_SIG" ]; then
-        log "forcing full recompile of hwbcm/*.o with warm-boot SDK flags"
+    if [ ! -f "$FLAGS_STAMP" ] || [ "$(cat "$FLAGS_STAMP")" != "$FLAGS_SIG" ]; then
+        log "SDK flags changed since the last build in $(to_host "$SR"): recompiling hwbcm/*.o (warm-boot SDK flags)"
         rm -f "$SR"/vslib/hwbcm/*.o "$SR"/vslib/libSaiVS.a
-        echo "$WB_STAMP_SIG" > "$WB_STAMP"
+        echo "$FLAGS_SIG" > "$FLAGS_STAMP"
     fi
 fi
 
@@ -164,8 +196,8 @@ if [ $CHECK_ONLY = 0 ]; then
         log "[dry-run] done. The libtool line must end with: libSaiVS.a $LIBS_VALUE"
         exit 0
     fi
-    if pgrep -f "libtool.*--mode=link.*sonic-sairedis-wb.*libsaivs" >/dev/null 2>&1; then
-        die "another sonic-sairedis-wb libsaivs link is running in the container right now; retry when it is done"
+    if pgrep -f "libtool.*--mode=link.*libsaivs" >/dev/null 2>&1; then
+        die "another libsaivs link is running in the container right now; retry when it is done"
     fi
     make -C "$SR/vslib" -j"$JOBS" libsaivs.la \
         SDK_CFLAGS="$SDK_CFLAGS_VALUE" CFLAGS="$CFLAGS_VALUE" LIBS="$LIBS_VALUE"
@@ -180,11 +212,13 @@ ln -sfn "$(basename "$SO")" "$OUT/libsaivs.so"
 ln -sfn "$(basename "$SO")" "$OUT/libsaivs.so.0"
 rm -f "$OUT/libsaivs.so.sha256"
 sha256sum "$SO" | awk '{print $1}' > "$SO.sha256"
+printf 'variant=warmboot\nsdk=%s\nsairedis=%s\nsha256=%s\n' "$(to_host "$SDK")" "$(to_host "$SR")" "$(cat "$SO.sha256")" > "$SO.variant"
 log "result"
 echo "   built:     $(to_host "$BUILT_SO")"
 echo "   copy:      $(to_host "$SO")"
 echo "   size:      $(stat -c %s "$SO") bytes ($(du -h "$SO" | cut -f1))"
 echo "   sha256:    $(cat "$SO.sha256")"
+echo "   variant:   warmboot ($(to_host "$SO.variant"))"
 echo "   soname:    $(readelf -d "$SO" | awk '/SONAME/{print $5}')"
 
 # ------------------------------------------------------------------ checks --

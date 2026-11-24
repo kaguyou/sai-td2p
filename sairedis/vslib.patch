@@ -1,5 +1,5 @@
 diff --git a/vslib/Makefile.am b/vslib/Makefile.am
-index ca2e26d..261702a 100644
+index ca2e26d..cbf722d 100644
 --- a/vslib/Makefile.am
 +++ b/vslib/Makefile.am
 @@ -53,6 +53,14 @@ libSaiVS_a_SOURCES = \
@@ -17,7 +17,7 @@ index ca2e26d..261702a 100644
  					  SwitchBCM56971B0.cpp \
  					  SwitchBCM81724.cpp \
  					  SwitchConfigContainer.cpp \
-@@ -70,7 +78,23 @@ libSaiVS_a_SOURCES = \
+@@ -70,7 +78,29 @@ libSaiVS_a_SOURCES = \
  					  TrafficForwarder.cpp \
  					  VirtualSwitchSaiInterface.cpp \
  					  VirtualSwitchSaiInterfaceFdb.cpp \
@@ -34,16 +34,22 @@ index ca2e26d..261702a 100644
 +					  hwbcm/hwbcm_mirror.c
 +
 +# hwbcm/*.c wrap the OpenBCM SDK (BCM56860 hardware switch). They need the SDK
-+# defines and include paths, kept in ../sai-td2p next to this tree (see
-+# sai-td2p/DESIGN.md). The SDK static libraries are added at link time by the
-+# deploy scripts (LIBS override), not here.
-+SDK_CFLAGS = $(shell cat $(top_srcdir)/../sai-td2p-wb/sdk_cflags_wb.txt $(top_srcdir)/../sai-td2p-wb/sdk_incs_wb.txt 2>/dev/null)
++# defines and include paths, captured in the sai-td2p checkout (see
++# sai-td2p/DESIGN.md): sdk_cflags_wb.txt + sdk_incs_wb.txt for the warm-boot
++# SDK (sdk-6.5.27-wb, the default) or sdk_cflags.txt + sdk_incs.txt for the
++# cold-only SDK (SDK_FLAGS_SUFFIX=). sai-td2p/deploy/build.sh and build_wb.sh
++# always pass SDK_CFLAGS on the make line; these defaults only matter for a
++# plain `make`. The SDK static libraries are added at link time by the deploy
++# scripts (LIBS override), not here.
++SAI_TD2P_DIR = $(top_srcdir)/../sai-td2p
++SDK_FLAGS_SUFFIX = _wb
++SDK_CFLAGS = $(shell cat $(SAI_TD2P_DIR)/sdk_cflags$(SDK_FLAGS_SUFFIX).txt $(SAI_TD2P_DIR)/sdk_incs$(SDK_FLAGS_SUFFIX).txt 2>/dev/null)
 +libSaiVS_a_CFLAGS = $(SDK_CFLAGS) -fPIC -I$(srcdir)/hwbcm
  
  if USE_VPP
  libSaiVS_a_SOURCES +=\
 diff --git a/vslib/Sai.cpp b/vslib/Sai.cpp
-index bc6694a..f173ef9 100644
+index bc6694a..161b02d 100644
 --- a/vslib/Sai.cpp
 +++ b/vslib/Sai.cpp
 @@ -152,6 +152,31 @@ sai_status_t Sai::apiInitialize(
@@ -115,7 +121,7 @@ index 051aa0a..c2c442d 100644
  
          SWSS_LOG_ERROR("unknown switch type: '%s', expected (%s)",
 diff --git a/vslib/SwitchConfig.h b/vslib/SwitchConfig.h
-index 409a6c3..70c2c0a 100644
+index 409a6c3..c17973c 100644
 --- a/vslib/SwitchConfig.h
 +++ b/vslib/SwitchConfig.h
 @@ -30,6 +30,8 @@ namespace saivs
@@ -127,7 +133,7 @@ index 409a6c3..70c2c0a 100644
      } sai_vs_switch_type_t;
  
      typedef enum _sai_vs_boot_type_t
-@@ -90,6 +92,18 @@ namespace saivs
+@@ -90,6 +92,19 @@ namespace saivs
  
              bool m_useConfiguredSpeedAsOperSpeed;
  

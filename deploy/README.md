@@ -8,7 +8,8 @@ All scripts run **on the PC**. Nothing here starts syncd; the start commands are
 
 | file | what |
 |---|---|
-| `build.sh` | compile in `saibuild`, explicit `g++ -shared` link with the full SDK group, nm/ldd checks |
+| `build_wb.sh` | **default going forward**: same as build.sh but against the warm-boot SDK `openbcm-src/sdk-6.5.27-wb` (`sdk_*_wb.txt`, `sdk_link_list_wb.txt`, `libopenbcm_td2p_wb.a`) plus warm-boot symbol checks; writes the tracked `nm-*.txt` |
+| `build.sh` | cold-only variant against `openbcm-src/sdk-6.5.27`: compile in `saibuild`, explicit `g++ -shared` link with the full SDK group, nm/ldd checks (nm lists go to untracked `nm-*-cold.txt`) |
 | `install.sh` | scp + install on the switch (device node, load test, backup, symlink, lanemap.ini, sai.profile) |
 | `rollback.sh` | restore the vendor `libsai.so.1` and `sai.profile.vendor` |
 | `gen_lanemap.py` | `port_config.ini` -> `lanemap.ini` (also run on the switch by install.sh) |
@@ -16,7 +17,9 @@ All scripts run **on the PC**. Nothing here starts syncd; the start commands are
 | `common.sh` | shared ssh/scp helpers (target probing IPv4 -> IPv6 link-local) |
 | `remote_install.sh`, `remote_rollback.sh` | the switch-side halves, streamed over ssh (`bash -s`) |
 | `ref/` | read-only copies fetched from the switch: `port_config.ini`, `sai.profile`, `td2-as5812t-72x10G.config.bcm`, `syncd_init_common.sh`, `syncd_container_start.sh`, `switch_host_scripts.txt` (host syncd.sh, opennsl-modules, supervisor conf), and `lanemap.ini.expected` (generator output) |
-| `build/` | outputs: `libsaivs.so.0.0.0` (+ `libsaivs.so`, `libsaivs.so.0` symlinks), `.sha256`, `libopenbcm_td2p.a` (merged SDK), `nm-undefined.txt`, `nm-defined.txt`, `dry-run.log` |
+| `build/` | outputs: `libsaivs.so.0.0.0` (+ `libsaivs.so`, `libsaivs.so.0` symlinks), `.sha256`, `.variant` (which script/SDK built it: both scripts write the same `libsaivs.so.0.0.0`, last one wins), `libopenbcm_td2p{,_wb}.a` (merged SDK), `nm-undefined.txt`, `nm-defined.txt` (from build_wb.sh), `dry-run.log` |
+
+Both build scripts take `SAI_TD2P_DIR` (default: this checkout), `SAIREDIS_DIR` (default `~/homelab/sonic-sairedis`), `SDK_DIR` and `LINK_LIST` from the environment (PC paths under `~/homelab`, mounted as `/w` in `saibuild`). They may share one sonic-sairedis tree: a stamp (`vslib/hwbcm/.sdk_cflags_stamp`) forces the hwbcm objects to be recompiled when the SDK flags change.
 
 Connection defaults (override via env): `SWITCH_V4=192.168.0.2`, `SWITCH_V6=fe80::aa2b:b5ff:fe3a:3e8e%enp2s0`,
 `SWITCH_USER=admin`, `SWITCH_PASS`. If both fail: `ip -br addr show enp2s0` and `nmcli con up sonic-mgmt`

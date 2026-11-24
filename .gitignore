@@ -2,6 +2,7 @@
 deploy/build/*.a
 deploy/build/*.so*
 deploy/build/*.sha256
+deploy/build/nm-*-cold.txt
 hwtest/hwtest
 hwtest/hwtest_wb
 *.o
