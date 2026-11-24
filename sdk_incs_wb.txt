@@ -1,0 +1,1 @@
+-I/w/openbcm-src/sdk-6.5.27-wb/include -I/w/openbcm-src/sdk-6.5.27-wb/systems/bde/linux/include -I/w/openbcm-src/sdk-6.5.27-wb/systems -I/w/openbcm-src/sdk-6.5.27-wb/src/appl/cint -I/w/openbcm-src/sdk-6.5.27-wb/systems/bde/linux/user/kernel

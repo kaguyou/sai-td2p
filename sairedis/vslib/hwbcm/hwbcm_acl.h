@@ -197,6 +197,11 @@ int hwbcm_acl_range_destroy(int range_id);
 int hwbcm_acl_dump_group(int gid);
 int hwbcm_acl_dump_entry(int eid);
 
+/* Warm boot helpers (Phase 3): restore group metadata with zero HW writes,
+ * reset SW caches on deinit. */
+int  hwbcm_acl_group_restore(int gid, int stage, uint32_t quals);
+void hwbcm_acl_warm_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

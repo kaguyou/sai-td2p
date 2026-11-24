@@ -114,6 +114,10 @@ int hwbcm_mirror_port_delete_all(int port, uint32_t dir);
 /* Log all currently installed mirror destinations at INFO level. */
 int hwbcm_mirror_dump(void);
 
+/* Warm boot helper (Phase 3): read-only check whether dest_gport exists in SDK
+ * (1 = exists, 0 = not found). */
+int hwbcm_mirror_dest_exists(int dest_gport);
+
 #ifdef __cplusplus
 }
 #endif

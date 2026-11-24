@@ -143,6 +143,45 @@ int hwbcm_copp_dump(void);
 /* Destroy all entries, policers and the group (switch remove / tests). */
 int hwbcm_copp_deinit(void);
 
+/* Warm boot helpers (Phase 3): persist/restore CoPP SW tables with zero HW writes. */
+#define HWBCM_COPP_MAX_TRAPS    64
+#define HWBCM_COPP_MAX_RULES    6
+#define HWBCM_COPP_MAX_POLICERS 32
+
+typedef struct {
+    int group_valid;
+    int group;
+    int have_to_me;
+    int have_icmp;
+    int have_stats;
+    int local_egr;
+} hwbcm_copp_wb_globals_t;
+
+typedef struct {
+    int slot_idx;
+    int pid;
+    hwbcm_copp_policer_cfg_t cfg;
+} hwbcm_copp_policer_wb_t;
+
+typedef struct {
+    int slot_idx;
+    hwbcm_copp_trap_cfg_t cfg;
+    int neid;
+    int eid[HWBCM_COPP_MAX_RULES];
+    int stat_id[HWBCM_COPP_MAX_RULES];
+    uint64_t base_nr_pkts;
+    uint64_t base_nr_bytes;
+    uint64_t base_red_pkts;
+} hwbcm_copp_slot_wb_t;
+
+void hwbcm_copp_wb_get(hwbcm_copp_wb_globals_t *globals,
+                       hwbcm_copp_policer_wb_t *pols, int max_pols, int *npols,
+                       hwbcm_copp_slot_wb_t *slots, int max_slots, int *nslots);
+int  hwbcm_copp_warm_restore(const hwbcm_copp_wb_globals_t *globals,
+                             const hwbcm_copp_policer_wb_t *pols, int npols,
+                             const hwbcm_copp_slot_wb_t *slots, int nslots);
+void hwbcm_copp_warm_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

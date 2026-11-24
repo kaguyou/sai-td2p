@@ -350,7 +350,8 @@ void SwitchBCM56860HW::qosUnmapPort(
     }
 }
 
-sai_status_t SwitchBCM56860HW::qosBuildHwMap()
+sai_status_t SwitchBCM56860HW::qosBuildHwMap(
+        _In_ bool warmBoot)
 {
     SWSS_LOG_ENTER();
 
@@ -376,12 +377,9 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
         qosMapPort(m_cpu_port_id);
     }
 
-    SWSS_LOG_NOTICE("qos: hardware map built: %zu queues, %zu scheduler groups, %zu PGs",
+    SWSS_LOG_NOTICE("qos: hardware map built (%s): %zu queues, %zu scheduler groups, %zu PGs",
+            warmBoot ? "warm/SW-only" : "cold",
             m_qosQueueHw.size(), m_qosSgHw.size(), m_qosPgHw.size());
-
-    // Resync desired state from the object hash (warm boot / syncd restart:
-    // the SDK came up cold while the vslib bookkeeping kept the objects).
-    // On a cold start these tables are empty and this is a no-op.
 
     auto forEach = [&](sai_object_type_t ot, std::function<void(sai_object_id_t)> fn)
     {
@@ -409,6 +407,11 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
         }
     };
 
+    m_qosMapType.clear();
+    m_qosSchedulers.clear();
+    m_qosWreds.clear();
+    m_qosProfiles.clear();
+
     forEach(SAI_OBJECT_TYPE_QOS_MAP, [&](sai_object_id_t oid) {
             sai_attribute_t a;
             if (getStoredAttr(SAI_OBJECT_TYPE_QOS_MAP, oid, SAI_QOS_MAP_ATTR_TYPE, a))
@@ -419,6 +422,173 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
 
     forEach(SAI_OBJECT_TYPE_SCHEDULER, [&](sai_object_id_t oid) { m_qosSchedulers.insert(oid); });
     forEach(SAI_OBJECT_TYPE_WRED, [&](sai_object_id_t oid) { m_qosWreds.insert(oid); });
+    forEach(SAI_OBJECT_TYPE_BUFFER_PROFILE, [&](sai_object_id_t oid) { m_qosProfiles.insert(oid); });
+
+    if (warmBoot)
+    {
+        // Warm boot (Phase 3): rebuild all pure-SW QoS desired-state binding maps
+        // from m_objectHash with ZERO HW writes, while preserving m_qosHwMaps,
+        // m_qosPools, m_qos*SpUsed, m_qosPgPending and per-port hw*Key / pfcTouched
+        // restored by hwStateLoad().
+        for (int s = 0; s < QOS_SLOT_COUNT; s++)
+        {
+            m_qosSwitchMaps[s] = SAI_NULL_OBJECT_ID;
+        }
+        m_qosSwitchDefaultTc = -1;
+
+        static const sai_attr_id_t wbSwitchAttrs[] = {
+            SAI_SWITCH_ATTR_QOS_DSCP_TO_TC_MAP, SAI_SWITCH_ATTR_QOS_DSCP_TO_COLOR_MAP,
+            SAI_SWITCH_ATTR_QOS_DOT1P_TO_TC_MAP, SAI_SWITCH_ATTR_QOS_DOT1P_TO_COLOR_MAP,
+            SAI_SWITCH_ATTR_QOS_TC_TO_QUEUE_MAP, SAI_SWITCH_ATTR_QOS_TC_AND_COLOR_TO_DSCP_MAP,
+            SAI_SWITCH_ATTR_QOS_DEFAULT_TC,
+        };
+        for (auto id: wbSwitchAttrs)
+        {
+            sai_attribute_t a;
+            if (!getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, id, a))
+            {
+                continue;
+            }
+            if (id == SAI_SWITCH_ATTR_QOS_DEFAULT_TC)
+            {
+                m_qosSwitchDefaultTc = (int)a.value.u8;
+            }
+            else if (a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                int slot = qosSlotOfSwitchAttr(id);
+                if (slot >= 0)
+                {
+                    m_qosSwitchMaps[slot] = a.value.oid;
+                }
+            }
+        }
+
+        static const sai_attr_id_t wbPortAttrs[] = {
+            SAI_PORT_ATTR_QOS_DSCP_TO_TC_MAP, SAI_PORT_ATTR_QOS_DSCP_TO_COLOR_MAP,
+            SAI_PORT_ATTR_QOS_DOT1P_TO_TC_MAP, SAI_PORT_ATTR_QOS_DOT1P_TO_COLOR_MAP,
+            SAI_PORT_ATTR_QOS_TC_TO_QUEUE_MAP, SAI_PORT_ATTR_QOS_TC_TO_PRIORITY_GROUP_MAP,
+            SAI_PORT_ATTR_QOS_PFC_PRIORITY_TO_QUEUE_MAP, SAI_PORT_ATTR_QOS_PFC_PRIORITY_TO_PRIORITY_GROUP_MAP,
+            SAI_PORT_ATTR_QOS_TC_AND_COLOR_TO_DSCP_MAP, SAI_PORT_ATTR_QOS_DEFAULT_TC,
+            SAI_PORT_ATTR_QOS_SCHEDULER_PROFILE_ID, SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_MODE,
+            SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL, SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_RX,
+            SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_TX,
+        };
+
+        for (auto port_id: m_port_list)
+        {
+            if (bcmPortOf(port_id) < 0)
+            {
+                continue;
+            }
+            // Preserve hwIngDscpKey, hwIngDot1pKey, hwEgrDscpKey, pfcTouched restored from .hwstate
+            auto &ps = qosPortState(port_id);
+            for (int s = 0; s < QOS_SLOT_COUNT; s++) ps.maps[s] = SAI_NULL_OBJECT_ID;
+            ps.defaultTc = -1;
+            ps.scheduler = SAI_NULL_OBJECT_ID;
+            ps.pfcSeparate = false;
+            ps.pfcCombined = 0;
+            ps.pfcTx = 0;
+            ps.pfcRx = 0;
+
+            for (auto id: wbPortAttrs)
+            {
+                sai_attribute_t a;
+                if (!getStoredAttr(SAI_OBJECT_TYPE_PORT, port_id, id, a))
+                {
+                    continue;
+                }
+                int slot = qosSlotOfPortAttr(id);
+                if (slot >= 0)
+                {
+                    ps.maps[slot] = a.value.oid;
+                    continue;
+                }
+                switch (id)
+                {
+                    case SAI_PORT_ATTR_QOS_DEFAULT_TC:
+                        ps.defaultTc = (int)a.value.u8;
+                        break;
+                    case SAI_PORT_ATTR_QOS_SCHEDULER_PROFILE_ID:
+                        ps.scheduler = a.value.oid;
+                        break;
+                    case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_MODE:
+                        ps.pfcSeparate = (a.value.s32 == SAI_PORT_PRIORITY_FLOW_CONTROL_MODE_SEPARATE);
+                        break;
+                    case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL:
+                        ps.pfcCombined = a.value.u8;
+                        if (a.value.u8 != 0) ps.pfcTouched = true;
+                        break;
+                    case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_RX:
+                        ps.pfcRx = a.value.u8;
+                        if (a.value.u8 != 0) ps.pfcTouched = true;
+                        break;
+                    case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_TX:
+                        ps.pfcTx = a.value.u8;
+                        if (a.value.u8 != 0) ps.pfcTouched = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        m_qosSgSched.clear();
+        for (const auto &kv: m_qosSgHw)
+        {
+            sai_attribute_t a;
+            if (getStoredAttr(SAI_OBJECT_TYPE_SCHEDULER_GROUP, kv.first,
+                        SAI_SCHEDULER_GROUP_ATTR_SCHEDULER_PROFILE_ID, a) &&
+                a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                m_qosSgSched[kv.first] = a.value.oid;
+            }
+        }
+
+        m_qosQueueSched.clear();
+        m_qosQueueWred.clear();
+        m_qosQueueProfile.clear();
+        for (const auto &kv: m_qosQueueHw)
+        {
+            sai_attribute_t a;
+            if (getStoredAttr(SAI_OBJECT_TYPE_QUEUE, kv.first, SAI_QUEUE_ATTR_SCHEDULER_PROFILE_ID, a) &&
+                a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                m_qosQueueSched[kv.first] = a.value.oid;
+            }
+            if (getStoredAttr(SAI_OBJECT_TYPE_QUEUE, kv.first, SAI_QUEUE_ATTR_WRED_PROFILE_ID, a) &&
+                a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                m_qosQueueWred[kv.first] = a.value.oid;
+            }
+            if (getStoredAttr(SAI_OBJECT_TYPE_QUEUE, kv.first, SAI_QUEUE_ATTR_BUFFER_PROFILE_ID, a) &&
+                a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                m_qosQueueProfile[kv.first] = a.value.oid;
+            }
+        }
+
+        m_qosPgProfile.clear();
+        for (const auto &kv: m_qosPgHw)
+        {
+            sai_attribute_t a;
+            if (getStoredAttr(SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP, kv.first,
+                        SAI_INGRESS_PRIORITY_GROUP_ATTR_BUFFER_PROFILE, a) &&
+                a.value.oid != SAI_NULL_OBJECT_ID)
+            {
+                m_qosPgProfile[kv.first] = a.value.oid;
+            }
+        }
+
+        SWSS_LOG_NOTICE("qos: warm SW bindings rebuilt (maps=%zu hwMaps=%zu pools=%zu scheds=%zu sgSched=%zu qSched=%zu qWred=%zu qProf=%zu pgProf=%zu pgPending=%zu)",
+                m_qosMapType.size(), m_qosHwMaps.size(), m_qosPools.size(),
+                m_qosSchedulers.size(), m_qosSgSched.size(), m_qosQueueSched.size(),
+                m_qosQueueWred.size(), m_qosQueueProfile.size(), m_qosPgProfile.size(),
+                m_qosPgPending.size());
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Resync desired state from the object hash (cold fallback with warm DB).
+    // On a normal cold start these tables are empty and this is a no-op.
 
     forEach(SAI_OBJECT_TYPE_BUFFER_POOL, [&](sai_object_id_t oid) {
             if (m_qosPools.find(oid) == m_qosPools.end())
@@ -426,8 +596,6 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
                 (void)hwCreateBufferPool(oid, 0, NULL);
             }
     });
-
-    forEach(SAI_OBJECT_TYPE_BUFFER_PROFILE, [&](sai_object_id_t oid) { m_qosProfiles.insert(oid); });
 
     static const sai_attr_id_t switchAttrs[] = {
         SAI_SWITCH_ATTR_QOS_DSCP_TO_TC_MAP, SAI_SWITCH_ATTR_QOS_DSCP_TO_COLOR_MAP,

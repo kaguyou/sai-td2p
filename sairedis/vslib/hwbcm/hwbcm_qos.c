@@ -1045,3 +1045,158 @@ int hwbcm_qos_cos_wred_set(int port, int cos, const hwbcm_qos_wred_t *w)
     QLOGD("qos: port %d cos %d wred %s ecn %d", port, cos, any ? "on" : "off", w ? w->ecn : 0);
     return 0;
 }
+
+/* ------------------------------------------------------------------------ */
+/* warm boot (Phase 3)                                                      */
+/* ------------------------------------------------------------------------ */
+
+void hwbcm_qos_warm_reset(void)
+{
+    s_qos_ready = 0;
+    memset(s_pg_snap, 0, sizeof(s_pg_snap));
+    memset(s_q_snap, 0, sizeof(s_q_snap));
+}
+
+int hwbcm_qos_wb_get_pg_snaps(hwbcm_qos_pg_snap_wb_t *out, int max)
+{
+    int p, pg, count = 0;
+
+    for (p = 0; p < HWBCM_MAX_PORTS; p++) {
+        for (pg = 0; pg < HWBCM_QOS_NUM_PG; pg++) {
+            const qos_pg_snap_t *s = &s_pg_snap[p][pg];
+            if (!s->valid) {
+                continue;
+            }
+            if (out != NULL && count < max) {
+                out[count].port   = p;
+                out[count].pg     = pg;
+                out[count].min    = s->min;
+                out[count].hdrm   = s->hdrm;
+                out[count].dyn    = s->dyn;
+                out[count].limit  = s->limit;
+                out[count].floor  = s->floor;
+                out[count].offset = s->offset;
+                out[count].spid   = s->spid;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+int hwbcm_qos_wb_get_q_snaps(hwbcm_qos_q_snap_wb_t *out, int max)
+{
+    int p, mc, cos, count = 0;
+
+    for (p = 0; p < HWBCM_MAX_PORTS; p++) {
+        for (mc = 0; mc < 2; mc++) {
+            for (cos = 0; cos < HWBCM_QOS_NUM_COS; cos++) {
+                const qos_q_snap_t *s = &s_q_snap[p][mc][cos];
+                if (!s->valid) {
+                    continue;
+                }
+                if (out != NULL && count < max) {
+                    out[count].port          = p;
+                    out[count].mcast         = mc;
+                    out[count].cos           = cos;
+                    out[count].have_min      = s->have_min;
+                    out[count].have_dyn      = s->have_dyn;
+                    out[count].have_shared   = s->have_shared;
+                    out[count].have_limit_en = s->have_limit_en;
+                    out[count].have_pool     = s->have_pool;
+                    out[count].min_bytes     = s->min_bytes;
+                    out[count].dyn           = s->dyn;
+                    out[count].shared_bytes  = s->shared_bytes;
+                    out[count].limit_en      = s->limit_en;
+                    out[count].pool          = s->pool;
+                    out[count].alpha         = s->alpha;
+                }
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+void hwbcm_qos_warm_restore(const hwbcm_qos_pg_snap_wb_t *pgs, int npgs,
+                            const hwbcm_qos_q_snap_wb_t *qs, int nqs)
+{
+    int i, rpg = 0, rq = 0;
+
+    memset(s_pg_snap, 0, sizeof(s_pg_snap));
+    memset(s_q_snap, 0, sizeof(s_q_snap));
+
+    for (i = 0; i < npgs && pgs != NULL; i++) {
+        int p = pgs[i].port;
+        int pg = pgs[i].pg;
+        if (p < 0 || p >= HWBCM_MAX_PORTS || pg < 0 || pg >= HWBCM_QOS_NUM_PG) {
+            continue;
+        }
+        s_pg_snap[p][pg].valid  = 1;
+        s_pg_snap[p][pg].min    = pgs[i].min;
+        s_pg_snap[p][pg].hdrm   = pgs[i].hdrm;
+        s_pg_snap[p][pg].dyn    = pgs[i].dyn;
+        s_pg_snap[p][pg].limit  = pgs[i].limit;
+        s_pg_snap[p][pg].floor  = pgs[i].floor;
+        s_pg_snap[p][pg].offset = pgs[i].offset;
+        s_pg_snap[p][pg].spid   = pgs[i].spid;
+        rpg++;
+    }
+
+    for (i = 0; i < nqs && qs != NULL; i++) {
+        int p = qs[i].port;
+        int mc = qs[i].mcast ? 1 : 0;
+        int cos = qs[i].cos;
+        if (p < 0 || p >= HWBCM_MAX_PORTS || cos < 0 || cos >= HWBCM_QOS_NUM_COS) {
+            continue;
+        }
+        s_q_snap[p][mc][cos].valid         = 1;
+        s_q_snap[p][mc][cos].have_min      = qs[i].have_min ? 1 : 0;
+        s_q_snap[p][mc][cos].have_dyn      = qs[i].have_dyn ? 1 : 0;
+        s_q_snap[p][mc][cos].have_shared   = qs[i].have_shared ? 1 : 0;
+        s_q_snap[p][mc][cos].have_limit_en = qs[i].have_limit_en ? 1 : 0;
+        s_q_snap[p][mc][cos].have_pool     = qs[i].have_pool ? 1 : 0;
+        s_q_snap[p][mc][cos].min_bytes     = qs[i].min_bytes;
+        s_q_snap[p][mc][cos].dyn           = qs[i].dyn;
+        s_q_snap[p][mc][cos].shared_bytes  = qs[i].shared_bytes;
+        s_q_snap[p][mc][cos].limit_en      = qs[i].limit_en;
+        s_q_snap[p][mc][cos].pool          = qs[i].pool;
+        s_q_snap[p][mc][cos].alpha         = qs[i].alpha;
+        rq++;
+    }
+
+    QLOGI("qos: warm restored %d PG snapshot(s) and %d queue snapshot(s) (zero HW writes)", rpg, rq);
+}
+
+int hwbcm_qos_map_exists(int map_id)
+{
+    int count = 0;
+    int *ids = NULL;
+    int *flags = NULL;
+    int i, found = 0;
+
+    if (map_id < 0) {
+        return 0;
+    }
+    if (BCM_FAILURE(bcm_qos_multi_get(U, 0, NULL, NULL, &count)) || count <= 0) {
+        return 0;
+    }
+    ids = (int *)calloc((size_t)count, sizeof(int));
+    flags = (int *)calloc((size_t)count, sizeof(int));
+    if (ids == NULL || flags == NULL) {
+        free(ids);
+        free(flags);
+        return 0;
+    }
+    if (BCM_SUCCESS(bcm_qos_multi_get(U, count, ids, flags, &count))) {
+        for (i = 0; i < count; i++) {
+            if (ids[i] == map_id) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    free(ids);
+    free(flags);
+    return found;
+}

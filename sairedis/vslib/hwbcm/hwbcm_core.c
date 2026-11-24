@@ -20,6 +20,16 @@
 #include <string.h>
 #include <stdarg.h>
 #include <syslog.h>
+/* Save syslog priority constants before SDK headers (<shared/bsl.h> via
+ * <soc/scache.h>) redefine LOG_INFO / LOG_DEBUG as function-like macros. */
+enum {
+    HWBCM_SYSLOG_ERR   = LOG_ERR,
+    HWBCM_SYSLOG_WARN  = LOG_WARNING,
+    HWBCM_SYSLOG_INFO  = LOG_INFO,
+    HWBCM_SYSLOG_DEBUG = LOG_DEBUG
+};
+#undef LOG_INFO
+#undef LOG_DEBUG
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
@@ -37,6 +47,7 @@
 #include <soc/drv.h>
 #include <soc/cm.h>
 #include <soc/knet.h>
+#include <soc/scache.h>
 #include <appl/diag/system.h>
 #include <appl/diag/shell.h>
 #include <appl/diag/parse.h>
@@ -60,6 +71,7 @@
 #include <bcm/switch.h>
 #include <bcm/l2.h>
 #include <bcm/rx.h>
+#include <bcm/tx.h>
 #include <bcm/knet.h>
 
 #include "hwbcm.h"
@@ -79,7 +91,9 @@ void hwbcm_log_level_set(hwbcm_log_level_t level)
 void hwbcm_log(hwbcm_log_level_t level, const char *fmt, ...)
 {
     static const char *tag[] = { "ERR", "WARN", "INFO", "DEBUG" };
-    static const int prio[] = { LOG_ERR, LOG_WARNING, LOG_INFO, LOG_DEBUG };
+    static const int prio[] = {
+        HWBCM_SYSLOG_ERR, HWBCM_SYSLOG_WARN, HWBCM_SYSLOG_INFO, HWBCM_SYSLOG_DEBUG
+    };
     char buf[1024];
     va_list ap;
     int idx;
@@ -191,6 +205,22 @@ static soc_knet_vectors_t g_knet_vect = {
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_inited = 0;
+static int g_sal_sysconf_inited = 0;
+static int g_warm_boot = 0;
+
+/* Level 2 warm-boot scache (buffer-backed with atomic file commit on sync). */
+#define HWBCM_SCACHE_DEFAULT_SIZE  (32u * 1024u * 1024u)
+#define HWBCM_SCACHE_MIN_SIZE      (16u * 1024u * 1024u)
+#define HWBCM_SCACHE_MAX_SIZE      (128u * 1024u * 1024u)
+#define HWBCM_SCACHE_NULL_PAD      64u
+
+static pthread_mutex_t g_scache_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *g_scache_buf = NULL;
+static size_t g_scache_cap = 0;
+static size_t g_scache_read_limit = 0;
+static size_t g_scache_written_end = 0;
+static int g_scache_configured = 0;
+static char g_scache_path[512];
 
 /* front panel port map, built at init */
 static int g_fp_count = 0;
@@ -929,6 +959,9 @@ static int hash_fields_program(int set, uint32_t f)
     return 0;
 }
 
+static uint32_t g_hash_fields[2] = { HWBCM_HASH_F_DEFAULT, HWBCM_HASH_F_DEFAULT };
+static uint32_t g_hash_seed[2]   = { 0x5a5a5a5au, 0xa5a5a5a5u };
+
 static int hash_init(void)
 {
     int rv, ctl = 0;
@@ -936,6 +969,8 @@ static int hash_init(void)
     /* Hash A (ECMP, VXLAN entropy) and hash B (LAG). */
     HASH_SC(bcmSwitchHashSeed0, 0x5a5a5a5a);
     HASH_SC(bcmSwitchHashSeed1, 0xa5a5a5a5);
+    g_hash_seed[HWBCM_HASH_ECMP] = 0x5a5a5a5au;
+    g_hash_seed[HWBCM_HASH_LAG]  = 0xa5a5a5a5u;
     HASH_SC(bcmSwitchHashField0PreProcessEnable, 1);
     HASH_SC(bcmSwitchHashField1PreProcessEnable, 1);
     HASH_SC(bcmSwitchHashField0Config, BCM_HASH_FIELD_CONFIG_CRC32LO);
@@ -947,10 +982,12 @@ static int hash_init(void)
     if (rv) {
         return rv;
     }
+    g_hash_fields[HWBCM_HASH_ECMP] = HWBCM_HASH_F_DEFAULT;
     rv = hash_fields_program(HWBCM_HASH_LAG, HWBCM_HASH_F_DEFAULT);
     if (rv) {
         return rv;
     }
+    g_hash_fields[HWBCM_HASH_LAG] = HWBCM_HASH_F_DEFAULT;
 
     /* Port-based (not flow-table) hash selection, then the bit offsets into
      * {A0(16), B0(16), ...}: ECMP on A0, trunks on B0. */
@@ -983,6 +1020,9 @@ int hwbcm_hash_fields_set(int set, uint32_t fields)
     }
     pthread_mutex_lock(&g_lock);
     rv = g_inited ? hash_fields_program(set, fields) : BCM_E_INIT;
+    if (rv == 0) {
+        g_hash_fields[set] = fields;
+    }
     pthread_mutex_unlock(&g_lock);
     return rv;
 }
@@ -1001,25 +1041,449 @@ int hwbcm_hash_seed_set(int set, uint32_t seed)
         rv = hash_sc(set == HWBCM_HASH_ECMP ? "HashSeed0" : "HashSeed1",
                      set == HWBCM_HASH_ECMP ? bcmSwitchHashSeed0 : bcmSwitchHashSeed1,
                      (int)seed);
+        if (rv == 0) {
+            g_hash_seed[set] = seed;
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return rv;
 }
 
+void hwbcm_hash_wb_get(hwbcm_hash_wb_state_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    out->fields[0] = g_hash_fields[0];
+    out->fields[1] = g_hash_fields[1];
+    out->seed[0]   = g_hash_seed[0];
+    out->seed[1]   = g_hash_seed[1];
+    pthread_mutex_unlock(&g_lock);
+}
+
+void hwbcm_hash_wb_restore(const hwbcm_hash_wb_state_t *in)
+{
+    int hw_s0 = 0, hw_s1 = 0, hw_ctl = 0;
+
+    if (in == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    g_hash_fields[0] = in->fields[0];
+    g_hash_fields[1] = in->fields[1];
+    g_hash_seed[0]   = in->seed[0];
+    g_hash_seed[1]   = in->seed[1];
+    if (g_inited) {
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashSeed0, &hw_s0)) &&
+            (uint32_t)hw_s0 != g_hash_seed[0]) {
+            HWBCM_LOGW("wb hash: HW HashSeed0 0x%08x != saved 0x%08x (HW left untouched)",
+                       (unsigned)hw_s0, (unsigned)g_hash_seed[0]);
+        }
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashSeed1, &hw_s1)) &&
+            (uint32_t)hw_s1 != g_hash_seed[1]) {
+            HWBCM_LOGW("wb hash: HW HashSeed1 0x%08x != saved 0x%08x (HW left untouched)",
+                       (unsigned)hw_s1, (unsigned)g_hash_seed[1]);
+        }
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashControl, &hw_ctl))) {
+            HWBCM_LOGI("wb hash: restored ECMP(fields=0x%x seed=0x%08x) LAG(fields=0x%x seed=0x%08x) HW HashControl=0x%x",
+                       (unsigned)g_hash_fields[0], (unsigned)g_hash_seed[0],
+                       (unsigned)g_hash_fields[1], (unsigned)g_hash_seed[1],
+                       (unsigned)hw_ctl);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 #undef HASH_SC
 
-int hwbcm_init(const char *config_bcm)
+static long mono_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+}
+
+#ifdef BCM_WARM_BOOT_SUPPORT
+
+static int hwbcm_scache_read(int unit, uint8 *buf, int offset, int nbytes)
+{
+    int rv = SOC_E_NONE;
+
+    if (unit != HWBCM_UNIT || buf == NULL || offset < 0 || nbytes < 0) {
+        return SOC_E_PARAM;
+    }
+    pthread_mutex_lock(&g_scache_lock);
+    if (g_scache_buf == NULL || g_scache_read_limit == 0 ||
+        (size_t)offset + (size_t)nbytes > g_scache_read_limit) {
+        rv = SOC_E_MEMORY;
+    } else if (nbytes > 0) {
+        memcpy(buf, g_scache_buf + (size_t)offset, (size_t)nbytes);
+    }
+    pthread_mutex_unlock(&g_scache_lock);
+    return rv;
+}
+
+static int hwbcm_scache_write(int unit, uint8 *buf, int offset, int nbytes)
+{
+    int rv = SOC_E_NONE;
+
+    if (unit != HWBCM_UNIT || buf == NULL || offset < 0 || nbytes < 0) {
+        return SOC_E_PARAM;
+    }
+    pthread_mutex_lock(&g_scache_lock);
+    if (g_scache_buf == NULL || (size_t)offset + (size_t)nbytes > g_scache_cap) {
+        rv = SOC_E_MEMORY;
+    } else if (nbytes > 0) {
+        size_t end = (size_t)offset + (size_t)nbytes;
+        memcpy(g_scache_buf + (size_t)offset, buf, (size_t)nbytes);
+        if (end > g_scache_written_end) {
+            g_scache_written_end = end;
+        }
+    }
+    pthread_mutex_unlock(&g_scache_lock);
+    return rv;
+}
+
+static void hwbcm_scache_cleanup(void)
+{
+    pthread_mutex_lock(&g_scache_lock);
+    free(g_scache_buf);
+    g_scache_buf = NULL;
+    g_scache_cap = 0;
+    g_scache_read_limit = 0;
+    g_scache_written_end = 0;
+    g_scache_configured = 0;
+    g_scache_path[0] = '\0';
+    pthread_mutex_unlock(&g_scache_lock);
+}
+
+static int hwbcm_scache_setup(int unit, int warm_boot, const char *scache_file)
+{
+    uint32 cfg_sz;
+    size_t cap;
+    size_t file_sz = 0;
+    uint8_t *buf = NULL;
+    int rv;
+
+    hwbcm_scache_cleanup();
+
+    cfg_sz = (uint32)soc_property_get(unit, spn_STABLE_SIZE, 0);
+    cap = cfg_sz ? (size_t)cfg_sz : (size_t)HWBCM_SCACHE_DEFAULT_SIZE;
+    if (cap < HWBCM_SCACHE_MIN_SIZE) {
+        cap = HWBCM_SCACHE_MIN_SIZE;
+    }
+    if (cap > HWBCM_SCACHE_MAX_SIZE) {
+        cap = HWBCM_SCACHE_MAX_SIZE;
+    }
+
+    if (warm_boot) {
+        int fd;
+        struct stat st;
+        size_t done = 0;
+
+        if (scache_file == NULL || scache_file[0] == '\0') {
+            HWBCM_LOGE("wb scache: warm boot requested without scache file path");
+            return BCM_E_PARAM;
+        }
+        fd = open(scache_file, O_RDONLY);
+        if (fd < 0) {
+            HWBCM_LOGE("wb scache: open(%s) failed: %s", scache_file, strerror(errno));
+            return BCM_E_NOT_FOUND;
+        }
+        if (fstat(fd, &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > HWBCM_SCACHE_MAX_SIZE) {
+            HWBCM_LOGE("wb scache: invalid size %lld for %s", (long long)st.st_size, scache_file);
+            close(fd);
+            return BCM_E_FAIL;
+        }
+        file_sz = (size_t)st.st_size;
+        if (file_sz > cap) {
+            cap = (file_sz + 4095u) & ~4095u;
+            if (cap > HWBCM_SCACHE_MAX_SIZE) {
+                cap = HWBCM_SCACHE_MAX_SIZE;
+            }
+        }
+        buf = (uint8_t *)calloc(1, cap);
+        if (buf == NULL) {
+            close(fd);
+            return BCM_E_MEMORY;
+        }
+        while (done < file_sz) {
+            ssize_t r = read(fd, buf + done, file_sz - done);
+            if (r < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                HWBCM_LOGE("wb scache: read(%s) failed: %s", scache_file, strerror(errno));
+                free(buf);
+                close(fd);
+                return BCM_E_FAIL;
+            }
+            if (r == 0) {
+                break;
+            }
+            done += (size_t)r;
+        }
+        close(fd);
+        if (done != file_sz) {
+            HWBCM_LOGE("wb scache: short read on %s (%zu/%zu)", scache_file, done, file_sz);
+            free(buf);
+            return BCM_E_FAIL;
+        }
+    } else {
+        buf = (uint8_t *)calloc(1, cap);
+        if (buf == NULL) {
+            return BCM_E_MEMORY;
+        }
+    }
+
+    pthread_mutex_lock(&g_scache_lock);
+    g_scache_buf = buf;
+    g_scache_cap = cap;
+    g_scache_read_limit = warm_boot ? file_sz : 0;
+    g_scache_written_end = warm_boot ? file_sz : 0;
+    if (scache_file != NULL && scache_file[0] != '\0') {
+        snprintf(g_scache_path, sizeof(g_scache_path), "%s", scache_file);
+    } else {
+        g_scache_path[0] = '\0';
+    }
+    pthread_mutex_unlock(&g_scache_lock);
+
+    rv = soc_switch_stable_register(unit, hwbcm_scache_read, hwbcm_scache_write, NULL, NULL);
+    if (SOC_FAILURE(rv)) {
+        HWBCM_LOGE("wb scache: soc_switch_stable_register: %s (%d)", bcm_errmsg(rv), rv);
+        hwbcm_scache_cleanup();
+        return rv;
+    }
+    rv = soc_stable_set(unit, BCM_SWITCH_STABLE_APPLICATION, 0);
+    if (SOC_FAILURE(rv)) {
+        HWBCM_LOGE("wb scache: soc_stable_set(APPLICATION): %s (%d)", bcm_errmsg(rv), rv);
+        hwbcm_scache_cleanup();
+        return rv;
+    }
+    rv = soc_stable_size_set(unit, (int)cap);
+    if (SOC_FAILURE(rv)) {
+        HWBCM_LOGE("wb scache: soc_stable_size_set(%zu): %s (%d)", cap, bcm_errmsg(rv), rv);
+        hwbcm_scache_cleanup();
+        return rv;
+    }
+
+    g_scache_configured = 1;
+    HWBCM_LOGI("wb scache: configured mode=%s cap=%zu bytes%s%s",
+               warm_boot ? "warm" : "cold", cap,
+               warm_boot ? " loaded=" : "",
+               warm_boot ? scache_file : "");
+    return 0;
+}
+
+static void fsync_parent_dir(const char *path)
+{
+    char dir[512];
+    char *slash;
+    int dfd;
+
+    snprintf(dir, sizeof(dir), "%s", path);
+    slash = strrchr(dir, '/');
+    if (slash == NULL) {
+        strcpy(dir, ".");
+    } else if (slash == dir) {
+        dir[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    dfd = open(dir, O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
+    }
+}
+
+static int hwbcm_scache_flush_file(const char *path, size_t *bytes_written)
+{
+    char tmp[528];
+    int fd;
+    int used = 0;
+    size_t write_len = 0;
+    size_t done = 0;
+
+    if (path == NULL || path[0] == '\0') {
+        HWBCM_LOGE("wb scache: no output path for flush");
+        return BCM_E_PARAM;
+    }
+
+    (void)soc_stable_used_get(HWBCM_UNIT, &used);
+
+    pthread_mutex_lock(&g_scache_lock);
+    if (g_scache_buf == NULL || !g_scache_configured) {
+        pthread_mutex_unlock(&g_scache_lock);
+        HWBCM_LOGE("wb scache: not configured");
+        return BCM_E_INIT;
+    }
+    write_len = g_scache_written_end;
+    if (used > 0 && (size_t)used + HWBCM_SCACHE_NULL_PAD > write_len) {
+        write_len = (size_t)used + HWBCM_SCACHE_NULL_PAD;
+    }
+    if (write_len > g_scache_cap) {
+        write_len = g_scache_cap;
+    }
+    if (write_len == 0) {
+        pthread_mutex_unlock(&g_scache_lock);
+        HWBCM_LOGE("wb scache: nothing written to scache buffer (used=%d)", used);
+        return BCM_E_EMPTY;
+    }
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0640);
+    if (fd < 0) {
+        int e = errno;
+        pthread_mutex_unlock(&g_scache_lock);
+        HWBCM_LOGE("wb scache: open(%s) failed: %s", tmp, strerror(e));
+        return BCM_E_FAIL;
+    }
+    while (done < write_len) {
+        ssize_t w = write(fd, g_scache_buf + done, write_len - done);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            int e = errno;
+            close(fd);
+            (void)unlink(tmp);
+            pthread_mutex_unlock(&g_scache_lock);
+            HWBCM_LOGE("wb scache: write(%s) failed: %s", tmp, strerror(e));
+            return BCM_E_FAIL;
+        }
+        done += (size_t)w;
+    }
+    if (fsync(fd) != 0) {
+        int e = errno;
+        close(fd);
+        (void)unlink(tmp);
+        pthread_mutex_unlock(&g_scache_lock);
+        HWBCM_LOGE("wb scache: fsync(%s) failed: %s", tmp, strerror(e));
+        return BCM_E_FAIL;
+    }
+    close(fd);
+    if (rename(tmp, path) != 0) {
+        int e = errno;
+        (void)unlink(tmp);
+        pthread_mutex_unlock(&g_scache_lock);
+        HWBCM_LOGE("wb scache: rename(%s -> %s) failed: %s", tmp, path, strerror(e));
+        return BCM_E_FAIL;
+    }
+    pthread_mutex_unlock(&g_scache_lock);
+
+    fsync_parent_dir(path);
+    if (bytes_written != NULL) {
+        *bytes_written = write_len;
+    }
+    HWBCM_LOGI("wb scache: committed %zu bytes (sdk used=%d) -> %s", write_len, used, path);
+    return 0;
+}
+
+#endif /* BCM_WARM_BOOT_SUPPORT */
+
+/* On warm boot, pre-populate g_sgmii_applied[] for every front port already
+ * linked up at <=1G in SGMII mode BEFORE linkscan is enabled, so the linkscan
+ * handler does not re-apply SGMII and bounce the 1G link. */
+static void hwbcm_sgmii_warm_probe(int unit)
+{
+    int i, nmarked = 0;
+    long ts = mono_seconds();
+    if (ts > HWBCM_SGMII_RATE_LIMIT_SEC) {
+        ts -= HWBCM_SGMII_RATE_LIMIT_SEC;
+    } else {
+        ts = 1;
+    }
+
+    for (i = 0; i < g_fp_count; i++) {
+        int port = g_fp_logical[i];
+        int link = 0, speed = 0;
+        bcm_port_if_t intf = BCM_PORT_IF_COUNT;
+
+        if (!port_valid(port)) {
+            continue;
+        }
+        if (BCM_FAILURE(bcm_port_link_status_get(unit, port, &link)) ||
+            link != BCM_PORT_LINK_STATUS_UP) {
+            continue;
+        }
+        if (BCM_FAILURE(bcm_port_speed_get(unit, port, &speed)) ||
+            speed <= 0 || speed > 1000) {
+            continue;
+        }
+        if (BCM_SUCCESS(bcm_port_interface_get(unit, port, &intf)) &&
+            intf == BCM_PORT_IF_SGMII) {
+            g_sgmii_applied[port] = 1;
+            g_sgmii_applied_at[port] = ts;
+            nmarked++;
+            HWBCM_LOGI("wb sgmii: port %d already UP at %d Mbps (SGMII), marked applied",
+                       port, speed);
+        }
+    }
+    HWBCM_LOGI("wb sgmii: probed %d front ports, %d active 1G SGMII port(s) preserved",
+               g_fp_count, nmarked);
+}
+
+static epc_link_bmap_entry_t g_epc_saved;
+static int g_epc_saved_valid = 0;
+
+static void epc_link_save(int unit)
+{
+    g_epc_saved_valid = 0;
+    if (!SOC_MEM_IS_VALID(unit, EPC_LINK_BMAPm)) {
+        return;
+    }
+    if (SOC_SUCCESS(soc_mem_read(unit, EPC_LINK_BMAPm, MEM_BLOCK_ANY, 0, &g_epc_saved))) {
+        g_epc_saved_valid = 1;
+    }
+}
+
+static void epc_link_restore(int unit, const char *after)
+{
+    epc_link_bmap_entry_t cur;
+    pbmp_t want, have;
+
+    if (!g_epc_saved_valid ||
+        SOC_FAILURE(soc_mem_read(unit, EPC_LINK_BMAPm, MEM_BLOCK_ANY, 0, &cur))) {
+        return;
+    }
+    soc_mem_pbmp_field_get(unit, EPC_LINK_BMAPm, &g_epc_saved, PORT_BITMAPf, &want);
+    soc_mem_pbmp_field_get(unit, EPC_LINK_BMAPm, &cur, PORT_BITMAPf, &have);
+    if (SOC_PBMP_EQ(want, have)) {
+        HWBCM_LOGI("hwbcm_init_ex[warm]: EPC_LINK_BMAP unchanged after %s", after);
+        return;
+    }
+    if (SOC_FAILURE(soc_mem_write(unit, EPC_LINK_BMAPm, MEM_BLOCK_ALL, 0, &g_epc_saved))) {
+        HWBCM_LOGE("hwbcm_init_ex[warm]: EPC_LINK_BMAP restore after %s failed", after);
+        return;
+    }
+    HWBCM_LOGW("hwbcm_init_ex[warm]: EPC_LINK_BMAP was rewritten by %s, restored (front-port egress kept)", after);
+}
+
+int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file)
 {
     int unit = HWBCM_UNIT;
     int rv;
     int i;
     bcm_port_t port;
+    long t0 = mono_ms();
 
     pthread_mutex_lock(&g_lock);
     if (g_inited) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
+
+#ifndef BCM_WARM_BOOT_SUPPORT
+    if (warm_boot) {
+        HWBCM_LOGE("hwbcm_init_ex: warm_boot requested but compiled without BCM_WARM_BOOT_SUPPORT");
+        pthread_mutex_unlock(&g_lock);
+        return BCM_E_UNAVAIL;
+    }
+#endif
 
     for (i = 0; i < HWBCM_PORT_TBL; i++) {
         g_desired_speed[i] = 0;
@@ -1030,85 +1494,258 @@ int hwbcm_init(const char *config_bcm)
         g_trap_l2cache_idx[i] = -1;
     }
     memset(g_knet, 0, sizeof(g_knet));
+    g_warm_boot = 0;
 
     if (config_bcm == NULL || config_bcm[0] == '\0') {
-        HWBCM_LOGE("hwbcm_init: no config.bcm path");
+        HWBCM_LOGE("hwbcm_init_ex: no config.bcm path");
         pthread_mutex_unlock(&g_lock);
         return BCM_E_PARAM;
     }
 
-    /* 1. config file, must precede sal_core_init */
-    {
-        size_t len = strlen(config_bcm);
-        char *tmp = (char *)malloc(len + 5);
-        if (tmp == NULL) {
+    if (warm_boot) {
+        struct stat st;
+        if (scache_file == NULL || scache_file[0] == '\0' ||
+            stat(scache_file, &st) != 0 || st.st_size <= 0) {
+            HWBCM_LOGE("hwbcm_init_ex: warm boot scache file missing or empty: %s",
+                       scache_file ? scache_file : "(null)");
             pthread_mutex_unlock(&g_lock);
-            return BCM_E_MEMORY;
+            return BCM_E_NOT_FOUND;
         }
-        memcpy(tmp, config_bcm, len);
-        memcpy(tmp + len, ".tmp", 5);
-        rv = sal_config_file_set(config_bcm, tmp);
-        free(tmp);
-        if (rv < 0) {
-            HWBCM_LOGE("sal_config_file_set(%s): %d", config_bcm, rv);
+    }
+
+    if (!g_sal_sysconf_inited) {
+        /* 1. config file, must precede sal_core_init */
+        {
+            size_t len = strlen(config_bcm);
+            char *tmp = (char *)malloc(len + 5);
+            if (tmp == NULL) {
+                pthread_mutex_unlock(&g_lock);
+                return BCM_E_MEMORY;
+            }
+            memcpy(tmp, config_bcm, len);
+            memcpy(tmp + len, ".tmp", 5);
+            rv = sal_config_file_set(config_bcm, tmp);
+            free(tmp);
+            if (rv < 0) {
+                HWBCM_LOGE("sal_config_file_set(%s): %d", config_bcm, rv);
+                pthread_mutex_unlock(&g_lock);
+                return BCM_E_FAIL;
+            }
+        }
+        HWBCM_LOGI("hwbcm_init_ex: mode=%s config=%s", warm_boot ? "WARM" : "COLD", config_bcm);
+
+        /* 2./3. SAL */
+        if (sal_core_init() < 0) {
+            HWBCM_LOGE("sal_core_init failed");
             pthread_mutex_unlock(&g_lock);
             return BCM_E_FAIL;
         }
-    }
-    HWBCM_LOGI("hwbcm_init: config %s", config_bcm);
+        if (sal_appl_init() < 0) {
+            HWBCM_LOGE("sal_appl_init failed");
+            pthread_mutex_unlock(&g_lock);
+            return BCM_E_FAIL;
+        }
 
-    /* 2./3. SAL */
-    if (sal_core_init() < 0) {
-        HWBCM_LOGE("sal_core_init failed");
+        /* 4. KNET kcom vectors (knet_kcom_config in socdiag.c) + chip info */
+        soc_knet_config(&g_knet_vect);
+        var_set("kcom", "bcm-knet", 0, 0);
+        soc_chip_info_vect_config(&g_chip_info_vect);
+
+        /* 4b. Diag shell library bring-up */
+        parse_user_var_get = diag_user_var_get;
+        bslmgmt_init();
+        diag_init();
+
+        /* 5.-7. BDE / device probe / attach */
+        if (sysconf_init() < 0) {
+            HWBCM_LOGE("sysconf_init failed");
+            pthread_mutex_unlock(&g_lock);
+            return BCM_E_FAIL;
+        }
+        if (sysconf_probe() < 0 && !soc_ndev) {
+            HWBCM_LOGE("sysconf_probe failed (no devices)");
+            pthread_mutex_unlock(&g_lock);
+            return BCM_E_FAIL;
+        }
+        var_set_integer("units", soc_ndev, FALSE, FALSE);
+        HWBCM_LOGI("hwbcm_init_ex: %d device(s) probed", soc_ndev);
+        if (sysconf_attach(unit) < 0) {
+            HWBCM_LOGE("sysconf_attach(%d) failed", unit);
+            pthread_mutex_unlock(&g_lock);
+            return BCM_E_FAIL;
+        }
+
+        /* 7b. Install the ESW command table and bind shell variables to unit 0. */
+        cmdlist_init();
+        command_mode_set(unit, ESW_CMD_MODE);
+        sh_swap_unit_vars(unit);
+
+        g_sal_sysconf_inited = 1;
+    } else {
+        HWBCM_LOGI("hwbcm_init_ex: re-initializing unit %d in mode=%s",
+                   unit, warm_boot ? "WARM" : "COLD");
+        if (!soc_attached(unit)) {
+            if (sysconf_attach(unit) < 0) {
+                HWBCM_LOGE("sysconf_attach(%d) retry failed", unit);
+                pthread_mutex_unlock(&g_lock);
+                return BCM_E_FAIL;
+            }
+        }
+    }
+
+#ifdef BCM_WARM_BOOT_SUPPORT
+    if (warm_boot) {
+        int loc = BCM_SWITCH_STABLE_NONE;
+        uint32 sflags = 0;
+
+        /* Ensure SDK preserves KNET DMA rings and filters during warm init. */
+        (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
+        (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
+
+        rv = hwbcm_scache_setup(unit, 1, scache_file);
+        if (rv < 0) {
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        SOC_WARM_BOOT_START(unit);
+
+        HWBCM_LOGI("hwbcm_init_ex[warm]: soc_init (noreset)");
+        rv = soc_init(unit);
+        if (SOC_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: soc_init failed: %s (%d)", bcm_errmsg(rv), rv);
+            SOC_WARM_BOOT_DONE(unit);
+            hwbcm_scache_cleanup();
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        /* Verify Level 2 scache recovered cleanly (soc_do_init downgrades to
+         * STABLE_NONE if soc_scache_recover fails CRC/format check). */
+        rv = soc_stable_get(unit, &loc, &sflags);
+        if (SOC_FAILURE(rv) || loc != BCM_SWITCH_STABLE_APPLICATION) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: L2 scache recovery failed/corrupt (loc=%d rv=%d)",
+                       loc, rv);
+            SOC_WARM_BOOT_DONE(unit);
+            hwbcm_scache_cleanup();
+            pthread_mutex_unlock(&g_lock);
+            return BCM_E_INTERNAL;
+        }
+
+        /* EPC_LINK_BMAP = egress "link up" ports. _soc_trident2_misc_init
+         * overwrites it with CMIC only, and warm linkscan never rewrites it
+         * (it assumes the links stayed up), so every front port stopped
+         * egress after the first warm restart (2026-11-24). The wb SDK copy
+         * guards that write; keep the live value here as well. */
+        epc_link_save(unit);
+        HWBCM_LOGI("hwbcm_init_ex[warm]: soc_misc_init");
+        rv = soc_misc_init(unit);
+        epc_link_restore(unit, "soc_misc_init");
+        if (SOC_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: soc_misc_init failed: %s (%d)", bcm_errmsg(rv), rv);
+            SOC_WARM_BOOT_DONE(unit);
+            hwbcm_scache_cleanup();
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init");
+        rv = soc_mmu_init(unit);
+        if (SOC_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: soc_mmu_init failed: %s (%d)", bcm_errmsg(rv), rv);
+            SOC_WARM_BOOT_DONE(unit);
+            hwbcm_scache_cleanup();
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        if (bcm_attach_check(unit) == BCM_E_UNIT) {
+            rv = bcm_attach(unit, NULL, NULL, unit);
+            if (BCM_FAILURE(rv)) {
+                HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_attach failed: %s (%d)", bcm_errmsg(rv), rv);
+                SOC_WARM_BOOT_DONE(unit);
+                hwbcm_scache_cleanup();
+                pthread_mutex_unlock(&g_lock);
+                return rv;
+            }
+        }
+
+        HWBCM_LOGI("hwbcm_init_ex[warm]: bcm_init");
+        rv = bcm_init(unit);
+        epc_link_restore(unit, "bcm_init");
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_init failed: %s (%d)", bcm_errmsg(rv), rv);
+            SOC_WARM_BOOT_DONE(unit);
+            hwbcm_scache_cleanup();
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        if (SOC_WARM_BOOT(unit)) {
+            SOC_WARM_BOOT_DONE(unit);
+        }
+
+        /* Warm boot: skip port disable, VLAN1 flush, STP set, KNET cleanup,
+         * hash_init, and EGR_VLAN[0] write. Re-attach userspace RX DCB chain. */
+        if (!bcm_rx_active(unit)) {
+            rv = bcm_rx_start(unit, NULL);
+            if (BCM_FAILURE(rv)) {
+                HWBCM_LOGW("hwbcm_init_ex[warm]: bcm_rx_start: %s", bcm_errmsg(rv));
+            }
+        }
+
+        hwbcm_port_map_build();
+
+        /* Pre-populate 1G SGMII state BEFORE linkscan so active 1G links do not bounce. */
+        hwbcm_sgmii_warm_probe(unit);
+
+        /* Re-enable linkscan and register callback; only touch port mode if NONE. */
+        rv = bcm_linkscan_enable_set(unit, BCM_LINKSCAN_INTERVAL_DEFAULT);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_linkscan_enable_set: %s", bcm_errmsg(rv));
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+        PBMP_PORT_ITER(unit, port) {
+            int mode = BCM_LINKSCAN_MODE_NONE;
+            if (IS_CPU_PORT(unit, port) || IS_LB_PORT(unit, port)) {
+                continue;
+            }
+            if (BCM_FAILURE(bcm_linkscan_mode_get(unit, port, &mode)) ||
+                mode == BCM_LINKSCAN_MODE_NONE) {
+                (void)bcm_linkscan_mode_set(unit, port, BCM_LINKSCAN_MODE_SW);
+            }
+        }
+        rv = bcm_linkscan_register(unit, hwbcm_linkscan_handler);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_linkscan_register: %s", bcm_errmsg(rv));
+            pthread_mutex_unlock(&g_lock);
+            return rv;
+        }
+
+        if (hwbcm_riot_enabled()) {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: riot active (EGR_VLAN[0] preserved)");
+        }
+
+        g_inited = 1;
+        g_warm_boot = 1;
         pthread_mutex_unlock(&g_lock);
-        return BCM_E_FAIL;
-    }
-    if (sal_appl_init() < 0) {
-        HWBCM_LOGE("sal_appl_init failed");
-        pthread_mutex_unlock(&g_lock);
-        return BCM_E_FAIL;
-    }
+        HWBCM_LOGI("hwbcm_init_ex: WARM init done (%s) in %ld ms",
+                   soc_cm_get_name(unit), mono_ms() - t0);
 
-    /* 4. KNET kcom vectors (knet_kcom_config in socdiag.c) + chip info */
-    soc_knet_config(&g_knet_vect);
-    var_set("kcom", "bcm-knet", 0, 0);
-    soc_chip_info_vect_config(&g_chip_info_vect);
-
-    /* 4b. Diag shell library bring-up, the minimal subset of
-     * diag_sdk_init() (src/appl/diag/system.c): variable lookup hook,
-     * BSL log management, symbol tables / globals. Without this the shell
-     * has no per-unit command table and sh_process_command returns CMD_NFND. */
-    parse_user_var_get = diag_user_var_get;
-    bslmgmt_init();
-    diag_init();
-
-    /* 5.-7. BDE / device probe / attach */
-    if (sysconf_init() < 0) {
-        HWBCM_LOGE("sysconf_init failed");
-        pthread_mutex_unlock(&g_lock);
-        return BCM_E_FAIL;
-    }
-    if (sysconf_probe() < 0 && !soc_ndev) {
-        HWBCM_LOGE("sysconf_probe failed (no devices)");
-        pthread_mutex_unlock(&g_lock);
-        return BCM_E_FAIL;
-    }
-    var_set_integer("units", soc_ndev, FALSE, FALSE);
-    HWBCM_LOGI("hwbcm_init: %d device(s) probed", soc_ndev);
-    if (sysconf_attach(unit) < 0) {
-        HWBCM_LOGE("sysconf_attach(%d) failed", unit);
-        pthread_mutex_unlock(&g_lock);
-        return BCM_E_FAIL;
+        (void)shell_sock_start();
+        return 0;
     }
 
-    /* 7b. Install the ESW command table for the unit (what diag_sdk_init
-     * does via cmdlist_init after attach) and bind the shell variables
-     * ($unit, chip name, ...) to unit 0. */
-    cmdlist_init();
-    command_mode_set(unit, ESW_CMD_MODE);
-    sh_swap_unit_vars(unit);
+    /* Cold boot: arm in-memory L2 scache buffer before init soc so a later
+     * warm shutdown can sync cleanly. Failure is non-fatal to cold boot. */
+    SOC_WARM_BOOT_DONE(unit);
+    if (hwbcm_scache_setup(unit, 0, scache_file) < 0) {
+        HWBCM_LOGW("hwbcm_init_ex[cold]: L2 scache arm failed; cold boot continues without L2 WB");
+    }
+#endif /* BCM_WARM_BOOT_SUPPORT */
 
-    /* 8. init soc / misc / mmu / bcm through the diag shell library */
+    /* 8. init soc / misc / mmu / bcm through the diag shell library (cold boot) */
     {
         static const char *steps[] = { "init soc", "init misc", "init mmu", "init bcm" };
         for (i = 0; i < 4; i++) {
@@ -1223,12 +1860,114 @@ int hwbcm_init(const char *config_bcm)
     }
 
     g_inited = 1;
+    g_warm_boot = 0;
     pthread_mutex_unlock(&g_lock);
-    HWBCM_LOGI("hwbcm_init: done (%s)", soc_cm_get_name(unit));
+    HWBCM_LOGI("hwbcm_init: done (%s) in %ld ms", soc_cm_get_name(unit), mono_ms() - t0);
 
     /* Debug aid, failure is not fatal. */
     (void)shell_sock_start();
     return 0;
+}
+
+int hwbcm_init(const char *config_bcm)
+{
+    return hwbcm_init_ex(config_bcm, 0, NULL);
+}
+
+int hwbcm_is_warm_boot(void)
+{
+    return g_warm_boot;
+}
+
+int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
+{
+#ifndef BCM_WARM_BOOT_SUPPORT
+    (void)scache_file;
+    (void)bytes_written;
+    HWBCM_LOGE("hwbcm_warm_sync: compiled without BCM_WARM_BOOT_SUPPORT");
+    return BCM_E_UNAVAIL;
+#else
+    int rv;
+    const char *path;
+    long t0 = mono_ms();
+
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) {
+        pthread_mutex_unlock(&g_lock);
+        return BCM_E_INIT;
+    }
+    if (!g_scache_configured) {
+        pthread_mutex_unlock(&g_lock);
+        HWBCM_LOGE("hwbcm_warm_sync: L2 scache not configured");
+        return BCM_E_CONFIG;
+    }
+
+    path = (scache_file != NULL && scache_file[0] != '\0') ? scache_file : g_scache_path;
+    if (path == NULL || path[0] == '\0') {
+        pthread_mutex_unlock(&g_lock);
+        HWBCM_LOGE("hwbcm_warm_sync: no scache file path");
+        return BCM_E_PARAM;
+    }
+
+    rv = bcm_switch_control_set(HWBCM_UNIT, bcmSwitchControlSync, 1);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("hwbcm_warm_sync: bcmSwitchControlSync failed: %s (%d)", bcm_errmsg(rv), rv);
+        pthread_mutex_unlock(&g_lock);
+        return rv;
+    }
+
+    rv = hwbcm_scache_flush_file(path, bytes_written);
+    pthread_mutex_unlock(&g_lock);
+    if (rv == 0) {
+        HWBCM_LOGI("hwbcm_warm_sync: completed in %ld ms", mono_ms() - t0);
+    }
+    return rv;
+#endif
+}
+
+int hwbcm_warm_deinit(void)
+{
+#ifndef BCM_WARM_BOOT_SUPPORT
+    HWBCM_LOGE("hwbcm_warm_deinit: compiled without BCM_WARM_BOOT_SUPPORT");
+    return BCM_E_UNAVAIL;
+#else
+    int unit = HWBCM_UNIT;
+    long t0 = mono_ms();
+
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) {
+        pthread_mutex_unlock(&g_lock);
+        return 0;
+    }
+
+    shell_sock_stop();
+
+    /* Unregister software callbacks without disabling hardware linkscan or
+     * tearing down KNET netifs/filters. */
+    (void)bcm_linkscan_unregister(unit, hwbcm_linkscan_handler);
+    g_link_cb = NULL;
+    g_link_cookie = NULL;
+    hwbcm_l2_warm_reset();
+    hwbcm_l3_warm_reset();
+    hwbcm_vxlan_warm_reset();
+
+    /* Preserve KNET DMA rings, netifs, and filters across shutdown. */
+    (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
+    (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
+
+    HWBCM_WARN_ON_FAIL("bcm_tx_cleanup", bcm_tx_cleanup(unit));
+    HWBCM_WARN_ON_FAIL("_bcm_shutdown", _bcm_shutdown(unit));
+    HWBCM_WARN_ON_FAIL("soc_shutdown", soc_shutdown(unit));
+
+    hwbcm_scache_cleanup();
+    memset(g_knet, 0, sizeof(g_knet));
+    g_inited = 0;
+    g_fp_count = 0;
+    g_warm_boot = 0;
+    pthread_mutex_unlock(&g_lock);
+    HWBCM_LOGI("hwbcm_warm_deinit: done in %ld ms (ASIC & KNET preserved)", mono_ms() - t0);
+    return 0;
+#endif
 }
 
 int hwbcm_deinit(void)
@@ -1247,6 +1986,10 @@ int hwbcm_deinit(void)
     (void)bcm_linkscan_unregister(unit, hwbcm_linkscan_handler);
     (void)bcm_linkscan_enable_set(unit, 0);
     g_link_cb = NULL;
+    g_link_cookie = NULL;
+    hwbcm_l2_warm_reset();
+    hwbcm_l3_warm_reset();
+    hwbcm_vxlan_warm_reset();
 
     for (i = 0; i < HWBCM_KNET_MAX; i++) {
         if (g_knet[i].netif_id != 0) {
@@ -1267,11 +2010,60 @@ int hwbcm_deinit(void)
         HWBCM_LOGW("sysconf_detach(%d) failed", unit);
     }
 
+#ifdef BCM_WARM_BOOT_SUPPORT
+    hwbcm_scache_cleanup();
+#endif
+
     g_inited = 0;
     g_fp_count = 0;
+    g_warm_boot = 0;
     pthread_mutex_unlock(&g_lock);
     HWBCM_LOGI("hwbcm_deinit: done");
     return 0;
+}
+
+void hwbcm_core_wb_get(hwbcm_core_wb_state_t *out)
+{
+    int i;
+
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    memcpy(out->switch_mac, g_switch_mac, 6);
+    out->switch_mac_valid = g_switch_mac_valid;
+    out->ip2me_station_id = g_ip2me_station_id;
+    out->ip2me_vfi_station_id = g_ip2me_vfi_station_id;
+    out->ip2me_wanted = g_ip2me_wanted;
+    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+        out->trap_l2cache_idx[i] = g_trap_l2cache_idx[i];
+    }
+}
+
+void hwbcm_core_wb_restore(const hwbcm_core_wb_state_t *in)
+{
+    int i;
+
+    if (in == NULL) {
+        return;
+    }
+    memcpy(g_switch_mac, in->switch_mac, 6);
+    g_switch_mac_valid = in->switch_mac_valid ? 1 : 0;
+    g_ip2me_station_id = in->ip2me_station_id;
+    g_ip2me_vfi_station_id = in->ip2me_vfi_station_id;
+    g_ip2me_wanted = in->ip2me_wanted ? 1 : 0;
+    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+        g_trap_l2cache_idx[i] = in->trap_l2cache_idx[i];
+    }
+    HWBCM_LOGI("wb core: restored mac_valid=%d ip2me_id=%d vfi_id=%d wanted=%d",
+               g_switch_mac_valid, g_ip2me_station_id, g_ip2me_vfi_station_id, g_ip2me_wanted);
+}
+
+void hwbcm_port_desired_speed_restore(int port, int speed_mbps)
+{
+    if (port_valid(port) && speed_mbps > 0) {
+        g_desired_speed[port] = speed_mbps;
+    }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -2072,6 +2864,111 @@ int hwbcm_knet_netif_destroy(int netif_id)
     }
     HWBCM_LOGI("knet: netif %d destroyed", netif_id);
     return 0;
+}
+
+typedef struct {
+    hwbcm_knet_info_t items[HWBCM_KNET_MAX];
+    int count;
+    int filter_matched;
+} knet_wb_recover_ctx_t;
+
+static int knet_wb_netif_cb(int unit, bcm_knet_netif_t *netif, void *user_data)
+{
+    knet_wb_recover_ctx_t *ctx = (knet_wb_recover_ctx_t *)user_data;
+    hwbcm_knet_slot_t *slot;
+    int is_cpu;
+
+    (void)unit;
+    if (netif == NULL || ctx == NULL || netif->id <= 0) {
+        return BCM_E_NONE;
+    }
+    slot = knet_slot_alloc();
+    if (slot == NULL) {
+        HWBCM_LOGW("wb knet: g_knet full while recovering netif %d (%s)", netif->id, netif->name);
+        return BCM_E_NONE;
+    }
+    is_cpu = (netif->type == BCM_KNET_NETIF_T_TX_CPU_INGRESS) ? 1 : 0;
+    memset(slot, 0, sizeof(*slot));
+    slot->netif_id = netif->id;
+    slot->port = is_cpu ? -1 : (int)netif->port;
+
+    if (ctx->count < HWBCM_KNET_MAX) {
+        hwbcm_knet_info_t *info = &ctx->items[ctx->count++];
+        memset(info, 0, sizeof(*info));
+        info->netif_id = netif->id;
+        info->port = slot->port;
+        info->is_cpu = is_cpu;
+        info->pvid = 0;
+        snprintf(info->name, sizeof(info->name), "%s", netif->name);
+    }
+    return BCM_E_NONE;
+}
+
+static int knet_wb_filter_cb(int unit, bcm_knet_filter_t *filter, void *user_data)
+{
+    knet_wb_recover_ctx_t *ctx = (knet_wb_recover_ctx_t *)user_data;
+    hwbcm_knet_slot_t *slot;
+    int i;
+
+    (void)unit;
+    if (filter == NULL || ctx == NULL || filter->dest_type != BCM_KNET_DEST_T_NETIF) {
+        return BCM_E_NONE;
+    }
+    slot = knet_slot_find(filter->dest_id);
+    if (slot == NULL) {
+        return BCM_E_NONE;
+    }
+    if (filter->priority == 48) {
+        slot->vfi_filter_id = filter->id;
+    } else if (filter->priority == 49) {
+        slot->pvid_filter_id = filter->id;
+        slot->pvid = (int)filter->m_vlan;
+        for (i = 0; i < ctx->count; i++) {
+            if (ctx->items[i].netif_id == slot->netif_id) {
+                ctx->items[i].pvid = slot->pvid;
+                break;
+            }
+        }
+    } else if (filter->priority == 50 || filter->priority == 100) {
+        slot->filter_id = filter->id;
+    }
+    ctx->filter_matched++;
+    return BCM_E_NONE;
+}
+
+int hwbcm_knet_warm_recover(hwbcm_knet_info_t *out, int max)
+{
+    knet_wb_recover_ctx_t ctx;
+    int rv, i, ncopy;
+
+    if (!g_inited) {
+        return BCM_E_INIT;
+    }
+    memset(&ctx, 0, sizeof(ctx));
+    memset(g_knet, 0, sizeof(g_knet));
+
+    rv = bcm_knet_netif_traverse(HWBCM_UNIT, knet_wb_netif_cb, &ctx);
+    if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        HWBCM_LOGE("wb knet: bcm_knet_netif_traverse failed: %s (%d)", bcm_errmsg(rv), rv);
+        return rv;
+    }
+    rv = bcm_knet_filter_traverse(HWBCM_UNIT, knet_wb_filter_cb, &ctx);
+    if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        HWBCM_LOGW("wb knet: bcm_knet_filter_traverse failed: %s (%d)", bcm_errmsg(rv), rv);
+    }
+
+    if (out != NULL && max > 0) {
+        ncopy = ctx.count < max ? ctx.count : max;
+        memcpy(out, ctx.items, (size_t)ncopy * sizeof(hwbcm_knet_info_t));
+    }
+    for (i = 0; i < ctx.count && i < 8; i++) {
+        HWBCM_LOGD("wb knet: recovered netif %d (%s) port=%d cpu=%d pvid=%d",
+                   ctx.items[i].netif_id, ctx.items[i].name,
+                   ctx.items[i].port, ctx.items[i].is_cpu, ctx.items[i].pvid);
+    }
+    HWBCM_LOGI("wb knet: recovered %d netif(s) and %d filter(s) with zero mutations",
+               ctx.count, ctx.filter_matched);
+    return ctx.count;
 }
 
 /* ------------------------------------------------------------------------ */

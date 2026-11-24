@@ -37,7 +37,7 @@ index ca2e26d..261702a 100644
 +# defines and include paths, kept in ../sai-td2p next to this tree (see
 +# sai-td2p/DESIGN.md). The SDK static libraries are added at link time by the
 +# deploy scripts (LIBS override), not here.
-+SDK_CFLAGS = $(shell cat $(top_srcdir)/../sai-td2p/sdk_cflags.txt $(top_srcdir)/../sai-td2p/sdk_incs.txt 2>/dev/null)
++SDK_CFLAGS = $(shell cat $(top_srcdir)/../sai-td2p-wb/sdk_cflags_wb.txt $(top_srcdir)/../sai-td2p-wb/sdk_incs_wb.txt 2>/dev/null)
 +libSaiVS_a_CFLAGS = $(SDK_CFLAGS) -fPIC -I$(srcdir)/hwbcm
  
  if USE_VPP
@@ -78,11 +78,13 @@ index bc6694a..f173ef9 100644
      const char *bfd_offload_supported = service_method_table->profile_get_value(0, SAI_KEY_VS_BFD_OFFLOAD_SUPPORTED);
      auto bfdOffloadSupported = SwitchConfig::parseBfdOffloadSupported(bfd_offload_supported);
  
-@@ -228,6 +253,7 @@ sai_status_t Sai::apiInitialize(
+@@ -228,6 +253,9 @@ sai_status_t Sai::apiInitialize(
          sc->m_bootType = bootType;
          sc->m_useTapDevice = useTapDevice;
          sc->m_useConfiguredSpeedAsOperSpeed = useConfiguredSpeedAsOperSpeed;
 +        sc->m_initConfigFile = initConfigFile;
++        sc->m_warmBootReadFile = m_warm_boot_read_file ? m_warm_boot_read_file : "";
++        sc->m_warmBootWriteFile = m_warm_boot_write_file ? m_warm_boot_write_file : "";
          sc->m_laneMap = m_laneMapContainer->getLaneMap(sc->m_switchIndex);
          sc->m_bfdOffload = bfdOffloadSupported;
  
@@ -125,7 +127,7 @@ index 409a6c3..70c2c0a 100644
      } sai_vs_switch_type_t;
  
      typedef enum _sai_vs_boot_type_t
-@@ -90,6 +92,12 @@ namespace saivs
+@@ -90,6 +92,18 @@ namespace saivs
  
              bool m_useConfiguredSpeedAsOperSpeed;
  
@@ -134,6 +136,13 @@ index 409a6c3..70c2c0a 100644
 +             * types only, empty otherwise).
 +             */
 +            std::string m_initConfigFile;
++
++            /**
++             * @brief Warm-boot file paths from the profile (used by hardware
++             * switch to derive sibling .scache and .hwstate files).
++             */
++            std::string m_warmBootReadFile;
++            std::string m_warmBootWriteFile;
 +
              std::shared_ptr<LaneMap> m_laneMap;
  

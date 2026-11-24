@@ -87,9 +87,9 @@ namespace saivs
 
             // --- core / ports (A2) -------------------------------------------
 
-            /* Bring up the SDK (hwbcm_init with SAI_INIT_CONFIG_FILE), build
+            /* Bring up the SDK (hwbcm_init_ex with SAI_INIT_CONFIG_FILE), build
              * the lane -> bcm port map, start the link notification thread. */
-            sai_status_t hwInitialize();
+            sai_status_t hwInitialize(_In_ bool warmBoot = false);
 
             virtual sai_status_t create_ports() override;
             virtual sai_status_t set_switch_default_attributes() override;
@@ -437,5 +437,6 @@ namespace saivs
 #include "SwitchBCM56860HW_copp.inc.h"
 #include "SwitchBCM56860HW_qos.inc.h"
 #include "SwitchBCM56860HW_mirror.inc.h"
+#include "SwitchBCM56860HW_wb.inc.h"
     };
 }

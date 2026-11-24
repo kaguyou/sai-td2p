@@ -1371,3 +1371,170 @@ int hwbcm_copp_deinit(void)
     pthread_mutex_unlock(&g_copp_lock);
     return 0;
 }
+
+/* ------------------------------------------------------------------------ */
+/* warm boot (Phase 3)                                                      */
+/* ------------------------------------------------------------------------ */
+
+typedef char copp_max_traps_match[(COPP_MAX_TRAPS == HWBCM_COPP_MAX_TRAPS) ? 1 : -1];
+typedef char copp_max_rules_match[(COPP_MAX_RULES == HWBCM_COPP_MAX_RULES) ? 1 : -1];
+typedef char copp_max_pols_match[(COPP_MAX_POLICERS == HWBCM_COPP_MAX_POLICERS) ? 1 : -1];
+
+void hwbcm_copp_warm_reset(void)
+{
+    pthread_mutex_lock(&g_copp_lock);
+    g_group_valid = 0;
+    g_group = 0;
+    g_have_to_me = 0;
+    g_have_icmp = 0;
+    g_have_stats = 1;
+    g_local_egr = -1;
+    g_qmax = -1;
+    memset(g_slot, 0, sizeof(g_slot));
+    memset(g_pol, 0, sizeof(g_pol));
+    pthread_mutex_unlock(&g_copp_lock);
+}
+
+void hwbcm_copp_wb_get(hwbcm_copp_wb_globals_t *globals,
+                       hwbcm_copp_policer_wb_t *pols, int max_pols, int *npols,
+                       hwbcm_copp_slot_wb_t *slots, int max_slots, int *nslots)
+{
+    int i, j, np = 0, ns = 0;
+
+    pthread_mutex_lock(&g_copp_lock);
+    if (globals != NULL) {
+        globals->group_valid = g_group_valid;
+        globals->group       = (int)g_group;
+        globals->have_to_me  = g_have_to_me;
+        globals->have_icmp   = g_have_icmp;
+        globals->have_stats  = g_have_stats;
+        globals->local_egr   = g_local_egr;
+    }
+    for (i = 0; i < COPP_MAX_POLICERS; i++) {
+        if (!g_pol[i].used) {
+            continue;
+        }
+        if (pols != NULL && np < max_pols) {
+            pols[np].slot_idx = i;
+            pols[np].pid      = (int)g_pol[i].pid;
+            pols[np].cfg      = g_pol[i].cfg;
+        }
+        np++;
+    }
+    for (i = 0; i < COPP_MAX_TRAPS; i++) {
+        if (!g_slot[i].used) {
+            continue;
+        }
+        if (slots != NULL && ns < max_slots) {
+            slots[ns].slot_idx      = i;
+            slots[ns].cfg           = g_slot[i].cfg;
+            slots[ns].neid          = g_slot[i].neid;
+            for (j = 0; j < COPP_MAX_RULES; j++) {
+                slots[ns].eid[j]     = (int)g_slot[i].eid[j];
+                slots[ns].stat_id[j] = g_slot[i].stat_id[j];
+            }
+            slots[ns].base_nr_pkts  = g_slot[i].base_nr_pkts;
+            slots[ns].base_nr_bytes = g_slot[i].base_nr_bytes;
+            slots[ns].base_red_pkts = g_slot[i].base_red_pkts;
+        }
+        ns++;
+    }
+    pthread_mutex_unlock(&g_copp_lock);
+
+    if (npols != NULL) {
+        *npols = np;
+    }
+    if (nslots != NULL) {
+        *nslots = ns;
+    }
+}
+
+int hwbcm_copp_warm_restore(const hwbcm_copp_wb_globals_t *globals,
+                            const hwbcm_copp_policer_wb_t *pols, int npols,
+                            const hwbcm_copp_slot_wb_t *slots, int nslots)
+{
+    int i, j;
+    int restored_pols = 0, restored_slots = 0, pending_slots = 0;
+    bcm_cos_queue_t q = 0;
+
+    pthread_mutex_lock(&g_copp_lock);
+    g_group_valid = 0;
+    g_group = 0;
+    g_have_to_me = 0;
+    g_have_icmp = 0;
+    g_have_stats = 1;
+    g_local_egr = -1;
+    g_qmax = -1;
+    memset(g_slot, 0, sizeof(g_slot));
+    memset(g_pol, 0, sizeof(g_pol));
+
+    if (globals != NULL) {
+        g_group_valid = globals->group_valid ? 1 : 0;
+        g_group       = (bcm_field_group_t)globals->group;
+        g_have_to_me  = globals->have_to_me ? 1 : 0;
+        g_have_icmp   = globals->have_icmp ? 1 : 0;
+        g_have_stats  = globals->have_stats ? 1 : 0;
+        g_local_egr   = globals->local_egr;
+    }
+
+    /* Probe g_qmax right away (read-only) so cfg_check() succeeds on any
+     * post-warm-boot hwbcm_copp_trap_apply() even though group_ensure()
+     * returns early when g_group_valid == 1. */
+    if (BCM_SUCCESS(bcm_rx_queue_max_get(HWBCM_UNIT, &q))) {
+        g_qmax = (int)q;
+    } else {
+        g_qmax = 7;
+    }
+
+    if (g_group_valid) {
+        bcm_field_group_status_t st;
+        memset(&st, 0, sizeof(st));
+        if (BCM_FAILURE(bcm_field_group_status_get(HWBCM_UNIT, g_group, &st))) {
+            CLOGW("wb: restored CoPP IFP group %d not found in SDK", (int)g_group);
+        }
+    }
+
+    for (i = 0; i < npols && pols != NULL; i++) {
+        int idx = pols[i].slot_idx;
+        if (idx < 0 || idx >= COPP_MAX_POLICERS) {
+            continue;
+        }
+        g_pol[idx].used = 1;
+        g_pol[idx].pid  = (bcm_policer_t)pols[i].pid;
+        g_pol[idx].cfg  = pols[i].cfg;
+        restored_pols++;
+    }
+
+    for (i = 0; i < nslots && slots != NULL; i++) {
+        int idx = slots[i].slot_idx;
+        int neid = slots[i].neid;
+        if (idx < 0 || idx >= COPP_MAX_TRAPS) {
+            continue;
+        }
+        if (neid < 0) {
+            neid = 0;
+        } else if (neid > COPP_MAX_RULES) {
+            neid = COPP_MAX_RULES;
+        }
+        g_slot[idx].used          = 1;
+        g_slot[idx].cfg           = slots[i].cfg;
+        g_slot[idx].neid          = neid;
+        for (j = 0; j < COPP_MAX_RULES; j++) {
+            g_slot[idx].eid[j]     = (bcm_field_entry_t)slots[i].eid[j];
+            g_slot[idx].stat_id[j] = slots[i].stat_id[j];
+        }
+        g_slot[idx].base_nr_pkts  = slots[i].base_nr_pkts;
+        g_slot[idx].base_nr_bytes = slots[i].base_nr_bytes;
+        g_slot[idx].base_red_pkts = slots[i].base_red_pkts;
+        restored_slots++;
+        if (neid == 0) {
+            pending_slots++;
+        }
+    }
+    pthread_mutex_unlock(&g_copp_lock);
+
+    CLOGI("wb: restored group=%d(valid=%d to_me=%d icmp=%d stats=%d) local_egr=%d qmax=%d policers=%d traps=%d(pending=%d)",
+          (int)g_group, g_group_valid, g_have_to_me, g_have_icmp, g_have_stats,
+          g_local_egr, g_qmax, restored_pols, restored_slots, pending_slots);
+    return 0;
+}
