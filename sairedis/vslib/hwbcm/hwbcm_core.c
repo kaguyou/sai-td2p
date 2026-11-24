@@ -2297,6 +2297,7 @@ int hwbcm_warm_deinit_ex(int for_kexec)
     long t0 = mono_ms();
     char mpath[600];
     int rv_reset1 = 0, rv_reset2 = 0, rv_bcm, rv_soc, nbusy = 0, busy;
+    int knet_mode = 0;
     char active[384];
 
     pthread_mutex_lock(&g_lock);
@@ -2304,6 +2305,9 @@ int hwbcm_warm_deinit_ex(int for_kexec)
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
+    /* soc_shutdown frees SOC_CONTROL(unit): SOC_KNET_MODE() after it is a
+     * NULL dereference (syncd segfaulted here, 2026-11-24). */
+    knet_mode = SOC_KNET_MODE(unit) ? 1 : 0;
     wb_sidecar_path(mpath, sizeof(mpath), g_scache_path, ".dma_idle");
     HWBCM_LOGI("hwbcm_warm_deinit: mode=%s", for_kexec ? "KEXEC (abort KNET DMA)" : "syncd restart (keep KNET)");
 
@@ -2330,7 +2334,7 @@ int hwbcm_warm_deinit_ex(int for_kexec)
          * Bus Master again. KCOM_M_HW_RESET with channels=0 = bkn_dma_abort on
          * every channel + bkn_clean_dcbs. Done first (before the long steps)
          * and again right before soc_shutdown. */
-        rv_reset1 = SOC_KNET_MODE(unit) ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
+        rv_reset1 = knet_mode ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
         if (SOC_FAILURE(rv_reset1)) {
             HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_knet_hw_reset(-1) rv=%d (%s)",
                        rv_reset1, bcm_errmsg(rv_reset1));
@@ -2351,7 +2355,7 @@ int hwbcm_warm_deinit_ex(int for_kexec)
         }
     }
     if (for_kexec) {
-        rv_reset2 = SOC_KNET_MODE(unit) ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
+        rv_reset2 = knet_mode ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
         if (SOC_FAILURE(rv_reset2)) {
             HWBCM_LOGE("hwbcm_warm_deinit[kexec]: second soc_knet_hw_reset(-1) rv=%d", rv_reset2);
         }
@@ -2367,7 +2371,7 @@ int hwbcm_warm_deinit_ex(int for_kexec)
         }
     }
 
-    if (for_kexec && SOC_KNET_MODE(unit)) {
+    if (for_kexec && knet_mode) {
         /* bkn_rxtick (every ~100 ms) refills and restarts an RX channel that
          * is not running if its token bucket is below the burst size, i.e.
          * if packets arrived in the tick before the abort (only matters with
