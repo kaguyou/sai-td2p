@@ -207,6 +207,19 @@ if ! grep -q '^mmu_lossless=' "$cfg_host"; then
     log "set mmu_lossless=0 in $cfg_host"
 fi
 
+# BDE/KNET module parameters as the stock opennsl-modules service uses them.
+# td2p-prep.service modprobes the modules before opennsl-modules runs, so
+# without this they load with defaults; KNET with use_rx_skb=0 depends on
+# syncd for RX buffers and its RX channel dies ("Incomplete chain") while
+# syncd is down for a warm restart. Takes effect on the next module load.
+KNET_CONF=/etc/modprobe.d/td2p-knet.conf
+KNET_WANT='options linux-kernel-bde dmasize=32M maxpayload=128 usemsi=0
+options linux-bcm-knet use_rx_skb=1 rx_buffer_size=9238 default_mtu=9100'
+if [ "$(cat "$KNET_CONF" 2>/dev/null)" != "$KNET_WANT" ]; then
+    printf '%s\n' "$KNET_WANT" | sudo tee "$KNET_CONF" >/dev/null
+    log "wrote $KNET_CONF (applies on next module load / reboot)"
+fi
+
 python3 -I "$GEN" "$HWSKU/port_config.ini" -c "$cfg_host" -o "$TMP/lanemap.ini"
 sudo install -m 644 -o root -g root "$TMP/lanemap.ini" "$HWSKU/lanemap.ini"
 log "wrote $HWSKU/lanemap.ini ($(grep -vc '^#' "$HWSKU/lanemap.ini") ports)"

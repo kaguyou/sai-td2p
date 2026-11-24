@@ -1391,10 +1391,12 @@ static int hwbcm_scache_flush_file(const char *path, size_t *bytes_written)
 static void hwbcm_sgmii_warm_probe(int unit)
 {
     int i, nmarked = 0;
+    /* Stamp "now": a link-down right after warm init is then treated as our
+     * own bounce (flag kept) and the following up is not re-applied. The old
+     * now-RATE_LIMIT stamp cleared the flag on the first down and every up
+     * re-applied SGMII, bouncing the copper link again (flap loop). */
     long ts = mono_seconds();
-    if (ts > HWBCM_SGMII_RATE_LIMIT_SEC) {
-        ts -= HWBCM_SGMII_RATE_LIMIT_SEC;
-    } else {
+    if (ts <= 0) {
         ts = 1;
     }
 
@@ -2213,6 +2215,21 @@ int hwbcm_port_speed_set(int port, int speed_mbps, int autoneg)
     }
     if (speed_mbps <= 0) {
         return BCM_E_PARAM;
+    }
+
+    if (autoneg && g_desired_speed[port] == speed_mbps) {
+        /* Same request as the one already in effect (orchagent re-sends the
+         * port config after a warm restart). Re-running autoneg_set and the
+         * SGMII interface_set goes all the way to the copper PHY and drops
+         * the link, so leave a live port alone. */
+        int an = 0, link = 0;
+        if (BCM_SUCCESS(bcm_port_autoneg_get(unit, port, &an)) && an &&
+            BCM_SUCCESS(bcm_port_link_status_get(unit, port, &link)) &&
+            link == BCM_PORT_LINK_STATUS_UP) {
+            HWBCM_LOGI("port %d: speed %d Mbps autoneg 1 unchanged, link up, not reprogrammed",
+                       port, speed_mbps);
+            return 0;
+        }
     }
 
     if (autoneg) {
