@@ -51,11 +51,13 @@
             bool m_uninitDataPlaneOnRemoval = false;
             bool m_warmSynced = false;
             /* Phase 4: PRE_SHUTDOWN=true (warm-reboot/fast-reboot only, a
-             * syncd-only warm restart never sends it) selects the kexec-mode
-             * warm deinit (KNET DMA aborted). */
+             * syncd-only warm restart never sends it) always forces kexec-mode
+             * warm deinit (KNET DMA aborted), even if HWBCM_WB_KEEP_KNET=1. */
             bool m_preShutdown = false;
 
-            /* kexec-mode warm deinit wanted: PRE_SHUTDOWN seen, or the test
-             * overrides env HWBCM_WB_KEXEC=1 / file <warmboot dir>/kexec-pending. */
+            /* kexec/dma-reset warm deinit wanted: always true for PRE_SHUTDOWN,
+             * HWBCM_WB_KEXEC=1, or <warmboot dir>/kexec-pending; also true by
+             * default for plain syncd warm restarts unless HWBCM_WB_KEEP_KNET=1
+             * opts back into live KNET rings. */
             bool warmDeinitForKexec() const;
             bool m_isWarmBoot = false;

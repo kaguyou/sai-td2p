@@ -45,6 +45,9 @@ enum {
 #include <sal/appl/sal.h>
 #include <sal/appl/config.h>
 #include <soc/drv.h>
+#ifdef BCM_CMICM_SUPPORT
+#include <soc/cmicm.h>
+#endif
 #include <soc/cm.h>
 #include <soc/knet.h>
 #include <soc/scache.h>
@@ -400,6 +403,9 @@ static void knet_stale_cleanup(void)
 
 int hwbcm_riot_enabled(void)
 {
+    if (!SOC_UNIT_VALID(HWBCM_UNIT)) {
+        return 0;
+    }
     return soc_feature(HWBCM_UNIT, soc_feature_riot) ? 1 : 0;
 }
 
@@ -699,6 +705,10 @@ static void shell_sock_serve(int client)
     }
 
     pthread_mutex_lock(&g_shell_lock);
+    if (g_shell_sock_stop || !g_inited || !SOC_UNIT_VALID(HWBCM_UNIT)) {
+        pthread_mutex_unlock(&g_shell_lock);
+        return;
+    }
     fflush(stdout);
     fflush(stderr);
     saved_out = dup(1);
@@ -815,6 +825,11 @@ static void shell_sock_stop(void)
         g_shell_sock_fd = -1;
     }
     (void)unlink(HWBCM_SHELL_SOCK_PATH);
+    /* Wait for any in-flight shell_sock_serve() command to finish before
+     * shutdown tears down SOC_CONTROL(unit). Once g_shell_sock_stop is 1,
+     * no new command will enter hwbcm_shell_cmd(). */
+    pthread_mutex_lock(&g_shell_lock);
+    pthread_mutex_unlock(&g_shell_lock);
     g_shell_sock_started = 0;
 }
 
@@ -1962,6 +1977,21 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             rv = soc_mmu_init(unit);
         } else {
             HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init skipped (MMU/LLS kept from cold boot)");
+            if (SOC_IS_TD2P_TT2P(unit)) {
+                /* soc_td2_cpu_port_lls_init() (inside soc_mmu_init) is the only
+                 * place that populates CPU_ARM_RSVD_QUEUE_BITMAP (bit 58 for
+                 * PCI CPU L0.0, plus 59/60 for ARM0/1 if configured). Without
+                 * bit 58, bcm_rx_start() -> _bcm_common_rx_queue_channel_set()
+                 * after SOC_WARM_BOOT_DONE overwrites CMIC_CMC0_CH1_COS_CTRL_RX_1
+                 * with 0x0000ffff (clearing 0x04000000), silencing CPU RX0. */
+                SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 0), 58);
+                if (NUM_CPU_ARM_COSQ(unit, SOC_ARM_CMC(unit, 0)) > 0) {
+                    SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 1), 59);
+                }
+                if (NUM_CPU_ARM_COSQ(unit, SOC_ARM_CMC(unit, 1)) > 0) {
+                    SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 2), 60);
+                }
+            }
             rv = SOC_E_NONE;
         }
         if (SOC_FAILURE(rv)) {
@@ -2017,6 +2047,15 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
                 HWBCM_LOGW("hwbcm_init_ex[warm]: bcm_rx_start: %s", bcm_errmsg(rv));
             }
         }
+#ifdef CMIC_CMCx_CHy_COS_CTRL_RX_0_OFFSET
+        {
+            int pci_cmc = SOC_PCI_CMC(unit);
+            uint32 r0 = soc_pci_read(unit, CMIC_CMCx_CHy_COS_CTRL_RX_0_OFFSET(pci_cmc, 1));
+            uint32 r1 = soc_pci_read(unit, CMIC_CMCx_CHy_COS_CTRL_RX_1_OFFSET(pci_cmc, 1));
+            HWBCM_LOGI("hwbcm_init_ex[warm]: CMIC_CMC%d_CH1_COS_CTRL_RX_0=0x%08x RX_1=0x%08x",
+                       pci_cmc, r0, r1);
+        }
+#endif
 
         /* Back to the syncd-restart defaults so later deinits keep the rings. */
         (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
@@ -2045,6 +2084,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         rv = bcm_linkscan_enable_set(unit, BCM_LINKSCAN_INTERVAL_DEFAULT);
         if (BCM_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_linkscan_enable_set: %s", bcm_errmsg(rv));
+            hwbcm_scache_cleanup();
             pthread_mutex_unlock(&g_lock);
             return rv;
         }
@@ -2061,6 +2101,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         rv = bcm_linkscan_register(unit, hwbcm_linkscan_handler);
         if (BCM_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_linkscan_register: %s", bcm_errmsg(rv));
+            hwbcm_scache_cleanup();
             pthread_mutex_unlock(&g_lock);
             return rv;
         }
@@ -2235,7 +2276,7 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
     long t0 = mono_ms();
 
     pthread_mutex_lock(&g_lock);
-    if (!g_inited) {
+    if (!g_inited || !SOC_UNIT_VALID(HWBCM_UNIT)) {
         pthread_mutex_unlock(&g_lock);
         return BCM_E_INIT;
     }
@@ -2250,6 +2291,9 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
         pthread_mutex_unlock(&g_lock);
         HWBCM_LOGE("hwbcm_warm_sync: no scache file path");
         return BCM_E_PARAM;
+    }
+    if (scache_file != NULL && scache_file[0] != '\0' && scache_file != g_scache_path) {
+        snprintf(g_scache_path, sizeof(g_scache_path), "%s", scache_file);
     }
 
     rv = bcm_switch_control_set(HWBCM_UNIT, bcmSwitchControlSync, 1);
@@ -2281,6 +2325,34 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
 #endif
 }
 
+static void hwbcm_core_state_reset(void)
+{
+    int i;
+
+    memset(g_knet, 0, sizeof(g_knet));
+    memset(g_desired_speed, 0, sizeof(g_desired_speed));
+    memset(g_sgmii_applied, 0, sizeof(g_sgmii_applied));
+    memset(g_sgmii_applied_at, 0, sizeof(g_sgmii_applied_at));
+    memset(g_switch_mac, 0, sizeof(g_switch_mac));
+    g_switch_mac_valid = 0;
+    g_ip2me_station_id = -1;
+    g_ip2me_vfi_station_id = -1;
+    g_ip2me_wanted = 0;
+    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+        g_trap_l2cache_idx[i] = -1;
+    }
+    g_hash_fields[0] = HWBCM_HASH_F_DEFAULT;
+    g_hash_fields[1] = HWBCM_HASH_F_DEFAULT;
+    g_hash_seed[0] = 0x5a5a5a5au;
+    g_hash_seed[1] = 0xa5a5a5a5u;
+    g_fp_count = 0;
+    g_warm_boot = 0;
+#ifdef BCM_WARM_BOOT_SUPPORT
+    g_knet_state = -1;
+    g_epc_saved_valid = 0;
+#endif
+}
+
 int hwbcm_warm_deinit(void)
 {
     return hwbcm_warm_deinit_ex(0);
@@ -2307,9 +2379,9 @@ int hwbcm_warm_deinit_ex(int for_kexec)
     }
     /* soc_shutdown frees SOC_CONTROL(unit): SOC_KNET_MODE() after it is a
      * NULL dereference (syncd segfaulted here, 2026-11-24). */
-    knet_mode = SOC_KNET_MODE(unit) ? 1 : 0;
+    knet_mode = (SOC_UNIT_VALID(unit) && SOC_KNET_MODE(unit)) ? 1 : 0;
     wb_sidecar_path(mpath, sizeof(mpath), g_scache_path, ".dma_idle");
-    HWBCM_LOGI("hwbcm_warm_deinit: mode=%s", for_kexec ? "KEXEC (abort KNET DMA)" : "syncd restart (keep KNET)");
+    HWBCM_LOGI("hwbcm_warm_deinit: mode=%s", for_kexec ? "KEXEC/dma-reset (abort KNET DMA)" : "live (keep KNET)");
 
     shell_sock_stop();
 
@@ -2323,17 +2395,17 @@ int hwbcm_warm_deinit_ex(int for_kexec)
     hwbcm_vxlan_warm_reset();
 
     /* Preserve KNET netifs and filters across shutdown (destroying 72 netifs
-     * one by one takes ~30 s). In kexec mode the rings are aborted below. */
+     * one by one takes ~30 s). In kexec/dma-reset mode the rings are aborted below. */
     (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
     (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
 
     if (for_kexec) {
-        /* System warm reboot: nothing unloads the KNET module before kexec
-         * (opennsl-modules ExecStop is a no-op), so its RX/TX channels would
-         * still point at old-kernel DCBs when the new kernel's BDE probe sets
-         * Bus Master again. KCOM_M_HW_RESET with channels=0 = bkn_dma_abort on
-         * every channel + bkn_clean_dcbs. Done first (before the long steps)
-         * and again right before soc_shutdown. */
+        /* System warm reboot or dma-reset syncd restart: nothing unloads the
+         * KNET module before kexec (opennsl-modules ExecStop is a no-op), so
+         * its RX/TX channels would still point at old-kernel DCBs when the new
+         * kernel's BDE probe sets Bus Master again. KCOM_M_HW_RESET with
+         * channels=0 = bkn_dma_abort on every channel + bkn_clean_dcbs. Done
+         * first (before the long steps) and again right before soc_shutdown. */
         rv_reset1 = knet_mode ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
         if (SOC_FAILURE(rv_reset1)) {
             HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_knet_hw_reset(-1) rv=%d (%s)",
@@ -2360,16 +2432,6 @@ int hwbcm_warm_deinit_ex(int for_kexec)
             HWBCM_LOGE("hwbcm_warm_deinit[kexec]: second soc_knet_hw_reset(-1) rv=%d", rv_reset2);
         }
     }
-    rv_soc = soc_shutdown(unit);
-    if (SOC_FAILURE(rv_soc)) {
-        /* soc_shutdown stops the userspace DMA engines with SOC_IF_ERROR_RETURN
-         * steps: an early error skips the later stops. */
-        if (for_kexec) {
-            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
-        } else {
-            HWBCM_LOGW("soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
-        }
-    }
 
     if (for_kexec && knet_mode) {
         /* bkn_rxtick (every ~100 ms) refills and restarts an RX channel that
@@ -2377,8 +2439,12 @@ int hwbcm_warm_deinit_ex(int for_kexec)
          * if packets arrived in the tick before the abort (only matters with
          * use_rx_skb=1; with the default 0 the RX buffers come from the BCM
          * RX API chains, which are gone). Re-check after more than one tick
-         * and abort again until the channels stay idle. KCOM is still open:
-         * soc_shutdown with mode=1 skips soc_knet_cleanup. */
+         * and abort again until the channels stay idle.
+         *
+         * MUST run BEFORE soc_shutdown(unit): soc_shutdown frees
+         * SOC_CONTROL(unit), after which soc_knet_handle_rx() rejects every
+         * KCOM reply (!SOC_UNIT_VALID(unit)) and soc_knet_hw_reset() always
+         * times out with SOC_E_TIMEOUT. */
         int tries;
         uint32 act = 0;
         for (tries = 0; tries < 6; tries++) {
@@ -2396,10 +2462,22 @@ int hwbcm_warm_deinit_ex(int for_kexec)
         }
     }
 
+    rv_soc = soc_shutdown(unit);
+    if (SOC_FAILURE(rv_soc)) {
+        /* soc_shutdown stops the userspace DMA engines with SOC_IF_ERROR_RETURN
+         * steps: an early error skips the later stops. */
+        if (for_kexec) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
+        } else {
+            HWBCM_LOGW("soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
+        }
+    }
+
     if (for_kexec) {
-        /* Read back the CMIC DMA engines (the BDE mapping is still there,
-         * sysconf_detach is never called) and leave the verdict for the
-         * platform warm-reboot_plugin, which re-checks the registers itself. */
+        /* Read back the CMIC DMA engines (soc_pci_read -> CMREAD uses static
+         * CMVEC(unit), not SOC_CONTROL(unit), and sysconf_detach is never
+         * called) and leave the verdict for the platform warm-reboot_plugin
+         * and the next warm init's KNET probe. */
         char bid[64], line[640];
         nbusy = cmic_dma_busy(unit, active, sizeof(active));
         busy = nbusy > 0 || SOC_FAILURE(rv_reset1) || SOC_FAILURE(rv_reset2) ||
@@ -2422,10 +2500,8 @@ int hwbcm_warm_deinit_ex(int for_kexec)
     }
 
     hwbcm_scache_cleanup();
-    memset(g_knet, 0, sizeof(g_knet));
+    hwbcm_core_state_reset();
     g_inited = 0;
-    g_fp_count = 0;
-    g_warm_boot = 0;
     pthread_mutex_unlock(&g_lock);
     HWBCM_LOGI("hwbcm_warm_deinit: done in %ld ms (ASIC preserved, KNET %s)", mono_ms() - t0,
                for_kexec ? "rings aborted, netifs kept" : "preserved");
@@ -2482,9 +2558,8 @@ int hwbcm_deinit(void)
     hwbcm_scache_cleanup();
 #endif
 
+    hwbcm_core_state_reset();
     g_inited = 0;
-    g_fp_count = 0;
-    g_warm_boot = 0;
     pthread_mutex_unlock(&g_lock);
     HWBCM_LOGI("hwbcm_deinit: done");
     return 0;
@@ -3587,13 +3662,14 @@ int hwbcm_shell(const char *cmd)
 {
     int rc;
 
-    if (!g_inited) {
-        return BCM_E_INIT;
-    }
     if (cmd == NULL) {
         return BCM_E_PARAM;
     }
     pthread_mutex_lock(&g_shell_lock);
+    if (!g_inited || !SOC_UNIT_VALID(HWBCM_UNIT)) {
+        pthread_mutex_unlock(&g_shell_lock);
+        return BCM_E_INIT;
+    }
     rc = hwbcm_shell_cmd(cmd);
     pthread_mutex_unlock(&g_shell_lock);
     return rc;

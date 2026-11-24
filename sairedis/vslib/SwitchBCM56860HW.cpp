@@ -91,6 +91,11 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
 {
     SWSS_LOG_ENTER();
 
+    /* Stop accepting new SDK link/L2 callbacks into our queue and stop the
+     * worker thread first, but keep m_linkEventFd open until after SDK
+     * deinit has unregistered linkCallbackC/l2CallbackC (so an in-flight
+     * callback during hwWarmSync or shutdown cannot write to a closed/reused
+     * fd). */
     m_linkRun = false;
 
     if (m_linkEventFd >= 0)
@@ -105,13 +110,6 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
     if (m_linkThread.joinable())
     {
         m_linkThread.join();
-    }
-
-    if (m_linkEventFd >= 0)
-    {
-        close(m_linkEventFd);
-
-        m_linkEventFd = -1;
     }
 
     if (m_hwReady)
@@ -158,7 +156,7 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
                     (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count(),
                     (long)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
                     (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(),
-                    forKexec ? "kexec" : "syncd-restart");
+                    forKexec ? "kexec/dma-reset" : "live");
         }
         else
         {
@@ -176,6 +174,13 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
         hwbcm_qos_warm_reset();
         hwbcm_stats_warm_reset();
         m_hwReady = false;
+    }
+
+    if (m_linkEventFd >= 0)
+    {
+        close(m_linkEventFd);
+
+        m_linkEventFd = -1;
     }
 }
 
@@ -280,9 +285,6 @@ sai_status_t SwitchBCM56860HW::hwInitialize(
     // BST (buffer watermarks) + counter baselines for queue/PG/pool stats
     (void)hwbcm_stats_init();
 
-    m_hwReady = true;
-    m_isWarmBoot = warmBoot;
-
     // link notification thread
 
     m_linkEventFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -291,8 +293,12 @@ sai_status_t SwitchBCM56860HW::hwInitialize(
     {
         SWSS_LOG_ERROR("eventfd failed: %s", strerror(errno));
 
+        (void)hwbcm_deinit();
         return SAI_STATUS_FAILURE;
     }
+
+    m_hwReady = true;
+    m_isWarmBoot = warmBoot;
 
     m_linkRun = true;
 
@@ -1212,7 +1218,7 @@ void SwitchBCM56860HW::linkCallbackC(
 
     auto *self = static_cast<SwitchBCM56860HW*>(cookie);
 
-    if (self == NULL)
+    if (self == NULL || !self->m_linkRun.load())
     {
         return;
     }
@@ -1305,7 +1311,7 @@ void SwitchBCM56860HW::l2CallbackC(
 
     auto *self = static_cast<SwitchBCM56860HW*>(cookie);
 
-    if (self == NULL || mac == NULL)
+    if (self == NULL || mac == NULL || !self->m_linkRun.load())
     {
         return;
     }

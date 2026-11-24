@@ -423,7 +423,15 @@ bool SwitchBCM56860HW::warmDeinitForKexec() const
         return true;
     }
 
-    return false;
+    const char *keepKnet = getenv("HWBCM_WB_KEEP_KNET");
+    if (keepKnet != NULL && keepKnet[0] == '1')
+    {
+        SWSS_LOG_NOTICE("wb: live-mode deinit (keep KNET rings) selected by HWBCM_WB_KEEP_KNET=1");
+        return false;
+    }
+
+    SWSS_LOG_NOTICE("wb: dma-reset deinit (default for syncd warm restart; set HWBCM_WB_KEEP_KNET=1 for live mode)");
+    return true;
 }
 
 sai_status_t SwitchBCM56860HW::hwWarmSync()

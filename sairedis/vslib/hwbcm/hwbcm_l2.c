@@ -433,7 +433,9 @@ int hwbcm_l2_callback_register(hwbcm_l2_cb_t cb, void *cookie)
 void hwbcm_l2_warm_reset(void)
 {
     if (g_l2_cb_registered) {
-        (void)bcm_l2_addr_unregister(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
+        if (SOC_UNIT_VALID(HWBCM_UNIT)) {
+            (void)bcm_l2_addr_unregister(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
+        }
         g_l2_cb_registered = 0;
     }
     g_l2_cb = NULL;
