@@ -1,8 +1,8 @@
 diff --git a/vslib/Makefile.am b/vslib/Makefile.am
-index ca2e26d..6cabf2b 100644
+index ca2e26d..261702a 100644
 --- a/vslib/Makefile.am
 +++ b/vslib/Makefile.am
-@@ -53,6 +53,13 @@ libSaiVS_a_SOURCES = \
+@@ -53,6 +53,14 @@ libSaiVS_a_SOURCES = \
  					  SelectableFd.cpp \
  					  Signal.cpp \
  					  SwitchBCM56850.cpp \
@@ -13,10 +13,11 @@ index ca2e26d..6cabf2b 100644
 +					  SwitchBCM56860HW_acl.cpp \
 +					  SwitchBCM56860HW_copp.cpp \
 +					  SwitchBCM56860HW_qos.cpp \
++					  SwitchBCM56860HW_mirror.cpp \
  					  SwitchBCM56971B0.cpp \
  					  SwitchBCM81724.cpp \
  					  SwitchConfigContainer.cpp \
-@@ -70,7 +77,22 @@ libSaiVS_a_SOURCES = \
+@@ -70,7 +78,23 @@ libSaiVS_a_SOURCES = \
  					  TrafficForwarder.cpp \
  					  VirtualSwitchSaiInterface.cpp \
  					  VirtualSwitchSaiInterfaceFdb.cpp \
@@ -29,7 +30,8 @@ index ca2e26d..6cabf2b 100644
 +					  hwbcm/hwbcm_stats.c \
 +					  hwbcm/hwbcm_acl.c \
 +					  hwbcm/hwbcm_copp.c \
-+					  hwbcm/hwbcm_qos.c
++					  hwbcm/hwbcm_qos.c \
++					  hwbcm/hwbcm_mirror.c
 +
 +# hwbcm/*.c wrap the OpenBCM SDK (BCM56860 hardware switch). They need the SDK
 +# defines and include paths, kept in ../sai-td2p next to this tree (see

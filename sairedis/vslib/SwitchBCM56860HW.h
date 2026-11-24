@@ -20,6 +20,7 @@
  *                               1D BRIDGE / tunnel BRIDGE_PORT, FDB on tunnels   (A4)
  *   SwitchBCM56860HW_copp.cpp   POLICER, HOSTIF_TRAP_GROUP, hostif trap policing (CoPP)
  *   SwitchBCM56860HW_qos.cpp    QOS_MAP, SCHEDULER, WRED, BUFFER_POOL/PROFILE, QUEUE/SG/PG (A6)
+ *   SwitchBCM56860HW_mirror.cpp MIRROR_SESSION (SPAN/RSPAN/ERSPAN), port mirror
  */
 
 #include "SwitchBCM56850.h"
@@ -435,5 +436,6 @@ namespace saivs
 #include "SwitchBCM56860HW_acl.inc.h"
 #include "SwitchBCM56860HW_copp.inc.h"
 #include "SwitchBCM56860HW_qos.inc.h"
+#include "SwitchBCM56860HW_mirror.inc.h"
     };
 }

@@ -574,6 +574,11 @@ sai_status_t SwitchBCM56860HW::hwSetPort(
         return qosHwSetPort(port_id, attr);
     }
 
+    if (mirrorIsPortAttr(attr->id))
+    {
+        return mirrorHwSetPort(port_id, attr);
+    }
+
     int bcm = bcmPortOf(port_id);
 
     if (bcm < 0)
@@ -692,6 +697,8 @@ sai_status_t SwitchBCM56860HW::hwRemovePort(
     }
 
     qosOnPortRemoved(port_id);
+
+    mirrorOnPortRemoved(port_id);
 
     unmapPort(port_id);
 
@@ -2606,6 +2613,9 @@ sai_status_t SwitchBCM56860HW::create(
         case SAI_OBJECT_TYPE_BUFFER_POOL:            hw = hwCreateBufferPool(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_BUFFER_PROFILE:         hw = hwCreateBufferProfile(oid, attr_count, attr_list); break;
 
+        // Mirror
+        case SAI_OBJECT_TYPE_MIRROR_SESSION:         hw = hwCreateMirrorSession(oid, attr_count, attr_list); break;
+
         default:
 
             // virtual switch behaviour only
@@ -2712,6 +2722,9 @@ sai_status_t SwitchBCM56860HW::remove(
             case SAI_OBJECT_TYPE_BUFFER_POOL:            hw = hwRemoveBufferPool(oid); break;
             case SAI_OBJECT_TYPE_BUFFER_PROFILE:         hw = hwRemoveBufferProfile(oid); break;
 
+            // Mirror
+            case SAI_OBJECT_TYPE_MIRROR_SESSION:         hw = hwRemoveMirrorSession(oid); break;
+
             default:
                 break;
         }
@@ -2786,6 +2799,7 @@ sai_status_t SwitchBCM56860HW::set(
         case SAI_OBJECT_TYPE_QUEUE:                  hw = hwSetQueue(oid, attr); break;
         case SAI_OBJECT_TYPE_SCHEDULER_GROUP:        hw = hwSetSchedulerGroup(oid, attr); break;
         case SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP: hw = hwSetIngressPriorityGroup(oid, attr); break;
+        case SAI_OBJECT_TYPE_MIRROR_SESSION:         hw = hwSetMirrorSession(oid, attr); break;
 
         default:
             break;
@@ -2813,14 +2827,40 @@ sai_status_t SwitchBCM56860HW::get(
 {
     SWSS_LOG_ENTER();
 
-    CHECK_STATUS(SwitchBCM56850::get(objectType, serializedObjectId, attr_count, attr_list));
-
     if (objectType == SAI_OBJECT_TYPE_ACL_COUNTER)
     {
+        // PACKETS/BYTES live in hardware and are never stored, so the base
+        // get fails on them ("failed to find attribute"): ask the base only
+        // for the other attributes, then fill the counters from the ASIC.
+        std::vector<sai_attribute_t> other;
+        std::vector<uint32_t> otherIdx;
+
+        for (uint32_t i = 0; i < attr_count; i++)
+        {
+            if (attr_list[i].id == SAI_ACL_COUNTER_ATTR_PACKETS || attr_list[i].id == SAI_ACL_COUNTER_ATTR_BYTES)
+            {
+                attr_list[i].value.u64 = 0;
+                continue;
+            }
+
+            other.push_back(attr_list[i]);
+            otherIdx.push_back(i);
+        }
+
+        if (!other.empty())
+        {
+            CHECK_STATUS(SwitchBCM56850::get(objectType, serializedObjectId, (uint32_t)other.size(), other.data()));
+
+            for (size_t k = 0; k < other.size(); k++)
+            {
+                attr_list[otherIdx[k]] = other[k];
+            }
+        }
+
         return hwAclCounterGet(serializedObjectId, attr_count, attr_list);
     }
 
-    return SAI_STATUS_SUCCESS;
+    return SwitchBCM56850::get(objectType, serializedObjectId, attr_count, attr_list);
 }
 
 // ---------------------------------------------------------------------------
