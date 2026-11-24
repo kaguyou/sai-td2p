@@ -1649,8 +1649,19 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             return rv;
         }
 
-        HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init");
-        rv = soc_mmu_init(unit);
+        /* soc_mmu_init has no warm-boot guard on TD2+: soc_td2_lls_init resets
+         * the LLS scheduler and rebuilds each port's tree with MMU TX disabled,
+         * which stopped forwarding ~3 s into the warm init (2026-11-24). The
+         * MMU is still programmed from the cold boot and bcm cosq reinit reads
+         * it back from hardware, so leave it alone (HWBCM_WB_MMU_INIT=1 restores
+         * the old behaviour for debugging). */
+        if (getenv("HWBCM_WB_MMU_INIT") && getenv("HWBCM_WB_MMU_INIT")[0] == '1') {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init (forced by HWBCM_WB_MMU_INIT)");
+            rv = soc_mmu_init(unit);
+        } else {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init skipped (MMU/LLS kept from cold boot)");
+            rv = SOC_E_NONE;
+        }
         if (SOC_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: soc_mmu_init failed: %s (%d)", bcm_errmsg(rv), rv);
             SOC_WARM_BOOT_DONE(unit);
@@ -1659,7 +1670,9 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             return rv;
         }
 
+        int wb_attached_now = 0;
         if (bcm_attach_check(unit) == BCM_E_UNIT) {
+            wb_attached_now = 1;
             rv = bcm_attach(unit, NULL, NULL, unit);
             if (BCM_FAILURE(rv)) {
                 HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_attach failed: %s (%d)", bcm_errmsg(rv), rv);
@@ -1670,8 +1683,17 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             }
         }
 
-        HWBCM_LOGI("hwbcm_init_ex[warm]: bcm_init");
-        rv = bcm_init(unit);
+        /* bcm_attach -> _bcm_esw_attach already ran _bcm_esw_init (the full
+         * module init, warm). A second bcm_init re-ran every module on top of
+         * live state: linkscan was stopped and re-inited and the copper link
+         * on 1G ports dropped ~1 s into it (2026-11-24). */
+        if (wb_attached_now) {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: bcm_init already done by bcm_attach, not repeated");
+            rv = BCM_E_NONE;
+        } else {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: bcm_init");
+            rv = bcm_init(unit);
+        }
         epc_link_restore(unit, "bcm_init");
         if (BCM_FAILURE(rv)) {
             HWBCM_LOGE("hwbcm_init_ex[warm]: bcm_init failed: %s (%d)", bcm_errmsg(rv), rv);
