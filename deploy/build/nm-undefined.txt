@@ -107,6 +107,7 @@
                  U _ZNKSt5ctypeIcE13_M_widen_initEv@GLIBCXX_3.4.11
                  U _ZNKSt6locale2id5_M_idEv@GLIBCXX_3.4
                  U _ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE4findEPKcmm@GLIBCXX_3.4.21
+                 U _ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE5rfindEcm@GLIBCXX_3.4.21
                  U _ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7compareEPKc@GLIBCXX_3.4.21
                  U _ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7compareEmmPKc@GLIBCXX_3.4.21
                  U _ZNKSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7compareEmmRKS4_@GLIBCXX_3.4.21
@@ -144,6 +145,7 @@
                  U _ZNSt18condition_variableD1Ev@GLIBCXX_3.4.11
                  U _ZNSt5ctypeIcE2idE@GLIBCXX_3.4
                  U _ZNSt6chrono3_V212steady_clock3nowEv@GLIBCXX_3.4.19
+                 U _ZNSt6chrono3_V212system_clock3nowEv@GLIBCXX_3.4.19
                  U _ZNSt6localeC1ERKS_@GLIBCXX_3.4
                  U _ZNSt6localeC1Ev@GLIBCXX_3.4
                  U _ZNSt6localeD1Ev@GLIBCXX_3.4
@@ -292,6 +294,8 @@
                  U fread@GLIBC_2.2.5
                  U free@GLIBC_2.2.5
                  U fseek@GLIBC_2.2.5
+                 U fstat@GLIBC_2.33
+                 U fsync@GLIBC_2.2.5
                  U ftell@GLIBC_2.2.5
                  U fwrite@GLIBC_2.2.5
                  U getcwd@GLIBC_2.2.5
@@ -301,6 +305,7 @@
                  U getpagesize@GLIBC_2.2.5
                  U gettimeofday@GLIBC_2.2.5
                  U if_nametoindex@GLIBC_2.2.5
+                 U inet_ntop@GLIBC_2.2.5
                  U ioctl@GLIBC_2.2.5
                  U isalnum@GLIBC_2.2.5
                  U isatty@GLIBC_2.2.5
@@ -402,6 +407,7 @@
                  U socket@GLIBC_2.2.5
                  U sprintf@GLIBC_2.2.5
                  U sqrt@GLIBC_2.2.5
+                 U stat@GLIBC_2.33
                  U stderr@GLIBC_2.2.5
                  U stdin@GLIBC_2.2.5
                  U stdout@GLIBC_2.2.5

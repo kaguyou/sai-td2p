@@ -430,6 +430,33 @@ int hwbcm_l2_callback_register(hwbcm_l2_cb_t cb, void *cookie)
     return 0;
 }
 
+void hwbcm_l2_warm_reset(void)
+{
+    if (g_l2_cb_registered) {
+        (void)bcm_l2_addr_unregister(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
+        g_l2_cb_registered = 0;
+    }
+    g_l2_cb = NULL;
+    g_l2_cookie = NULL;
+}
+
+int hwbcm_trunk_member_count_get(int trunk_id)
+{
+    bcm_trunk_info_t info;
+    int count = 0;
+    int rv;
+
+    if (trunk_id < 0) {
+        return BCM_E_PARAM;
+    }
+    bcm_trunk_info_t_init(&info);
+    rv = bcm_trunk_get(HWBCM_UNIT, (bcm_trunk_t)trunk_id, &info, 0, NULL, &count);
+    if (BCM_FAILURE(rv)) {
+        return rv;
+    }
+    return count;
+}
+
 /* ------------------------------------------------------------------------ */
 /* trunk / LAG                                                              */
 /* ------------------------------------------------------------------------ */

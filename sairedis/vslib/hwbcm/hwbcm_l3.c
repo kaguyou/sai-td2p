@@ -778,3 +778,47 @@ int hwbcm_l3_vrf_destroy(int vrf)
     hwbcm_log(HWBCM_LOG_INFO, "l3: vrf %d released", vrf);
     return 0;
 }
+
+void hwbcm_l3_warm_reset(void)
+{
+    s_l3_ready = 0;
+    s_l3_ingress_mode = 0;
+    s_ecmp_count = 0;
+    memset(s_vrf_used, 0, sizeof(s_vrf_used));
+}
+
+int hwbcm_l3_warm_restore(const int *vrfs, int nvrfs, const int *ecmp_ids, int necmp)
+{
+    int mode = 0, imode = 0, rv, i;
+
+    s_ecmp_count = 0;
+    memset(s_vrf_used, 0, sizeof(s_vrf_used));
+
+    rv = bcm_switch_control_get(U, bcmSwitchL3EgressMode, &mode);
+    if (rv < 0) {
+        hwbcm_log(HWBCM_LOG_WARN, "l3 wb: switch_control_get(L3EgressMode): %s", bcm_errmsg(rv));
+        mode = 0;
+    }
+    rv = bcm_switch_control_get(U, bcmSwitchL3IngressMode, &imode);
+    if (rv < 0) {
+        imode = 0;
+    }
+    s_l3_ready = mode ? 1 : 0;
+    s_l3_ingress_mode = imode ? 1 : 0;
+
+    for (i = 0; i < nvrfs; i++) {
+        int v = vrfs[i];
+        if (v > 0 && v < HWBCM_L3_MAX_VRF) {
+            s_vrf_used[v / 8] |= (uint8_t)(1u << (v % 8));
+        }
+    }
+    for (i = 0; i < necmp; i++) {
+        rv = hwbcm_l3_ecmp_remember(ecmp_ids[i]);
+        if (rv < 0) {
+            return rv;
+        }
+    }
+    hwbcm_log(HWBCM_LOG_INFO, "l3 wb: restored egress_mode=%d ingress_mode=%d vrfs=%d ecmp=%d",
+              s_l3_ready, s_l3_ingress_mode, nvrfs, necmp);
+    return 0;
+}

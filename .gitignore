@@ -3,6 +3,7 @@ deploy/build/*.a
 deploy/build/*.so*
 deploy/build/*.sha256
 hwtest/hwtest
+hwtest/hwtest_wb
 *.o
 *.so
 *.b64

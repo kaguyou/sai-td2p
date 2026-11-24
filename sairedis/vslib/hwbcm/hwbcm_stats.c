@@ -155,6 +155,11 @@ int hwbcm_stats_init(void)
     if (getenv("HWBCM_STATS_NO_BST") != NULL) {
         HWBCM_LOGW("stats: HWBCM_STATS_NO_BST set, watermarks read as 0");
         g_bst_on = 0;
+    } else if (hwbcm_is_warm_boot()) {
+        int bst_en = 0;
+        rv = bcm_switch_control_get(U, bcmSwitchBstEnable, &bst_en);
+        g_bst_on = (BCM_SUCCESS(rv) && bst_en) ? 1 : 0;
+        HWBCM_LOGI("stats: warm boot probed BST=%d (rv=%d)", g_bst_on, rv);
     } else {
         rv = bcm_switch_control_set(U, bcmSwitchBstTrackingMode, bcmSwitchBstTrackPeak);
         if (BCM_SUCCESS(rv)) {
