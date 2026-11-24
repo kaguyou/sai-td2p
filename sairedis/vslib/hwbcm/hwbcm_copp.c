@@ -721,7 +721,7 @@ static int entry_prio(const hwbcm_copp_trap_cfg_t *cfg, const copp_rule_t *r)
 }
 
 /* Colour actions. steer: the entry itself copies to the CPU. */
-static int entry_actions(bcm_field_entry_t eid, const hwbcm_copp_trap_cfg_t *cfg, int steer, int ridx)
+static int entry_actions(bcm_field_entry_t eid, const hwbcm_copp_trap_cfg_t *cfg, int steer, int ridx, int to_me)
 {
     int rv = 0;
     int policed = (cfg->policer_id >= 0);
@@ -752,6 +752,22 @@ static int entry_actions(bcm_field_entry_t eid, const hwbcm_copp_trap_cfg_t *cfg
     /* Cancel every CPU copy (switch logic + FP) of a dropped colour. With
      * steer the entry has no copy for that colour already, but another
      * mechanism (e.g. a duplicate of the same match) might. */
+    /* "To me" packets (DstL3Egress = the ip2me CPU egress) reach the CPU by
+     * L3 forwarding to the CPU port, not by a copy, so the copy/switch-to-CPU
+     * cancels do not stop them (measured 2026-11-24: ip2me policer red count
+     * rising while the CPU still took ~2600 pps). They have no other
+     * destination, so drop the over-rate colour outright. */
+    if (to_me) {
+        if (drop_r) {
+            ECHK("RpDrop", bcm_field_action_add(HWBCM_UNIT, eid, bcmFieldActionRpDrop, 0, 0));
+        }
+        if (drop_y) {
+            ECHK("YpDrop", bcm_field_action_add(HWBCM_UNIT, eid, bcmFieldActionYpDrop, 0, 0));
+        }
+        if (drop_g) {
+            ECHK("GpDrop", bcm_field_action_add(HWBCM_UNIT, eid, bcmFieldActionGpDrop, 0, 0));
+        }
+    }
     if (drop_r) {
         ECHK("RpCopyToCpuCancel", bcm_field_action_add(HWBCM_UNIT, eid, bcmFieldActionRpCopyToCpuCancel, 0, 0));
         ECHK("RpSwitchToCpuCancel", bcm_field_action_add(HWBCM_UNIT, eid, bcmFieldActionRpSwitchToCpuCancel, 0, 0));
@@ -900,7 +916,7 @@ static int entry_build(const hwbcm_copp_trap_cfg_t *cfg, const copp_rule_t *r, i
     if (BCM_FAILURE(rv)) {
         goto fail;
     }
-    rv = entry_actions(eid, cfg, steer, ridx);
+    rv = entry_actions(eid, cfg, steer, ridx, r->to_me);
     if (BCM_FAILURE(rv)) {
         goto fail;
     }
