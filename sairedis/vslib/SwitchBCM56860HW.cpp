@@ -20,6 +20,7 @@
 #include "hwbcm/hwbcm_stats.h"
 
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <poll.h>
 #include <unistd.h>
 #include <net/if.h>
@@ -110,13 +111,38 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
 
     if (m_hwReady)
     {
-        int rv = hwbcm_deinit();
+        bool doWarm = m_restartWarm && !m_uninitDataPlaneOnRemoval;
 
-        if (rv < 0)
+        if (doWarm)
         {
-            SWSS_LOG_WARN("hwbcm_deinit failed: %d", rv);
+            if (!m_warmSynced)
+            {
+                SWSS_LOG_NOTICE("wb: destructor running warm sync fallback (PRE_SHUTDOWN not invoked)");
+                sai_status_t st = hwWarmSync();
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    SWSS_LOG_ERROR("wb: fallback warm sync failed: %s", sai_serialize_status(st).c_str());
+                }
+            }
+
+            int rv = hwbcm_warm_deinit();
+
+            if (rv < 0)
+            {
+                SWSS_LOG_WARN("hwbcm_warm_deinit failed: %d", rv);
+            }
+        }
+        else
+        {
+            int rv = hwbcm_deinit();
+
+            if (rv < 0)
+            {
+                SWSS_LOG_WARN("hwbcm_deinit failed: %d", rv);
+            }
         }
 
+        hwL3RestoreSharedEgress(-1, -1);
         m_hwReady = false;
     }
 }
@@ -169,7 +195,8 @@ std::string SwitchBCM56860HW::resolveConfigBcm() const
     return "";
 }
 
-sai_status_t SwitchBCM56860HW::hwInitialize()
+sai_status_t SwitchBCM56860HW::hwInitialize(
+        _In_ bool warmBoot)
 {
     SWSS_LOG_ENTER();
 
@@ -189,15 +216,21 @@ sai_status_t SwitchBCM56860HW::hwInitialize()
         return SAI_STATUS_FAILURE;
     }
 
-    SWSS_LOG_NOTICE("initializing Broadcom SDK with %s", m_configBcm.c_str());
+    std::string scachePath = warmBootScachePath(!warmBoot);
+
+    SWSS_LOG_NOTICE("initializing Broadcom SDK (%s) with %s (scache=%s)",
+            warmBoot ? "WARM" : "COLD",
+            m_configBcm.c_str(),
+            scachePath.c_str());
 
     hwbcm_log_level_set(HWBCM_LOG_INFO);
 
-    int rv = hwbcm_init(m_configBcm.c_str());
+    int rv = hwbcm_init_ex(m_configBcm.c_str(), warmBoot ? 1 : 0, scachePath.c_str());
 
     if (rv < 0)
     {
-        SWSS_LOG_ERROR("hwbcm_init(%s) failed: %d", m_configBcm.c_str(), rv);
+        SWSS_LOG_ERROR("hwbcm_init_ex(%s, warm=%d, %s) failed: %d",
+                m_configBcm.c_str(), warmBoot ? 1 : 0, scachePath.c_str(), rv);
 
         return SAI_STATUS_FAILURE;
     }
@@ -208,13 +241,15 @@ sai_status_t SwitchBCM56860HW::hwInitialize()
 
     if (hwbcm_chip_info(&devId, &revId, name, sizeof(name)) == 0)
     {
-        SWSS_LOG_NOTICE("attached to %s (device 0x%04x rev 0x%02x)", name, devId, revId);
+        SWSS_LOG_NOTICE("attached to %s (device 0x%04x rev 0x%02x) mode=%s",
+                name, devId, revId, warmBoot ? "WARM" : "COLD");
     }
 
     // BST (buffer watermarks) + counter baselines for queue/PG/pool stats
     (void)hwbcm_stats_init();
 
     m_hwReady = true;
+    m_isWarmBoot = warmBoot;
 
     // link notification thread
 
@@ -281,15 +316,43 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
 
     CHECK_STATUS(SwitchBCM56850::warm_boot_initialize_objects());
 
-    // NOTE: the SDK is initialized cold here, so ASIC tables are empty while
-    // the vslib bookkeeping says objects exist. Good enough for syncd restart
-    // with orchagent replay; true warm boot is not supported.
+    std::string scachePath = warmBootScachePath(false);
+    std::string hwStatePath = warmBootHwStatePath(false);
 
-    CHECK_STATUS(hwInitialize());
+    struct stat scSt;
+    bool haveScache = (stat(scachePath.c_str(), &scSt) == 0 && scSt.st_size > 0);
+    bool haveHwState = hwStateValidateFile(hwStatePath);
 
-    CHECK_STATUS(buildPortMaps(true));
+    if (haveScache && haveHwState)
+    {
+        SWSS_LOG_NOTICE("wb: attempting true warm boot (scache=%s, hwstate=%s)",
+                scachePath.c_str(), hwStatePath.c_str());
 
-    return qosBuildHwMap();
+        sai_status_t wst = hwInitialize(/*warmBoot=*/true);
+        if (wst == SAI_STATUS_SUCCESS)
+        {
+            CHECK_STATUS(buildPortMaps(/*applyDefaults=*/false));
+            CHECK_STATUS(hwWarmRecoverKnet());
+            CHECK_STATUS(hwStateLoad(hwStatePath));
+            CHECK_STATUS(qosBuildHwMap(/*warmBoot=*/true));
+
+            SWSS_LOG_NOTICE("wb: true warm boot completed (zero ASIC resets, zero port flaps)");
+            return SAI_STATUS_SUCCESS;
+        }
+
+        SWSS_LOG_ERROR("wb: warm SDK attach failed (%s); falling back to cold SDK init",
+                sai_serialize_status(wst).c_str());
+    }
+    else
+    {
+        SWSS_LOG_WARN("wb: warm boot sidecar files missing or invalid (scache_ok=%d hwstate_ok=%d); falling back to cold SDK init",
+                haveScache ? 1 : 0, haveHwState ? 1 : 0);
+    }
+
+    // Fallback: cold SDK init (preserves pre-warm-boot behavior on missing/corrupt files).
+    CHECK_STATUS(hwInitialize(/*warmBoot=*/false));
+    CHECK_STATUS(buildPortMaps(/*applyDefaults=*/true));
+    return qosBuildHwMap(/*warmBoot=*/false);
 }
 
 sai_status_t SwitchBCM56860HW::set_switch_default_attributes()
@@ -452,6 +515,41 @@ sai_status_t SwitchBCM56860HW::buildPortMaps(
 
         if (!applyDefaults)
         {
+            // Warm boot: zero HW writes! Restore SW desired speed for SGMII
+            // diagnostics and refresh live OPER_STATUS / OPER_SPEED from HW.
+            if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_SPEED, attr) &&
+                    attr.value.u32 > 0)
+            {
+                hwbcm_port_desired_speed_restore(bcm, static_cast<int>(attr.value.u32));
+            }
+
+            int up = 0;
+
+            if (hwbcm_port_link_get(bcm, &up) == 0)
+            {
+                attr.id = SAI_PORT_ATTR_OPER_STATUS;
+                attr.value.s32 = up ? SAI_PORT_OPER_STATUS_UP : SAI_PORT_OPER_STATUS_DOWN;
+
+                set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &attr);
+
+                uint32_t operSpeed = 0;
+
+                if (up)
+                {
+                    int sp = 0;
+
+                    if (hwbcm_port_speed_get(bcm, &sp) == 0 && sp > 0)
+                    {
+                        operSpeed = static_cast<uint32_t>(sp);
+                    }
+                }
+
+                attr.id = SAI_PORT_ATTR_OPER_SPEED;
+                attr.value.u32 = operSpeed;
+
+                set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &attr);
+            }
+
             continue;
         }
 
@@ -1014,6 +1112,34 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
         case SAI_SWITCH_ATTR_LAG_DEFAULT_HASH_SEED:
 
             rv = hwbcm_hash_seed_set(HWBCM_HASH_LAG, attr->value.u32);
+            break;
+
+        case SAI_SWITCH_ATTR_RESTART_WARM:
+
+            m_restartWarm = attr->value.booldata;
+            if (!m_restartWarm)
+            {
+                m_warmSynced = false;
+            }
+            SWSS_LOG_NOTICE("switch RESTART_WARM = %s", m_restartWarm ? "true" : "false");
+            break;
+
+        case SAI_SWITCH_ATTR_UNINIT_DATA_PLANE_ON_REMOVAL:
+
+            m_uninitDataPlaneOnRemoval = attr->value.booldata;
+            SWSS_LOG_NOTICE("switch UNINIT_DATA_PLANE_ON_REMOVAL = %s",
+                    m_uninitDataPlaneOnRemoval ? "true" : "false");
+            break;
+
+        case SAI_SWITCH_ATTR_PRE_SHUTDOWN:
+
+            SWSS_LOG_NOTICE("switch PRE_SHUTDOWN = %s (RESTART_WARM=%s)",
+                    attr->value.booldata ? "true" : "false",
+                    m_restartWarm ? "true" : "false");
+            if (attr->value.booldata && m_restartWarm)
+            {
+                return hwWarmSync();
+            }
             break;
 
         default:
@@ -2800,6 +2926,7 @@ sai_status_t SwitchBCM56860HW::set(
             if (hw == SAI_STATUS_SUCCESS && attr->id == SAI_SWITCH_ATTR_SRC_MAC_ADDRESS) hwCoppRefresh();
             break;
         case SAI_OBJECT_TYPE_PORT:             hw = hwSetPort(oid, attr); break;
+        case SAI_OBJECT_TYPE_BRIDGE_PORT:      hw = hwSetBridgePort(oid, attr); break;
         case SAI_OBJECT_TYPE_HOSTIF_TRAP:      hw = hwCoppOnTrapSet(oid, attr); break;
         case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwSetHostifTrapGroup(oid, attr); break;
         case SAI_OBJECT_TYPE_POLICER:          hw = hwSetPolicer(oid, attr); break;
@@ -3192,3 +3319,5 @@ sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
 
     return SAI_STATUS_SUCCESS; // the local flush must proceed even if the ASIC call failed
 }
+
+#include "SwitchBCM56860HW_wb.inc.cpp"

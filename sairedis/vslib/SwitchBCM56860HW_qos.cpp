@@ -350,7 +350,8 @@ void SwitchBCM56860HW::qosUnmapPort(
     }
 }
 
-sai_status_t SwitchBCM56860HW::qosBuildHwMap()
+sai_status_t SwitchBCM56860HW::qosBuildHwMap(
+        _In_ bool warmBoot)
 {
     SWSS_LOG_ENTER();
 
@@ -376,12 +377,9 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
         qosMapPort(m_cpu_port_id);
     }
 
-    SWSS_LOG_NOTICE("qos: hardware map built: %zu queues, %zu scheduler groups, %zu PGs",
+    SWSS_LOG_NOTICE("qos: hardware map built (%s): %zu queues, %zu scheduler groups, %zu PGs",
+            warmBoot ? "warm/SW-only" : "cold",
             m_qosQueueHw.size(), m_qosSgHw.size(), m_qosPgHw.size());
-
-    // Resync desired state from the object hash (warm boot / syncd restart:
-    // the SDK came up cold while the vslib bookkeeping kept the objects).
-    // On a cold start these tables are empty and this is a no-op.
 
     auto forEach = [&](sai_object_type_t ot, std::function<void(sai_object_id_t)> fn)
     {
@@ -419,6 +417,17 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
 
     forEach(SAI_OBJECT_TYPE_SCHEDULER, [&](sai_object_id_t oid) { m_qosSchedulers.insert(oid); });
     forEach(SAI_OBJECT_TYPE_WRED, [&](sai_object_id_t oid) { m_qosWreds.insert(oid); });
+    forEach(SAI_OBJECT_TYPE_BUFFER_PROFILE, [&](sai_object_id_t oid) { m_qosProfiles.insert(oid); });
+
+    if (warmBoot)
+    {
+        // Warm boot: skip all HW writes (QoS HW handles are preserved in ASIC
+        // and SDK scache; full QoS handle persistence is Phase 3).
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Resync desired state from the object hash (cold fallback with warm DB).
+    // On a normal cold start these tables are empty and this is a no-op.
 
     forEach(SAI_OBJECT_TYPE_BUFFER_POOL, [&](sai_object_id_t oid) {
             if (m_qosPools.find(oid) == m_qosPools.end())
@@ -426,8 +435,6 @@ sai_status_t SwitchBCM56860HW::qosBuildHwMap()
                 (void)hwCreateBufferPool(oid, 0, NULL);
             }
     });
-
-    forEach(SAI_OBJECT_TYPE_BUFFER_PROFILE, [&](sai_object_id_t oid) { m_qosProfiles.insert(oid); });
 
     static const sai_attr_id_t switchAttrs[] = {
         SAI_SWITCH_ATTR_QOS_DSCP_TO_TC_MAP, SAI_SWITCH_ATTR_QOS_DSCP_TO_COLOR_MAP,

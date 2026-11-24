@@ -2151,3 +2151,19 @@ void SwitchBCM56860HW::vxlanSviSync(
 
     hwReresolveNeighborsOnVlan(vid); // remote hosts can now be routed in hardware
 }
+
+void SwitchBCM56860HW::hwL3GetSharedEgress(
+        _Out_ int &cpuEgr,
+        _Out_ int &dropEgr) const
+{
+    cpuEgr = g_cpuEgr;
+    dropEgr = g_dropEgr;
+}
+
+void SwitchBCM56860HW::hwL3RestoreSharedEgress(
+        _In_ int cpuEgr,
+        _In_ int dropEgr)
+{
+    g_cpuEgr = cpuEgr;
+    g_dropEgr = dropEgr;
+}

@@ -60,8 +60,9 @@
 
             /* Build the queue / scheduler group / PG oid -> HW maps for every
              * port in m_port_list (+ CPU queues). Call at the end of
-             * initialize_default_objects and warm_boot_initialize_objects. */
-            sai_status_t qosBuildHwMap();
+             * initialize_default_objects and warm_boot_initialize_objects.
+             * When warmBoot == true, rebuilds SW maps only (zero HW writes). */
+            sai_status_t qosBuildHwMap(_In_ bool warmBoot = false);
 
             /* A port was created (after mapPort in hwCreatePort) / is about to
              * be removed (before unmapPort in hwRemovePort). */
