@@ -1383,7 +1383,292 @@ static int hwbcm_scache_flush_file(const char *path, size_t *bytes_written)
     return 0;
 }
 
+/* ---- Phase 4: SONiC warm-reboot (kexec) ------------------------------------
+ *
+ * Sidecar files next to the scache (base = scache path minus ".scache", i.e.
+ * /var/warmboot/sai-warmboot.bin = /host/warmboot/sai-warmboot.bin on the host):
+ *   <base>.bootid    boot_id of the kernel that wrote the scache (hwbcm_warm_sync)
+ *   <base>.dma_idle  verdict of a kexec-mode warm deinit, read by the platform
+ *                    warm-reboot_plugin: "ok|busy boot=<id> ..." */
+static void wb_sidecar_path(char *out, size_t n, const char *scache, const char *suffix)
+{
+    static const char ext[] = ".scache";
+    size_t elen = sizeof(ext) - 1;
+    size_t len;
+
+    out[0] = '\0';
+    if (scache == NULL || scache[0] == '\0') {
+        return;
+    }
+    len = strlen(scache);
+    if (len > elen && strcmp(scache + len - elen, ext) == 0) {
+        len -= elen;
+    }
+    snprintf(out, n, "%.*s%s", (int)len, scache, suffix);
+}
+
+static int read_line_file(const char *path, char *buf, size_t n)
+{
+    FILE *f;
+    size_t l;
+
+    buf[0] = '\0';
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    if (fgets(buf, (int)n, f) == NULL) {
+        fclose(f);
+        buf[0] = '\0';
+        return -1;
+    }
+    fclose(f);
+    l = strlen(buf);
+    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r' || buf[l - 1] == ' ')) {
+        buf[--l] = '\0';
+    }
+    return (int)l;
+}
+
+static int write_file_atomic(const char *path, const char *content)
+{
+    char tmp[600];
+    size_t len = strlen(content);
+    ssize_t w;
+    int fd;
+
+    if (path == NULL || path[0] == '\0') {
+        return -1;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    w = write(fd, content, len);
+    if (w < 0 || (size_t)w != len || fsync(fd) != 0) {
+        close(fd);
+        (void)unlink(tmp);
+        return -1;
+    }
+    close(fd);
+    if (rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    fsync_parent_dir(path);
+    return 0;
+}
+
+static void boot_id_get(char *buf, size_t n)
+{
+    if (read_line_file("/proc/sys/kernel/random/boot_id", buf, n) <= 0) {
+        buf[0] = '\0';
+    }
+}
+
+/* Netdevs the kernel KNET module has right now, from /proc/bcm/knet/link
+ * ("Software link status:" then one "  <name> up|down" line per netif).
+ * -1 if the file cannot be read or has no header. Read before soc_init: the
+ * KCOM channel only opens inside soc_init (soc_dma_attach -> soc_knet_init). */
+static int knet_proc_netif_count(void)
+{
+    FILE *f = fopen("/proc/bcm/knet/link", "r");
+    char line[256];
+    int n = 0, header = 0;
+
+    if (f == NULL) {
+        return -1;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (strncmp(line, "Software link status", 20) == 0) {
+            header = 1;
+            continue;
+        }
+        if (header && line[0] == ' ' && line[1] == ' ' &&
+            line[2] != '\0' && line[2] != '\n' && line[2] != ' ') {
+            n++;
+        }
+    }
+    fclose(f);
+    return header ? n : -1;
+}
+
+/* Kernel KNET verdict for a warm init (computed before soc_init):
+ *   LIVE       netifs present, same boot, rings not aborted -> keep everything
+ *              (syncd warm restart, Case A, exactly as before phase 4)
+ *   DMA_RESET  netifs present but a kexec-mode deinit aborted the rings on this
+ *              boot (or boot_id changed although netifs exist: inconsistent)
+ *              -> KCOM HW_INIT, keep netifs and filters (Case A)
+ *   FRESH      module has 0 netifs (kexec, or modules reloaded)
+ *              -> cold-style KNET bring-up: HW_INIT, DefaultRxAPI (Case B)
+ *   UNKNOWN    /proc/bcm/knet/link unreadable -> HW_INIT (safe for both
+ *              cases), keep filters; hwWarmRecoverKnet decides on the live
+ *              netif table */
+static int g_knet_state = -1;
+/* Set once a warm init in this process overrode the two KNET properties;
+ * a cold init/deinit afterwards puts them back to the SDK default (0). */
+static int g_knet_props_overridden = 0;
+
+static void knet_props_cold_defaults(const char *who)
+{
+    if (g_knet_props_overridden) {
+        (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"0");
+        (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"0");
+        g_knet_props_overridden = 0;
+        HWBCM_LOGI("%s: warmboot_knet_shutdown_mode/knet_filter_persist back to 0 (cold semantics)", who);
+    }
+}
+
+static const char *knet_state_name(int s)
+{
+    switch (s) {
+    case HWBCM_KNET_LIVE:      return "live";
+    case HWBCM_KNET_DMA_RESET: return "dma-reset";
+    case HWBCM_KNET_FRESH:     return "fresh";
+    case HWBCM_KNET_UNKNOWN:   return "unknown";
+    default:                   return "none";
+    }
+}
+
+int hwbcm_warm_knet_probe(const char *scache_file)
+{
+    char path[600];
+    char cur[64], saved[64], marker[256];
+    const char *mb;
+    int nnetif, bootid_changed, marker_same_boot = 0, state;
+
+    nnetif = knet_proc_netif_count();
+    boot_id_get(cur, sizeof(cur));
+    wb_sidecar_path(path, sizeof(path), scache_file, ".bootid");
+    (void)read_line_file(path, saved, sizeof(saved));
+    bootid_changed = (cur[0] != '\0' && saved[0] != '\0' && strcmp(cur, saved) != 0);
+
+    wb_sidecar_path(path, sizeof(path), scache_file, ".dma_idle");
+    if (read_line_file(path, marker, sizeof(marker)) > 0 && cur[0] != '\0' &&
+        (mb = strstr(marker, "boot=")) != NULL &&
+        strncmp(mb + 5, cur, strlen(cur)) == 0) {
+        marker_same_boot = 1;
+    }
+
+    if (nnetif < 0) {
+        state = HWBCM_KNET_UNKNOWN;
+    } else if (nnetif == 0) {
+        state = HWBCM_KNET_FRESH;
+    } else if (bootid_changed) {
+        HWBCM_LOGE("wb: boot_id changed (%s -> %s) but KNET still has %d netif(s): "
+                   "stale .bootid? treating as dma-reset", saved, cur, nnetif);
+        state = HWBCM_KNET_DMA_RESET;
+    } else if (marker_same_boot) {
+        state = HWBCM_KNET_DMA_RESET;
+    } else {
+        state = HWBCM_KNET_LIVE;
+    }
+    g_knet_state = state;
+    HWBCM_LOGI("wb: knet fresh=%d state=%s (bootid %s saved %s%s, netifs %d, dma marker %s)",
+               state == HWBCM_KNET_FRESH ? 1 : 0, knet_state_name(state),
+               cur[0] ? cur : "?", saved[0] ? saved : "none",
+               bootid_changed ? " CHANGED" : "", nnetif,
+               marker[0] ? marker : "none");
+    return state;
+}
+
+/* CMICm DMA engines that can write host memory (offsets from
+ * include/soc/mcm/cmicm.h, per CMC +0x1000; deploy/platform/warm-reboot_plugin
+ * checks the same bits through BAR0):
+ *   CHy_DMA_CTRL   0x31140+4y  bit1 PKTDMA_ENABLE   (reported, not busy alone:
+ *                                                    an enabled but finished
+ *                                                    chain does not restart)
+ *   DMA_STAT       0x31150     bit 8+y CHy ACTIVE   -> busy
+ *   FIFO_CHy_RD_DMA_CFG 0x312c0+4y bit0 ENABLE      -> busy (L2 mod FIFO etc.)
+ *   STAT_DMA_CFG   0x311c4     bit1 EN              (reported only, stays set)
+ *   STAT_DMA_STAT  0x311dc     bit3 ACTIVE          -> busy
+ *   SBUSDMA_CHy_STATUS 0x3161c+0x50y bit11 ACTIVE   -> busy */
+#define WB_CMC_NUM 3
+static uint32 cmic_pktdma_active_mask(int unit)
+{
+    uint32 m = 0;
+    int cmc;
+
+    for (cmc = 0; cmc < WB_CMC_NUM; cmc++) {
+        m |= ((soc_pci_read(unit, 0x31150u + 0x1000u * (uint32)cmc) >> 8) & 0xfu) << (cmc * 4);
+    }
+    return m;
+}
+
+static int cmic_dma_busy(int unit, char *desc, size_t n)
+{
+    size_t off = 0;
+    uint32 v, pkt_en = 0, st_en = 0;
+    int cmc, ch, nbusy = 0;
+
+#define WB_APPEND(...) do { \
+        if (off < n) { int _w = snprintf(desc + off, n - off, __VA_ARGS__); \
+                       if (_w > 0) off += (size_t)_w; } } while (0)
+
+    desc[0] = '\0';
+    for (cmc = 0; cmc < WB_CMC_NUM; cmc++) {
+        uint32 base = 0x1000u * (uint32)cmc;
+
+        v = soc_pci_read(unit, 0x31150u + base);
+        for (ch = 0; ch < 4; ch++) {
+            if (v & (0x100u << ch)) {
+                WB_APPEND(" pktdma%d.%d", cmc, ch);
+                nbusy++;
+            }
+            if (soc_pci_read(unit, 0x31140u + base + 4u * (uint32)ch) & 0x2u) {
+                pkt_en |= 1u << (cmc * 4 + ch);
+            }
+            if (soc_pci_read(unit, 0x312c0u + base + 4u * (uint32)ch) & 0x1u) {
+                WB_APPEND(" fifodma%d.%d", cmc, ch);
+                nbusy++;
+            }
+        }
+        if (soc_pci_read(unit, 0x311c4u + base) & 0x2u) {
+            st_en |= 1u << cmc;
+        }
+        if (soc_pci_read(unit, 0x311dcu + base) & 0x8u) {
+            WB_APPEND(" statdma%d", cmc);
+            nbusy++;
+        }
+        for (ch = 0; ch < 3; ch++) {
+            if (soc_pci_read(unit, 0x3161cu + base + 0x50u * (uint32)ch) & 0x800u) {
+                WB_APPEND(" sbusdma%d.%d", cmc, ch);
+                nbusy++;
+            }
+        }
+    }
+    WB_APPEND(" pktdma_en=0x%03x statdma_en=0x%x", pkt_en, st_en);
+#undef WB_APPEND
+    return nbusy;
+}
+
 #endif /* BCM_WARM_BOOT_SUPPORT */
+
+int hwbcm_warm_knet_state(void)
+{
+#ifdef BCM_WARM_BOOT_SUPPORT
+    return g_knet_state;
+#else
+    return -1;
+#endif
+}
+
+int hwbcm_warm_knet_fresh(void)
+{
+    return hwbcm_warm_knet_state() == HWBCM_KNET_FRESH ? 1 : 0;
+}
+
+#ifndef BCM_WARM_BOOT_SUPPORT
+int hwbcm_warm_knet_probe(const char *scache_file)
+{
+    (void)scache_file;
+    return -1;
+}
+#endif
 
 /* On warm boot, pre-populate g_sgmii_applied[] for every front port already
  * linked up at <=1G in SGMII mode BEFORE linkscan is enabled, so the linkscan
@@ -1391,10 +1676,12 @@ static int hwbcm_scache_flush_file(const char *path, size_t *bytes_written)
 static void hwbcm_sgmii_warm_probe(int unit)
 {
     int i, nmarked = 0;
+    /* Stamp "now": a link-down right after warm init is then treated as our
+     * own bounce (flag kept) and the following up is not re-applied. The old
+     * now-RATE_LIMIT stamp cleared the flag on the first down and every up
+     * re-applied SGMII, bouncing the copper link again (flap loop). */
     long ts = mono_seconds();
-    if (ts > HWBCM_SGMII_RATE_LIMIT_SEC) {
-        ts -= HWBCM_SGMII_RATE_LIMIT_SEC;
-    } else {
+    if (ts <= 0) {
         ts = 1;
     }
 
@@ -1598,9 +1885,24 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         int loc = BCM_SWITCH_STABLE_NONE;
         uint32 sflags = 0;
 
-        /* Ensure SDK preserves KNET DMA rings and filters during warm init. */
-        (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
-        (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
+        /* KNET during warm init. LIVE (syncd warm restart): keep the kernel
+         * DMA rings and filters (mode=1, persist=1), as before phase 4.
+         * Anything else: the kernel side needs KCOM_M_HW_INIT (DCB rings,
+         * bkn_isr), which soc_dma_init only sends with mode=0; the KNET
+         * channels get configured and bcm_esw_knet_init runs. FRESH also gets
+         * persist=0 so the DefaultRxAPI filter is created like on a cold
+         * boot (the filter table is empty). Forwarding tables stay untouched
+         * (SOC_WARM_BOOT). Both go back to "1" after bcm_init. */
+        int knet_state = hwbcm_warm_knet_probe(scache_file);
+        g_knet_props_overridden = 1;
+        (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE,
+                             (char *)(knet_state == HWBCM_KNET_LIVE ? "1" : "0"));
+        (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST,
+                             (char *)(knet_state == HWBCM_KNET_FRESH ? "0" : "1"));
+        HWBCM_LOGI("hwbcm_init_ex[warm]: knet %s -> warmboot_knet_shutdown_mode=%s knet_filter_persist=%s",
+                   knet_state_name(knet_state),
+                   knet_state == HWBCM_KNET_LIVE ? "1" : "0",
+                   knet_state == HWBCM_KNET_FRESH ? "0" : "1");
 
         rv = hwbcm_scache_setup(unit, 1, scache_file);
         if (rv < 0) {
@@ -1716,6 +2018,24 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             }
         }
 
+        /* Back to the syncd-restart defaults so later deinits keep the rings. */
+        (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
+        (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
+        {
+            /* The rings run again: the dma_idle verdict of the last deinit
+             * is consumed (a stale same-boot marker would force HW_INIT on
+             * the next syncd restart). */
+            char mpath[600];
+            wb_sidecar_path(mpath, sizeof(mpath), scache_file, ".dma_idle");
+            if (mpath[0] != '\0' && unlink(mpath) == 0) {
+                HWBCM_LOGI("hwbcm_init_ex[warm]: consumed %s", mpath);
+            }
+        }
+        if (knet_state != HWBCM_KNET_LIVE) {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: KNET kernel side re-initialised (%s, rx %s)",
+                       knet_state_name(knet_state), bcm_rx_active(unit) ? "active" : "INACTIVE");
+        }
+
         hwbcm_port_map_build();
 
         /* Pre-populate 1G SGMII state BEFORE linkscan so active 1G links do not bounce. */
@@ -1762,6 +2082,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
     /* Cold boot: arm in-memory L2 scache buffer before init soc so a later
      * warm shutdown can sync cleanly. Failure is non-fatal to cold boot. */
     SOC_WARM_BOOT_DONE(unit);
+    knet_props_cold_defaults("hwbcm_init_ex[cold]");
     if (hwbcm_scache_setup(unit, 0, scache_file) < 0) {
         HWBCM_LOGW("hwbcm_init_ex[cold]: L2 scache arm failed; cold boot continues without L2 WB");
     }
@@ -1939,6 +2260,19 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
     }
 
     rv = hwbcm_scache_flush_file(path, bytes_written);
+    if (rv == 0) {
+        /* boot_id of the kernel this scache belongs to: a different one at
+         * warm init means the host kexec'd (logged by hwbcm_warm_knet_probe). */
+        char bpath[600], bid[64], line[96];
+        wb_sidecar_path(bpath, sizeof(bpath), path, ".bootid");
+        boot_id_get(bid, sizeof(bid));
+        if (bid[0] != '\0') {
+            snprintf(line, sizeof(line), "%s\n", bid);
+            if (write_file_atomic(bpath, line) != 0) {
+                HWBCM_LOGW("hwbcm_warm_sync: writing %s failed: %s", bpath, strerror(errno));
+            }
+        }
+    }
     pthread_mutex_unlock(&g_lock);
     if (rv == 0) {
         HWBCM_LOGI("hwbcm_warm_sync: completed in %ld ms", mono_ms() - t0);
@@ -1949,18 +2283,29 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written)
 
 int hwbcm_warm_deinit(void)
 {
+    return hwbcm_warm_deinit_ex(0);
+}
+
+int hwbcm_warm_deinit_ex(int for_kexec)
+{
 #ifndef BCM_WARM_BOOT_SUPPORT
+    (void)for_kexec;
     HWBCM_LOGE("hwbcm_warm_deinit: compiled without BCM_WARM_BOOT_SUPPORT");
     return BCM_E_UNAVAIL;
 #else
     int unit = HWBCM_UNIT;
     long t0 = mono_ms();
+    char mpath[600];
+    int rv_reset1 = 0, rv_reset2 = 0, rv_bcm, rv_soc, nbusy = 0, busy;
+    char active[384];
 
     pthread_mutex_lock(&g_lock);
     if (!g_inited) {
         pthread_mutex_unlock(&g_lock);
         return 0;
     }
+    wb_sidecar_path(mpath, sizeof(mpath), g_scache_path, ".dma_idle");
+    HWBCM_LOGI("hwbcm_warm_deinit: mode=%s", for_kexec ? "KEXEC (abort KNET DMA)" : "syncd restart (keep KNET)");
 
     shell_sock_stop();
 
@@ -1973,13 +2318,104 @@ int hwbcm_warm_deinit(void)
     hwbcm_l3_warm_reset();
     hwbcm_vxlan_warm_reset();
 
-    /* Preserve KNET DMA rings, netifs, and filters across shutdown. */
+    /* Preserve KNET netifs and filters across shutdown (destroying 72 netifs
+     * one by one takes ~30 s). In kexec mode the rings are aborted below. */
     (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
     (void)sal_config_set((char *)spn_KNET_FILTER_PERSIST, (char *)"1");
 
+    if (for_kexec) {
+        /* System warm reboot: nothing unloads the KNET module before kexec
+         * (opennsl-modules ExecStop is a no-op), so its RX/TX channels would
+         * still point at old-kernel DCBs when the new kernel's BDE probe sets
+         * Bus Master again. KCOM_M_HW_RESET with channels=0 = bkn_dma_abort on
+         * every channel + bkn_clean_dcbs. Done first (before the long steps)
+         * and again right before soc_shutdown. */
+        rv_reset1 = SOC_KNET_MODE(unit) ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
+        if (SOC_FAILURE(rv_reset1)) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_knet_hw_reset(-1) rv=%d (%s)",
+                       rv_reset1, bcm_errmsg(rv_reset1));
+        } else {
+            HWBCM_LOGI("hwbcm_warm_deinit[kexec]: soc_knet_hw_reset(-1) rv=0 (KNET rings aborted)");
+        }
+    } else if (mpath[0] != '\0') {
+        (void)unlink(mpath);   /* rings stay armed: no idle verdict */
+    }
+
     HWBCM_WARN_ON_FAIL("bcm_tx_cleanup", bcm_tx_cleanup(unit));
-    HWBCM_WARN_ON_FAIL("_bcm_shutdown", _bcm_shutdown(unit));
-    HWBCM_WARN_ON_FAIL("soc_shutdown", soc_shutdown(unit));
+    rv_bcm = _bcm_shutdown(unit);
+    if (BCM_FAILURE(rv_bcm)) {
+        if (for_kexec) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: _bcm_shutdown: %s (%d)", bcm_errmsg(rv_bcm), rv_bcm);
+        } else {
+            HWBCM_LOGW("_bcm_shutdown: %s (%d)", bcm_errmsg(rv_bcm), rv_bcm);
+        }
+    }
+    if (for_kexec) {
+        rv_reset2 = SOC_KNET_MODE(unit) ? soc_knet_hw_reset(unit, -1) : SOC_E_UNAVAIL;
+        if (SOC_FAILURE(rv_reset2)) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: second soc_knet_hw_reset(-1) rv=%d", rv_reset2);
+        }
+    }
+    rv_soc = soc_shutdown(unit);
+    if (SOC_FAILURE(rv_soc)) {
+        /* soc_shutdown stops the userspace DMA engines with SOC_IF_ERROR_RETURN
+         * steps: an early error skips the later stops. */
+        if (for_kexec) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
+        } else {
+            HWBCM_LOGW("soc_shutdown: %s (%d)", bcm_errmsg(rv_soc), rv_soc);
+        }
+    }
+
+    if (for_kexec && SOC_KNET_MODE(unit)) {
+        /* bkn_rxtick (every ~100 ms) refills and restarts an RX channel that
+         * is not running if its token bucket is below the burst size, i.e.
+         * if packets arrived in the tick before the abort (only matters with
+         * use_rx_skb=1; with the default 0 the RX buffers come from the BCM
+         * RX API chains, which are gone). Re-check after more than one tick
+         * and abort again until the channels stay idle. KCOM is still open:
+         * soc_shutdown with mode=1 skips soc_knet_cleanup. */
+        int tries;
+        uint32 act = 0;
+        for (tries = 0; tries < 6; tries++) {
+            usleep(250000);
+            act = cmic_pktdma_active_mask(unit);
+            if (act == 0) {
+                break;
+            }
+            HWBCM_LOGW("hwbcm_warm_deinit[kexec]: packet DMA re-armed after abort (mask 0x%03x), aborting again",
+                       act);
+            rv_reset2 = soc_knet_hw_reset(unit, -1);
+        }
+        if (act == 0 && tries > 0) {
+            HWBCM_LOGI("hwbcm_warm_deinit[kexec]: packet DMA idle after %d extra abort(s)", tries);
+        }
+    }
+
+    if (for_kexec) {
+        /* Read back the CMIC DMA engines (the BDE mapping is still there,
+         * sysconf_detach is never called) and leave the verdict for the
+         * platform warm-reboot_plugin, which re-checks the registers itself. */
+        char bid[64], line[640];
+        nbusy = cmic_dma_busy(unit, active, sizeof(active));
+        busy = nbusy > 0 || SOC_FAILURE(rv_reset1) || SOC_FAILURE(rv_reset2) ||
+               BCM_FAILURE(rv_bcm) || SOC_FAILURE(rv_soc);
+        boot_id_get(bid, sizeof(bid));
+        snprintf(line, sizeof(line),
+                 "%s boot=%s active=%d knet_reset=%d,%d bcm_shutdown=%d soc_shutdown=%d regs:%s\n",
+                 busy ? "busy" : "ok", bid[0] ? bid : "?", nbusy, rv_reset1, rv_reset2,
+                 rv_bcm, rv_soc, active);
+        if (write_file_atomic(mpath, line) != 0) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: writing %s failed: %s", mpath, strerror(errno));
+        }
+        if (busy) {
+            HWBCM_LOGE("hwbcm_warm_deinit[kexec]: dma_idle=busy (%d active engine(s):%s)", nbusy, active);
+        } else {
+            HWBCM_LOGI("hwbcm_warm_deinit[kexec]: dma_idle=ok (%s)", active);
+        }
+    } else {
+        busy = 0;
+    }
 
     hwbcm_scache_cleanup();
     memset(g_knet, 0, sizeof(g_knet));
@@ -1987,8 +2423,9 @@ int hwbcm_warm_deinit(void)
     g_fp_count = 0;
     g_warm_boot = 0;
     pthread_mutex_unlock(&g_lock);
-    HWBCM_LOGI("hwbcm_warm_deinit: done in %ld ms (ASIC & KNET preserved)", mono_ms() - t0);
-    return 0;
+    HWBCM_LOGI("hwbcm_warm_deinit: done in %ld ms (ASIC preserved, KNET %s)", mono_ms() - t0,
+               for_kexec ? "rings aborted, netifs kept" : "preserved");
+    return busy ? BCM_E_BUSY : 0;
 #endif
 }
 
@@ -2027,6 +2464,11 @@ int hwbcm_deinit(void)
         (void)bcm_rx_stop(unit, NULL);
     }
 
+#ifdef BCM_WARM_BOOT_SUPPORT
+    /* After a warm init the KNET properties are "1", which would make this
+     * cold detach leave the kernel DMA rings running (fast-reboot = kexec). */
+    knet_props_cold_defaults("hwbcm_deinit");
+#endif
     HWBCM_WARN_ON_FAIL("bcm_detach", bcm_detach(unit));
     if (sysconf_detach(unit) < 0) {
         HWBCM_LOGW("sysconf_detach(%d) failed", unit);
@@ -2213,6 +2655,21 @@ int hwbcm_port_speed_set(int port, int speed_mbps, int autoneg)
     }
     if (speed_mbps <= 0) {
         return BCM_E_PARAM;
+    }
+
+    if (autoneg && g_desired_speed[port] == speed_mbps) {
+        /* Same request as the one already in effect (orchagent re-sends the
+         * port config after a warm restart). Re-running autoneg_set and the
+         * SGMII interface_set goes all the way to the copper PHY and drops
+         * the link, so leave a live port alone. */
+        int an = 0, link = 0;
+        if (BCM_SUCCESS(bcm_port_autoneg_get(unit, port, &an)) && an &&
+            BCM_SUCCESS(bcm_port_link_status_get(unit, port, &link)) &&
+            link == BCM_PORT_LINK_STATUS_UP) {
+            HWBCM_LOGI("port %d: speed %d Mbps autoneg 1 unchanged, link up, not reprogrammed",
+                       port, speed_mbps);
+            return 0;
+        }
     }
 
     if (autoneg) {

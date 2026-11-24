@@ -1,0 +1,190 @@
+#!/bin/bash
+# warm-reboot_plugin (also installed as fast-reboot_plugin) for sai-td2p on the AS5812-54T.
+#
+# Installed by deploy/remote_install.sh to
+#   /usr/share/sonic/device/x86_64-accton_as5812_54t-r0/{warm,fast}-reboot_plugin
+# /usr/local/bin/warm-reboot (== fast-reboot) runs it after docker and syncd are
+# stopped and right before `exec /sbin/kexec -e`; its exit code is ignored.
+#
+# Why: kexec skips the BIOS, so the ASIC is never reset. Any CMIC DMA engine
+# still armed at kexec time (KNET RX/TX rings, L2 mod FIFO, SBUS/stat DMA) would
+# write into new-kernel memory as soon as the new linux-kernel-bde probe sets
+# Bus Master again. syncd's kexec-mode warm deinit aborts them and leaves its
+# verdict in /host/warmboot/sai-warmboot.bin.dma_idle; this plugin re-checks the
+# registers itself through BAR0 (read-only) and, if needed:
+#   packet DMA still active -> rmmod linux-knet-cb linux-bcm-knet (bkn_dma_abort,
+#                              ~30 s more control-plane downtime, no data-plane effect)
+#   anything still active   -> kexec -u + cold reboot (traffic loss, no corruption)
+#
+#   warm-reboot_plugin           the hook (as called by warm-reboot / fast-reboot)
+#   warm-reboot_plugin --check   report only: no ifdown, no rmmod, no reboot; exit 0 idle, 1 busy, 2 error
+#   touch /host/warmboot/plugin-unload-knet   always unload KNET before kexec (belt and braces,
+#                                ~30 s more control-plane downtime)
+#
+# Before sampling, the hook takes the KNET netdevs down (nothing needs them any more, and the
+# kernel would otherwise start TX DMA for ARP/ND replies), then samples the registers three times
+# over ~0.6 s: bkn_rxtick can re-arm an aborted RX channel within one tick (~100 ms) when the
+# module runs with use_rx_skb=1.
+#
+# Log: /host/warmboot/plugin.log (persists across the reboot) and syslog (user.err/notice).
+set -u
+
+CHECK_ONLY=0
+[ "${1:-}" = "--check" ] && CHECK_ONLY=1
+
+WB=/host/warmboot
+LOG=$WB/plugin.log
+MARKER=$WB/sai-warmboot.bin.dma_idle
+NAME=$(basename "$0")
+
+log() {
+    local msg="$(date -Is) $NAME: $*"
+    echo "$msg"
+    [ $CHECK_ONLY = 1 ] || { echo "$msg" >> "$LOG"; } 2>/dev/null
+    logger -t "$NAME" -p user.notice -- "$*" 2>/dev/null || true
+}
+err() {
+    local msg="$(date -Is) $NAME: ERROR: $*"
+    echo "$msg" >&2
+    [ $CHECK_ONLY = 1 ] || { echo "$msg" >> "$LOG"; } 2>/dev/null
+    logger -t "$NAME" -p user.err -- "$*" 2>/dev/null || true
+}
+
+# Read the CMIC DMA registers through BAR0 (same offsets/bits as cmic_dma_busy()
+# in sairedis/vslib/hwbcm/hwbcm_core.c, CMICm per CMC +0x1000).
+# Prints "idle|busy pktdma=<n> other=<n>: <details>"; exit 0 idle, 1 busy, 2 error.
+dma_check() {
+    python3 -I - <<'PY'
+import glob, mmap, os, sys
+
+def find_dev():
+    for d in sorted(glob.glob('/sys/bus/pci/devices/*')):
+        try:
+            v = open(d + '/vendor').read().strip()
+            dev = open(d + '/device').read().strip()
+        except OSError:
+            continue
+        if v == '0x14e4' and dev.lower().startswith('0xb8'):
+            return d, dev
+    return None, None
+
+d, dev = find_dev()
+if d is None:
+    print('error: no Broadcom 0xb8xx switch device in /sys/bus/pci/devices')
+    sys.exit(2)
+try:
+    fd = os.open(d + '/resource0', os.O_RDONLY | os.O_SYNC)
+    size = os.fstat(fd).st_size
+    mm = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+except OSError as e:
+    print('error: %s/resource0: %s' % (d, e))
+    sys.exit(2)
+# native 'I' = one aligned 32-bit load (struct '<I' would read byte by byte)
+regs = memoryview(mm).cast('I')
+
+def rd(off):
+    return regs[off // 4]
+
+pkt, other, details = 0, 0, []
+pkt_en = 0
+st_en = 0
+for cmc in range(3):
+    b = 0x1000 * cmc
+    stat = rd(0x31150 + b)
+    for ch in range(4):
+        if stat & (0x100 << ch):
+            pkt += 1; details.append('pktdma%d.%d' % (cmc, ch))
+        if rd(0x31140 + b + 4 * ch) & 0x2:
+            pkt_en |= 1 << (cmc * 4 + ch)
+        if rd(0x312c0 + b + 4 * ch) & 0x1:
+            other += 1; details.append('fifodma%d.%d' % (cmc, ch))
+    if rd(0x311c4 + b) & 0x2:
+        st_en |= 1 << cmc
+    if rd(0x311dc + b) & 0x8:
+        other += 1; details.append('statdma%d' % cmc)
+    for ch in range(3):
+        if rd(0x3161c + b + 0x50 * ch) & 0x800:
+            other += 1; details.append('sbusdma%d.%d' % (cmc, ch))
+busy = pkt + other
+print('%s pktdma=%d other=%d: %s pktdma_en=0x%03x statdma_en=0x%x (%s %s)' % (
+    'busy' if busy else 'idle', pkt, other, ' '.join(details) or '-', pkt_en, st_en,
+    os.path.basename(d), dev))
+regs.release()
+mm.close()
+os.close(fd)
+sys.exit(1 if busy else 0)
+PY
+}
+
+[ $CHECK_ONLY = 1 ] || mkdir -p "$WB" 2>/dev/null
+
+cur_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+if [ -f "$MARKER" ]; then
+    m=$(head -c 1024 "$MARKER")
+    case "$m" in *"boot=$cur_boot"*) same=yes ;; *) same="NO (stale)" ;; esac
+    log "syncd verdict: $m  [this boot: $same]"
+else
+    log "syncd verdict: none ($MARKER missing: syncd did not run a kexec-mode deinit)"
+fi
+
+# three samples ~0.3 s apart; the worst one counts
+sample() {
+    local i o r worst_o="" worst_r=0
+    for i in 1 2 3; do
+        o=$(dma_check); r=$?
+        if [ $r -ne 0 ] && { [ $worst_r -eq 0 ] || [ $r -eq 2 ]; }; then worst_r=$r; worst_o=$o; fi
+        [ -n "$worst_o" ] || worst_o=$o
+        [ $i = 3 ] || sleep 0.3
+    done
+    out=$worst_o; rc=$worst_r
+}
+
+if [ $CHECK_ONLY = 0 ] && [ -r /proc/bcm/knet/link ]; then
+    n=0
+    for ifc in $(awk '/^  [^ ]/{print $1}' /proc/bcm/knet/link); do
+        ip link set dev "$ifc" down 2>/dev/null && n=$((n + 1))
+    done
+    log "took $n KNET netdev(s) down (no more kernel TX DMA)"
+fi
+
+sample
+log "registers: $out"
+if [ $rc = 0 ] && [ $CHECK_ONLY = 0 ] && [ -e "$WB/plugin-unload-knet" ]; then
+    log "$WB/plugin-unload-knet present: unloading KNET although DMA is idle"
+    rc=1; out="forced pktdma=forced"
+fi
+if [ $rc = 0 ]; then
+    log "all CMIC DMA engines idle: kexec may proceed"
+    exit 0
+fi
+if [ $rc = 2 ]; then
+    err "register check failed ($out)"
+    [ $CHECK_ONLY = 1 ] && exit 2
+    # cannot prove anything: fall through to the KNET unload, then re-check
+fi
+[ $CHECK_ONLY = 1 ] && exit 1
+
+case "$out" in
+    *" pktdma=0 "*) ;;   # only non-packet engines: unloading KNET would not help
+    *)
+        if grep -q '^linux_bcm_knet ' /proc/modules; then
+            log "DMA still active: unloading KNET (linux-knet-cb, linux-bcm-knet) to abort its rings"
+            t0=$(date +%s)
+            timeout 120 rmmod linux-knet-cb 2>&1 | while read -r l; do log "rmmod: $l"; done
+            timeout 120 rmmod linux-bcm-knet 2>&1 | while read -r l; do log "rmmod: $l"; done
+            log "rmmod done in $(( $(date +%s) - t0 )) s, knet loaded: $(grep -c '^linux_bcm_knet ' /proc/modules)"
+        fi
+        sample
+        log "registers after KNET unload: $out"
+        ;;
+esac
+
+if [ $rc = 0 ]; then
+    log "all CMIC DMA engines idle after KNET unload: kexec may proceed"
+    exit 0
+fi
+
+err "CMIC DMA not idle before kexec ($out): unloading kexec kernel and doing a COLD reboot instead"
+/sbin/kexec -u 2>&1 | while read -r l; do log "kexec -u: $l"; done
+sync
+exec /sbin/reboot

@@ -16,6 +16,7 @@ All scripts run **on the PC**. Nothing here starts syncd; the start commands are
 | `sai.profile.td2p.extra` | the extra profile keys appended to the vendor sai.profile |
 | `common.sh` | shared ssh/scp helpers (target probing IPv4 -> IPv6 link-local) |
 | `remote_install.sh`, `remote_rollback.sh` | the switch-side halves, streamed over ssh (`bash -s`) |
+| `platform/warm-reboot_plugin` | kexec DMA guard, installed by `install.sh` as `/usr/share/sonic/device/x86_64-accton_as5812_54t-r0/{warm,fast}-reboot_plugin` (see "SONiC warm-reboot" below) |
 | `ref/` | read-only copies fetched from the switch: `port_config.ini`, `sai.profile`, `td2-as5812t-72x10G.config.bcm`, `syncd_init_common.sh`, `syncd_container_start.sh`, `switch_host_scripts.txt` (host syncd.sh, opennsl-modules, supervisor conf), and `lanemap.ini.expected` (generator output) |
 | `build/` | outputs: `libsaivs.so.0.0.0` (+ `libsaivs.so`, `libsaivs.so.0` symlinks), `.sha256`, `.variant` (which script/SDK built it: both scripts write the same `libsaivs.so.0.0.0`, last one wins), `libopenbcm_td2p{,_wb}.a` (merged SDK), `nm-undefined.txt`, `nm-defined.txt` (from build_wb.sh), `dry-run.log` |
 
@@ -178,6 +179,29 @@ stream, checks that the content behind it is the vendor library (restoring it fr
 restores `sai.profile` from `sai.profile.vendor`. The `.vendor` files stay, so rollback and install can
 alternate freely. `/usr/lib/libsaivs.so.0.0.0` stays in the container (unused; files cannot be deleted in a
 stopped container with docker cp). `/dev/linux-user-bde` is left alone (harmless for the vendor SAI).
+
+## SONiC warm-reboot (kexec), phase 4
+
+`sudo warm-reboot` kexecs into the same image without resetting the ASIC. What our library and the
+plugin do (details: `notes/plan_warmboot_phase4.md`, test steps: `notes/runbook_warmboot_phase4.md`):
+
+* `PRE_SHUTDOWN` (sent only by warm-reboot/fast-reboot, never by a syncd-only warm restart) puts the
+  final warm deinit into kexec mode: KNET netifs/filters are kept, but every KNET DMA channel is
+  aborted (`KCOM_M_HW_RESET`), the CMIC DMA engines are read back and the verdict goes to
+  `/host/warmboot/sai-warmboot.bin.dma_idle`. Test overrides: `touch /host/warmboot/kexec-pending`
+  or `HWBCM_WB_KEXEC=1`.
+* The plugin runs after syncd/docker are gone, right before `kexec -e`: KNET netdevs down, register
+  check through BAR0; still active -> `rmmod linux-knet-cb linux-bcm-knet`; still active -> `kexec -u`
+  and a cold reboot. `warm-reboot_plugin --check` only reports. Log: `/host/warmboot/plugin.log`.
+* Warm init picks the KNET bring-up from `/proc/bcm/knet/link`, `sai-warmboot.bin.bootid` and the
+  `.dma_idle` marker (`wb: knet fresh=... state=...` in syslog): `live` = syncd restart as before;
+  `fresh` (0 netifs) = KCOM HW_INIT + DefaultRxAPI and the netdevs are recreated from the hostif
+  objects; `dma-reset`/`unknown` = HW_INIT, netifs kept.
+* Same image only: a different image has its own docker dir, i.e. the vendor libsai.
+* `warm-reboot` refuses while `WARM_RESTART_ENABLE_TABLE|syncd` is enabled: `config warm_restart disable syncd` first.
+* config.bcm lists `stable_size` twice; the SDK keeps the first (32 MB). Do not change it between a
+  cold boot and a warm one.
+* Builds: `nice -n 19 deploy/build_wb.sh ...` now really runs niced (the niceness is passed into `saibuild`).
 
 ## Caveats
 

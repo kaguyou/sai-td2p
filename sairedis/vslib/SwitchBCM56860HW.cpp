@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 
 using namespace saivs;
 
@@ -119,22 +120,45 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
 
         if (doWarm)
         {
-            if (!m_warmSynced)
+            auto t0 = std::chrono::steady_clock::now();
+
+            // Always sync here: after PRE_SHUTDOWN linkscan and L2 learning
+            // kept running (teamd stops in between), so the final scache /
+            // .hwstate must reflect the state at the final shutdown.
+            SWSS_LOG_NOTICE("wb: destructor warm sync (%s)",
+                    m_warmSynced ? "final, after PRE_SHUTDOWN sync" : "PRE_SHUTDOWN not invoked");
+            sai_status_t st = hwWarmSync();
+            if (st != SAI_STATUS_SUCCESS)
             {
-                SWSS_LOG_NOTICE("wb: destructor running warm sync fallback (PRE_SHUTDOWN not invoked)");
-                sai_status_t st = hwWarmSync();
-                if (st != SAI_STATUS_SUCCESS)
-                {
-                    SWSS_LOG_ERROR("wb: fallback warm sync failed: %s", sai_serialize_status(st).c_str());
-                }
+                SWSS_LOG_ERROR("wb: destructor warm sync failed: %s", sai_serialize_status(st).c_str());
             }
 
-            int rv = hwbcm_warm_deinit();
+            auto t1 = std::chrono::steady_clock::now();
+
+            bool forKexec = warmDeinitForKexec();
+
+            int rv = hwbcm_warm_deinit_ex(forKexec ? 1 : 0);
+
+            auto t2 = std::chrono::steady_clock::now();
 
             if (rv < 0)
             {
-                SWSS_LOG_WARN("hwbcm_warm_deinit failed: %d", rv);
+                if (forKexec)
+                {
+                    SWSS_LOG_ERROR("wb: hwbcm_warm_deinit_ex(kexec) failed: %d: DMA not proven idle, "
+                            "the warm-reboot_plugin will check the registers", rv);
+                }
+                else
+                {
+                    SWSS_LOG_WARN("hwbcm_warm_deinit failed: %d", rv);
+                }
             }
+
+            SWSS_LOG_NOTICE("wb: shutdown total %ld ms (sync %ld ms, deinit %ld ms, mode %s)",
+                    (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t0).count(),
+                    (long)std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count(),
+                    (long)std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count(),
+                    forKexec ? "kexec" : "syncd-restart");
         }
         else
         {
@@ -349,13 +373,18 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
             return SAI_STATUS_SUCCESS;
         }
 
-        SWSS_LOG_ERROR("wb: warm SDK attach failed (%s); falling back to cold SDK init",
-                sai_serialize_status(wst).c_str());
+        SWSS_LOG_ERROR("wb: warm SDK attach failed (%s); falling back to cold SDK init "
+                "(full ASIC reset, data-plane loss; knet verdict %d%s)",
+                sai_serialize_status(wst).c_str(), hwbcm_warm_knet_state(),
+                hwbcm_warm_knet_fresh() ? ", host kexec'd or KNET reloaded" : "");
     }
     else
     {
-        SWSS_LOG_WARN("wb: warm boot sidecar files missing or invalid (scache_ok=%d hwstate_ok=%d); falling back to cold SDK init",
-                haveScache ? 1 : 0, haveHwState ? 1 : 0);
+        int ks = hwbcm_warm_knet_probe(scachePath.c_str());
+        SWSS_LOG_ERROR("wb: warm boot sidecar files missing or invalid (scache_ok=%d hwstate_ok=%d); "
+                "falling back to cold SDK init (full ASIC reset, data-plane loss; knet verdict %d%s)",
+                haveScache ? 1 : 0, haveHwState ? 1 : 0, ks,
+                ks == HWBCM_KNET_FRESH ? ", host kexec'd or KNET reloaded" : "");
     }
 
     // Fallback: cold SDK init (preserves pre-warm-boot behavior on missing/corrupt files).
@@ -1129,6 +1158,7 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
             if (!m_restartWarm)
             {
                 m_warmSynced = false;
+                m_preShutdown = false;
             }
             SWSS_LOG_NOTICE("switch RESTART_WARM = %s", m_restartWarm ? "true" : "false");
             break;
@@ -1147,6 +1177,10 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
                     m_restartWarm ? "true" : "false");
             if (attr->value.booldata && m_restartWarm)
             {
+                // Only warm-reboot (kexec) sends PRE_SHUTDOWN; remember it so
+                // the final deinit aborts the KNET DMA before the kexec.
+                m_preShutdown = true;
+                SWSS_LOG_NOTICE("wb: PRE_SHUTDOWN: system warm reboot, final deinit will run in kexec mode");
                 return hwWarmSync();
             }
             break;

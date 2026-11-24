@@ -75,9 +75,11 @@ if [ "${1:-}" != "--inner" ]; then
     CT_SAIREDIS=$(to_ct "${SAIREDIS_DIR:-$HOST_ROOT/sonic-sairedis}") || exit 1
     CT_SDK=$(to_ct "${SDK_DIR:-$HOST_ROOT/openbcm-src/sdk-6.5.27}") || exit 1
     CT_LINK_LIST=$(to_ct "${LINK_LIST:-$HOST_ROOT/as5812-bdeshim/sdk_link_list.txt}") || exit 1
+    # podman exec starts the inner half under conmon, not as our child: pass our
+    # niceness on explicitly so `nice -n 19 deploy/build.sh` really runs niced.
     exec podman exec -e HOST_ROOT="$HOST_ROOT" -e C_STD="${C_STD:--std=gnu99}" \
         -e SAI_TD2P_DIR="$CT_SAI_TD2P" -e SAIREDIS_DIR="$CT_SAIREDIS" -e SDK_DIR="$CT_SDK" -e LINK_LIST="$CT_LINK_LIST" \
-        "$CT_NAME" bash "$CT_SAI_TD2P/deploy/build.sh" --inner "$@"
+        "$CT_NAME" nice -n "$(nice)" bash "$CT_SAI_TD2P/deploy/build.sh" --inner "$@"
 fi
 shift
 

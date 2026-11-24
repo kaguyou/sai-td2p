@@ -395,6 +395,37 @@ std::string SwitchBCM56860HW::warmBootHwStatePath(
     return warmBootBasePath(forWrite) + ".hwstate";
 }
 
+bool SwitchBCM56860HW::warmDeinitForKexec() const
+{
+    SWSS_LOG_ENTER();
+
+    if (m_preShutdown)
+    {
+        SWSS_LOG_NOTICE("wb: kexec-mode deinit (PRE_SHUTDOWN seen: system warm reboot)");
+        return true;
+    }
+
+    const char *env = getenv("HWBCM_WB_KEXEC");
+    if (env != NULL && env[0] == '1')
+    {
+        SWSS_LOG_NOTICE("wb: kexec-mode deinit forced by HWBCM_WB_KEXEC=1");
+        return true;
+    }
+
+    std::string base = warmBootBasePath(true);
+    size_t slash = base.rfind('/');
+    std::string pending = (slash == std::string::npos ? std::string(".") : base.substr(0, slash)) + "/kexec-pending";
+
+    struct stat st;
+    if (stat(pending.c_str(), &st) == 0)
+    {
+        SWSS_LOG_NOTICE("wb: kexec-mode deinit forced by %s", pending.c_str());
+        return true;
+    }
+
+    return false;
+}
+
 sai_status_t SwitchBCM56860HW::hwWarmSync()
 {
     SWSS_LOG_ENTER();
@@ -2543,6 +2574,24 @@ sai_status_t SwitchBCM56860HW::hwWarmRecoverKnet()
         return SAI_STATUS_SUCCESS;
     }
 
+    // The SDK-side KNET bring-up was decided before soc_init (hwbcm_warm_knet_probe);
+    // the netif recovery follows the live table: netifs present -> attach to them
+    // (destroying them would drop the Linux-side config swss does not re-apply on a
+    // syncd-only restart), none -> recreate (Case B).
+    int knetState = hwbcm_warm_knet_state();
+    SWSS_LOG_NOTICE("wb knet: verdict %d (0 live, 1 dma-reset, 2 fresh, 3 unknown), %d live netif(s)",
+            knetState, nlive);
+    if (knetState == HWBCM_KNET_FRESH && nlive > 0)
+    {
+        SWSS_LOG_ERROR("wb knet: verdict was FRESH (0 netifs before soc_init) but %d netif(s) are live now; "
+                "attaching to them (Case A)", nlive);
+    }
+    else if ((knetState == HWBCM_KNET_LIVE || knetState == HWBCM_KNET_DMA_RESET) && nlive == 0)
+    {
+        SWSS_LOG_ERROR("wb knet: verdict %d expected live netifs but the table is empty; recreating (Case B)",
+                knetState);
+    }
+
     if (nlive > 0)
     {
         // Case A: syncd restart — kernel kept KNET netifs/filters alive.
@@ -2603,7 +2652,7 @@ sai_status_t SwitchBCM56860HW::hwWarmRecoverKnet()
         memcpy(mac, sattr.value.mac, sizeof(mac));
     }
 
-    size_t recreated = 0;
+    size_t recreated = 0, expected = 0;
     for (const auto &kv : hit->second)
     {
         sai_object_id_t hostifOid = SAI_NULL_OBJECT_ID;
@@ -2632,19 +2681,34 @@ sai_status_t SwitchBCM56860HW::hwWarmRecoverKnet()
         memset(ifname, 0, sizeof(ifname));
         memcpy(ifname, nameAttr.value.chardata, SAI_HOSTIF_NAME_SIZE);
 
+        expected++;
         int netifId = 0;
         int rv = hwbcm_knet_netif_create(bcm, ifname, mac, &netifId);
         if (rv == 0)
         {
             m_hostifToNetif[hostifOid] = netifId;
             recreated++;
+            if (recreated <= 4)
+            {
+                SWSS_LOG_NOTICE("wb knet: Case B hostif %s %s -> bcm port %d netif %d",
+                        kv.first.c_str(), ifname, bcm, netifId);
+            }
         }
         else
         {
-            SWSS_LOG_WARN("wb knet: recreate(%s, port %d) failed: %d", ifname, bcm, rv);
+            SWSS_LOG_ERROR("wb knet: Case B recreate(%s, port %d) failed: %d", ifname, bcm, rv);
         }
     }
-    SWSS_LOG_NOTICE("wb knet: Case B recreated %zu KNET netdev(s)", recreated);
+    if (recreated < expected)
+    {
+        // No fallback to a cold SDK init: that would reset the data plane.
+        SWSS_LOG_ERROR("wb knet: Case B recreated %zu/%zu KNET netdev(s) (%zu FAILED, CPU path of those ports is dead)",
+                recreated, expected, expected - recreated);
+    }
+    else
+    {
+        SWSS_LOG_NOTICE("wb knet: Case B recreated %zu/%zu KNET netdev(s)", recreated, expected);
+    }
     return SAI_STATUS_SUCCESS;
 }
 

@@ -13,7 +13,8 @@
 #   /dev/linux-user-bde -> container stopped? -> load test -> backup vendor libsai.so.1 as
 #   libsai.so.1.vendor (container + /home/admin/sai-td2p/backup) -> our lib as
 #   /usr/lib/libsaivs.so.0.0.0 + symlink /usr/lib/libsai.so.1 -> libsaivs.so.0.0.0 (vendor libsai.so.1.0
-#   untouched) -> hwsku: sai.profile.vendor backup, lanemap.ini, extended sai.profile.
+#   untouched) -> hwsku: sai.profile.vendor backup, lanemap.ini, extended sai.profile
+#   -> platform dir: deploy/platform/warm-reboot_plugin as warm-reboot_plugin + fast-reboot_plugin.
 # It does NOT start syncd; it prints the start/watch commands at the end.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
@@ -51,10 +52,12 @@ rssh "mv -f $REMOTE_DIR/libsaivs.so.upload $REMOTE_DIR/libsaivs.so && echo $LOCA
 log "uploading helper files"
 rscp_to "$DEPLOY_DIR/gen_lanemap.py" "$REMOTE_DIR/gen_lanemap.py"
 rscp_to "$DEPLOY_DIR/sai.profile.td2p.extra" "$REMOTE_DIR/sai.profile.td2p.extra"
+rscp_to "$DEPLOY_DIR/platform/warm-reboot_plugin" "$REMOTE_DIR/warm-reboot_plugin"
 
 log "running install steps on the switch"
 rssh_script "$DEPLOY_DIR/remote_install.sh" \
-    "$REMOTE_DIR/libsaivs.so" "$REMOTE_DIR/sai.profile.td2p.extra" "$REMOTE_DIR/gen_lanemap.py" "${FLAGS[@]}"
+    "$REMOTE_DIR/libsaivs.so" "$REMOTE_DIR/sai.profile.td2p.extra" "$REMOTE_DIR/gen_lanemap.py" "${FLAGS[@]}" \
+    --plugin "$REMOTE_DIR/warm-reboot_plugin"
 
 print_start_howto
 echo "Rollback at any time:  deploy/rollback.sh [--stop]"

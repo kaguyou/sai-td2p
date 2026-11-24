@@ -73,6 +73,24 @@ int hwbcm_warm_sync(const char *scache_file, size_t *bytes_written);
  * warmboot_knet_shutdown_mode=1. */
 int hwbcm_warm_deinit(void);
 
+/* Phase 4. for_kexec=0: same as hwbcm_warm_deinit(). for_kexec=1 (system
+ * warm-reboot, selected by PRE_SHUTDOWN): netifs/filters are still kept, but
+ * every KNET RX/TX DMA channel is aborted (KCOM_M_HW_RESET) before
+ * _bcm_shutdown/soc_shutdown, the CMIC DMA engines are read back afterwards
+ * and the verdict is written to <base>.dma_idle ("ok ..."/"busy ..."). Returns
+ * BCM_E_BUSY if anything is still active or a step failed. */
+int hwbcm_warm_deinit_ex(int for_kexec);
+
+/* Kernel KNET state verdict of a warm init (computed before soc_init from
+ * /proc/bcm/knet/link, <base>.bootid and <base>.dma_idle). */
+#define HWBCM_KNET_LIVE      0   /* syncd restart: rings + netifs alive (Case A) */
+#define HWBCM_KNET_DMA_RESET 1   /* netifs alive, rings aborted: HW_INIT, Case A */
+#define HWBCM_KNET_FRESH     2   /* 0 netifs (kexec / module reload): HW_INIT, Case B */
+#define HWBCM_KNET_UNKNOWN   3   /* /proc unreadable: HW_INIT, case by netif table */
+int hwbcm_warm_knet_probe(const char *scache_file);   /* recompute + log, returns state */
+int hwbcm_warm_knet_state(void);  /* last verdict, -1 if none (cold build / cold boot) */
+int hwbcm_warm_knet_fresh(void);  /* last verdict == HWBCM_KNET_FRESH */
+
 /* Returns 1 if the active SDK session was initialized via warm boot, else 0. */
 int hwbcm_is_warm_boot(void);
 

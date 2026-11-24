@@ -49,10 +49,18 @@ index ca2e26d..cbf722d 100644
  if USE_VPP
  libSaiVS_a_SOURCES +=\
 diff --git a/vslib/Sai.cpp b/vslib/Sai.cpp
-index bc6694a..161b02d 100644
+index bc6694a..a0f4f20 100644
 --- a/vslib/Sai.cpp
 +++ b/vslib/Sai.cpp
-@@ -152,6 +152,31 @@ sai_status_t Sai::apiInitialize(
+@@ -21,6 +21,7 @@
+ #include <inttypes.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstring>
+ 
+ using namespace saivs;
+@@ -152,6 +153,31 @@ sai_status_t Sai::apiInitialize(
  
      auto useTapDevice = SwitchConfig::parseBool(use_tap_dev);
  
@@ -84,7 +92,7 @@ index bc6694a..161b02d 100644
      const char *bfd_offload_supported = service_method_table->profile_get_value(0, SAI_KEY_VS_BFD_OFFLOAD_SUPPORTED);
      auto bfdOffloadSupported = SwitchConfig::parseBfdOffloadSupported(bfd_offload_supported);
  
-@@ -228,6 +253,9 @@ sai_status_t Sai::apiInitialize(
+@@ -228,6 +254,9 @@ sai_status_t Sai::apiInitialize(
          sc->m_bootType = bootType;
          sc->m_useTapDevice = useTapDevice;
          sc->m_useConfiguredSpeedAsOperSpeed = useConfiguredSpeedAsOperSpeed;
@@ -94,6 +102,28 @@ index bc6694a..161b02d 100644
          sc->m_laneMap = m_laneMapContainer->getLaneMap(sc->m_switchIndex);
          sc->m_bfdOffload = bfdOffloadSupported;
  
+@@ -292,6 +321,8 @@ sai_status_t Sai::apiUninitialize(void)
+ 
+     SWSS_LOG_NOTICE("begin");
+ 
++    auto uninitStart = std::chrono::steady_clock::now();
++
+     // no mutex on uninitialized to prevent deadlock
+     // if some thread would try to gram api mutex
+     // so threads must be stopped first
+@@ -318,7 +349,11 @@ sai_status_t Sai::apiUninitialize(void)
+ 
+     m_apiInitialized = false;
+ 
+-    SWSS_LOG_NOTICE("end");
++    // sai-td2p warm boot: host syncd_common.sh waits only 20 s for syncd to exit
++    // (warm sync + hwbcm deinit + sai-warmboot.bin all happen in here)
++    SWSS_LOG_NOTICE("end (apiUninitialize took %ld ms)",
++            (long)std::chrono::duration_cast<std::chrono::milliseconds>(
++                std::chrono::steady_clock::now() - uninitStart).count());
+ 
+     return SAI_STATUS_SUCCESS;
+ }
 diff --git a/vslib/SwitchConfig.cpp b/vslib/SwitchConfig.cpp
 index 051aa0a..c2c442d 100644
 --- a/vslib/SwitchConfig.cpp

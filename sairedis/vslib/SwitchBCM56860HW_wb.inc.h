@@ -50,4 +50,12 @@
             bool m_restartWarm = false;
             bool m_uninitDataPlaneOnRemoval = false;
             bool m_warmSynced = false;
+            /* Phase 4: PRE_SHUTDOWN=true (warm-reboot/fast-reboot only, a
+             * syncd-only warm restart never sends it) selects the kexec-mode
+             * warm deinit (KNET DMA aborted). */
+            bool m_preShutdown = false;
+
+            /* kexec-mode warm deinit wanted: PRE_SHUTDOWN seen, or the test
+             * overrides env HWBCM_WB_KEXEC=1 / file <warmboot dir>/kexec-pending. */
+            bool warmDeinitForKexec() const;
             bool m_isWarmBoot = false;
