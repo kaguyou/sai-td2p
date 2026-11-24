@@ -39,6 +39,12 @@ using namespace saivs;
 
 #define SAI_VS_BCM_FALLBACK_PROFILE "/usr/share/sonic/hwsku/sai.profile"
 
+/* Same value as the private define in vslib SwitchState.cpp: unit tests set
+ * this bit in the counter count to write counters instead of reading them. */
+#ifndef VS_COUNTERS_COUNT_MSB
+#define VS_COUNTERS_COUNT_MSB (0x80000000)
+#endif
+
 // ---------------------------------------------------------------------------
 // construction
 // ---------------------------------------------------------------------------
@@ -712,6 +718,187 @@ sai_status_t SwitchBCM56860HW::refresh_port_oper_speed(
 }
 
 // ---------------------------------------------------------------------------
+// load-balancing hash
+// ---------------------------------------------------------------------------
+
+sai_status_t SwitchBCM56860HW::hwSetHash(
+        _In_ sai_object_id_t hash_id,
+        _In_ const sai_attribute_t *attr)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr->id != SAI_HASH_ATTR_NATIVE_HASH_FIELD_LIST)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int set;
+
+    if (hash_id == m_ecmp_hash_id)
+    {
+        set = HWBCM_HASH_ECMP;
+    }
+    else if (hash_id == m_lag_hash_id)
+    {
+        set = HWBCM_HASH_LAG;
+    }
+    else
+    {
+        /* Not bound to the switch: nothing in hardware uses it. */
+        return SAI_STATUS_SUCCESS;
+    }
+
+    uint32_t fields = 0;
+
+    for (uint32_t i = 0; i < attr->value.s32list.count; i++)
+    {
+        switch (attr->value.s32list.list[i])
+        {
+            case SAI_NATIVE_HASH_FIELD_SRC_IP:
+            case SAI_NATIVE_HASH_FIELD_SRC_IPV4:
+            case SAI_NATIVE_HASH_FIELD_SRC_IPV6:
+            case SAI_NATIVE_HASH_FIELD_INNER_SRC_IP:
+            case SAI_NATIVE_HASH_FIELD_INNER_SRC_IPV4:
+            case SAI_NATIVE_HASH_FIELD_INNER_SRC_IPV6:   fields |= HWBCM_HASH_F_SRC_IP; break;
+            case SAI_NATIVE_HASH_FIELD_DST_IP:
+            case SAI_NATIVE_HASH_FIELD_DST_IPV4:
+            case SAI_NATIVE_HASH_FIELD_DST_IPV6:
+            case SAI_NATIVE_HASH_FIELD_INNER_DST_IP:
+            case SAI_NATIVE_HASH_FIELD_INNER_DST_IPV4:
+            case SAI_NATIVE_HASH_FIELD_INNER_DST_IPV6:   fields |= HWBCM_HASH_F_DST_IP; break;
+            case SAI_NATIVE_HASH_FIELD_L4_SRC_PORT:
+            case SAI_NATIVE_HASH_FIELD_INNER_L4_SRC_PORT: fields |= HWBCM_HASH_F_L4_SRC; break;
+            case SAI_NATIVE_HASH_FIELD_L4_DST_PORT:
+            case SAI_NATIVE_HASH_FIELD_INNER_L4_DST_PORT: fields |= HWBCM_HASH_F_L4_DST; break;
+            case SAI_NATIVE_HASH_FIELD_IP_PROTOCOL:
+            case SAI_NATIVE_HASH_FIELD_INNER_IP_PROTOCOL: fields |= HWBCM_HASH_F_PROTOCOL; break;
+            case SAI_NATIVE_HASH_FIELD_IN_PORT:          fields |= HWBCM_HASH_F_IN_PORT; break;
+            case SAI_NATIVE_HASH_FIELD_VLAN_ID:          fields |= HWBCM_HASH_F_VLAN; break;
+            case SAI_NATIVE_HASH_FIELD_ETHERTYPE:
+            case SAI_NATIVE_HASH_FIELD_INNER_ETHERTYPE:  fields |= HWBCM_HASH_F_ETHERTYPE; break;
+            case SAI_NATIVE_HASH_FIELD_SRC_MAC:
+            case SAI_NATIVE_HASH_FIELD_INNER_SRC_MAC:    fields |= HWBCM_HASH_F_SRC_MAC; break;
+            case SAI_NATIVE_HASH_FIELD_DST_MAC:
+            case SAI_NATIVE_HASH_FIELD_INNER_DST_MAC:    fields |= HWBCM_HASH_F_DST_MAC; break;
+            default:
+                SWSS_LOG_WARN("hash field %d has no TD2+ equivalent, ignored", attr->value.s32list.list[i]);
+                break;
+        }
+    }
+
+    if (fields == 0)
+    {
+        fields = HWBCM_HASH_F_DEFAULT;
+    }
+
+    int rv = hwbcm_hash_fields_set(set, fields);
+
+    SWSS_LOG_NOTICE("%s hash fields 0x%x -> hardware: %d", set == HWBCM_HASH_ECMP ? "ECMP" : "LAG", fields, rv);
+
+    return rv == 0 ? SAI_STATUS_SUCCESS : SAI_STATUS_FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// port counters
+// ---------------------------------------------------------------------------
+
+static int hwPstatOf(
+        _In_ sai_stat_id_t id)
+{
+    switch (id)
+    {
+#define M(sai, hw) case SAI_PORT_STAT_##sai: return HWBCM_PSTAT_##hw;
+#define M1(name) M(name, name)
+        M1(IF_IN_OCTETS) M1(IF_IN_UCAST_PKTS) M1(IF_IN_NON_UCAST_PKTS)
+        M1(IF_IN_DISCARDS) M1(IF_IN_ERRORS) M1(IF_IN_UNKNOWN_PROTOS)
+        M1(IF_IN_BROADCAST_PKTS) M1(IF_IN_MULTICAST_PKTS)
+        M1(IF_OUT_OCTETS) M1(IF_OUT_UCAST_PKTS) M1(IF_OUT_NON_UCAST_PKTS)
+        M1(IF_OUT_DISCARDS) M1(IF_OUT_ERRORS) M1(IF_OUT_QLEN)
+        M1(IF_OUT_BROADCAST_PKTS) M1(IF_OUT_MULTICAST_PKTS)
+        M1(ETHER_STATS_DROP_EVENTS) M1(ETHER_STATS_MULTICAST_PKTS)
+        M1(ETHER_STATS_BROADCAST_PKTS) M1(ETHER_STATS_UNDERSIZE_PKTS)
+        M1(ETHER_STATS_FRAGMENTS)
+        M1(ETHER_STATS_PKTS_64_OCTETS) M1(ETHER_STATS_PKTS_65_TO_127_OCTETS)
+        M1(ETHER_STATS_PKTS_128_TO_255_OCTETS) M1(ETHER_STATS_PKTS_256_TO_511_OCTETS)
+        M1(ETHER_STATS_PKTS_512_TO_1023_OCTETS) M1(ETHER_STATS_PKTS_1024_TO_1518_OCTETS)
+        M1(ETHER_STATS_OVERSIZE_PKTS) M1(ETHER_RX_OVERSIZE_PKTS) M1(ETHER_TX_OVERSIZE_PKTS)
+        M1(ETHER_STATS_JABBERS) M1(ETHER_STATS_OCTETS) M1(ETHER_STATS_PKTS)
+        M1(ETHER_STATS_COLLISIONS) M1(ETHER_STATS_CRC_ALIGN_ERRORS)
+        M1(ETHER_STATS_TX_NO_ERRORS) M1(ETHER_STATS_RX_NO_ERRORS)
+        M1(DOT3_STATS_FCS_ERRORS) M1(PAUSE_RX_PKTS) M1(PAUSE_TX_PKTS)
+        M1(ETHER_IN_PKTS_64_OCTETS) M1(ETHER_IN_PKTS_65_TO_127_OCTETS)
+        M1(ETHER_IN_PKTS_128_TO_255_OCTETS) M1(ETHER_IN_PKTS_256_TO_511_OCTETS)
+        M1(ETHER_IN_PKTS_512_TO_1023_OCTETS) M1(ETHER_IN_PKTS_1024_TO_1518_OCTETS)
+        M1(ETHER_IN_PKTS_1519_TO_2047_OCTETS) M1(ETHER_IN_PKTS_2048_TO_4095_OCTETS)
+        M1(ETHER_IN_PKTS_4096_TO_9216_OCTETS) M1(ETHER_IN_PKTS_9217_TO_16383_OCTETS)
+        M1(ETHER_OUT_PKTS_64_OCTETS) M1(ETHER_OUT_PKTS_65_TO_127_OCTETS)
+        M1(ETHER_OUT_PKTS_128_TO_255_OCTETS) M1(ETHER_OUT_PKTS_256_TO_511_OCTETS)
+        M1(ETHER_OUT_PKTS_512_TO_1023_OCTETS) M1(ETHER_OUT_PKTS_1024_TO_1518_OCTETS)
+        M1(ETHER_OUT_PKTS_1519_TO_2047_OCTETS) M1(ETHER_OUT_PKTS_2048_TO_4095_OCTETS)
+        M1(ETHER_OUT_PKTS_4096_TO_9216_OCTETS) M1(ETHER_OUT_PKTS_9217_TO_16383_OCTETS)
+        M1(PFC_0_RX_PKTS) M1(PFC_1_RX_PKTS) M1(PFC_2_RX_PKTS) M1(PFC_3_RX_PKTS)
+        M1(PFC_4_RX_PKTS) M1(PFC_5_RX_PKTS) M1(PFC_6_RX_PKTS) M1(PFC_7_RX_PKTS)
+        M1(PFC_0_TX_PKTS) M1(PFC_1_TX_PKTS) M1(PFC_2_TX_PKTS) M1(PFC_3_TX_PKTS)
+        M1(PFC_4_TX_PKTS) M1(PFC_5_TX_PKTS) M1(PFC_6_TX_PKTS) M1(PFC_7_TX_PKTS)
+#undef M1
+#undef M
+        default:
+            return HWBCM_PSTAT_NONE;
+    }
+}
+
+sai_status_t SwitchBCM56860HW::getStatsExt(
+        _In_ sai_object_type_t object_type,
+        _In_ sai_object_id_t object_id,
+        _In_ uint32_t number_of_counters,
+        _In_ const sai_stat_id_t* counter_ids,
+        _In_ sai_stats_mode_t mode,
+        _Out_ uint64_t *counters)
+{
+    SWSS_LOG_ENTER();
+
+    int bcm = (object_type == SAI_OBJECT_TYPE_PORT && m_hwReady) ? bcmPortOf(object_id) : -1;
+
+    /* Non-port objects, the CPU port, and the unit-test "set counters" call
+     * (count with the MSB set) keep the vslib behaviour. */
+    if (bcm < 0 || (number_of_counters & VS_COUNTERS_COUNT_MSB))
+    {
+        return SwitchBCM56850::getStatsExt(object_type, object_id, number_of_counters,
+                counter_ids, mode, counters);
+    }
+
+    std::vector<int> ids(number_of_counters);
+
+    for (uint32_t i = 0; i < number_of_counters; i++)
+    {
+        ids[i] = hwPstatOf(counter_ids[i]);
+    }
+
+    int n = (int)number_of_counters;
+
+    int rv = hwbcm_port_stat_multi_get(bcm, n, ids.data(), counters);
+
+    if (rv != 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_port_stat_multi_get(port %d, %d counters) failed: %d", bcm, n, rv);
+        return SAI_STATUS_FAILURE;
+    }
+
+    if (mode == SAI_STATS_MODE_READ_AND_CLEAR)
+    {
+        rv = hwbcm_port_stat_multi_clear(bcm, n, ids.data());
+
+        if (rv != 0)
+        {
+            SWSS_LOG_ERROR("hwbcm_port_stat_multi_clear(port %d) failed: %d", bcm, rv);
+            return SAI_STATUS_FAILURE;
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // switch attributes
 // ---------------------------------------------------------------------------
 
@@ -739,6 +926,16 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
         case SAI_SWITCH_ATTR_FDB_AGING_TIME:
 
             rv = hwbcm_l2_age_set((int)attr->value.u32);
+            break;
+
+        case SAI_SWITCH_ATTR_ECMP_DEFAULT_HASH_SEED:
+
+            rv = hwbcm_hash_seed_set(HWBCM_HASH_ECMP, attr->value.u32);
+            break;
+
+        case SAI_SWITCH_ATTR_LAG_DEFAULT_HASH_SEED:
+
+            rv = hwbcm_hash_seed_set(HWBCM_HASH_LAG, attr->value.u32);
             break;
 
         default:
@@ -2455,6 +2652,7 @@ sai_status_t SwitchBCM56860HW::set(
         case SAI_OBJECT_TYPE_PORT:             hw = hwSetPort(oid, attr); break;
         case SAI_OBJECT_TYPE_ROUTER_INTERFACE: hw = hwSetRouterInterface(oid, attr); break;
         case SAI_OBJECT_TYPE_ROUTE_ENTRY:      hw = hwSetRoute(serializedObjectId, attr); break;
+        case SAI_OBJECT_TYPE_HASH:             hw = hwSetHash(oid, attr); break;
 
         default:
             break;

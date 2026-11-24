@@ -129,6 +129,19 @@ namespace saivs
 
             virtual sai_status_t refresh_port_oper_speed(_In_ sai_object_id_t port_id) override;
 
+            /* SAI_HASH_ATTR_NATIVE_HASH_FIELD_LIST of the switch's ECMP/LAG hash -> RTAG7 fields. */
+            sai_status_t hwSetHash(_In_ sai_object_id_t hash_id, _In_ const sai_attribute_t *attr);
+
+            /* Port counters come from the ASIC (bcm_stat_get via hwbcm); every
+             * other object type keeps the vslib behaviour. */
+            virtual sai_status_t getStatsExt(
+                    _In_ sai_object_type_t object_type,
+                    _In_ sai_object_id_t object_id,
+                    _In_ uint32_t number_of_counters,
+                    _In_ const sai_stat_id_t* counter_ids,
+                    _In_ sai_stats_mode_t mode,
+                    _Out_ uint64_t *counters) override;
+
             /* (Re)build m_portToBcm / m_bcmToPort from the ports in the object
              * hash (SAI_PORT_ATTR_HW_LANE_LIST, first lane = physical port).
              * applyDefaults: push admin state to HW and read back speed/link. */

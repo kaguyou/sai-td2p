@@ -520,6 +520,29 @@ static void shell_sock_serve(int client)
         return;
     }
 
+    /* Commands that switch the SDK shell into an interactive mode read from
+     * syncd's own stdin (a tty in the container), so they would block this
+     * thread for good (seen with a bare "cint" on 2026-11-24). Only allow
+     * them with an argument, e.g. "cint /tmp/x.c". */
+    {
+        static const char *const interactive[] = { "cint", "shell", "sh", "debugshell", "bsh", NULL };
+        const char *p = line;
+        int i;
+
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        for (i = 0; interactive[i] != NULL; i++) {
+            size_t l = strlen(interactive[i]);
+            if (strncasecmp(p, interactive[i], l) == 0 && p[l] == '\0') {
+                const char msg[] = "refused: interactive command needs an argument (it would block on syncd's stdin)\n[hwbcm rc=-1]\n";
+                ssize_t w = write(client, msg, sizeof(msg) - 1);
+                (void)w;
+                return;
+            }
+        }
+    }
+
     pthread_mutex_lock(&g_shell_lock);
     fflush(stdout);
     fflush(stderr);
@@ -675,6 +698,190 @@ static void hwbcm_port_map_build(void)
     }
     HWBCM_LOGI("port map: %d front panel ports", g_fp_count);
 }
+
+/* ------------------------------------------------------------------------ */
+/* load-balancing hash (RTAG7)                                              */
+/* ------------------------------------------------------------------------ */
+
+/* The SDK default leaves ECMP on the legacy hash with only the source IP as
+ * input (HASH_CONTROL ECMP_HASH_USE_DIP=0, USE_TCP_UDP_PORTS=0), every RTAG7
+ * field bitmap at 0 (so the VXLAN entropy source port is always 0) and
+ * RTAG7_HASH_SEL.USE_FLOW_SEL_ECMP=1. All three are fixed here. */
+
+static int hash_sc(const char *what, bcm_switch_control_t ctl, int val)
+{
+    int rv = bcm_switch_control_set(HWBCM_UNIT, ctl, val);
+
+    if (rv == BCM_E_UNAVAIL) {
+        HWBCM_LOGW("hash: %s unavailable on this chip", what);
+        return 0;
+    }
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("hash: bcm_switch_control_set(%s, 0x%x): %s", what, val, bcm_errmsg(rv));
+        return rv;
+    }
+    return 0;
+}
+
+#define HASH_SC(ctl, val) do { int _r = hash_sc(#ctl, (ctl), (int)(val)); if (_r) return _r; } while (0)
+
+static int hash_fields_program(int set, uint32_t f)
+{
+    int common = 0, ip4, ip4l4, ip6, ip6l4, l2;
+
+    if (f & HWBCM_HASH_F_IN_PORT) {
+        common |= BCM_HASH_FIELD_SRCMOD | BCM_HASH_FIELD_SRCPORT;
+    }
+    if (f & HWBCM_HASH_F_VLAN) {
+        common |= BCM_HASH_FIELD_VLAN;
+    }
+
+    ip4 = common;
+    ip6 = common;
+    if (f & HWBCM_HASH_F_SRC_IP) {
+        ip4 |= BCM_HASH_FIELD_IP4SRC_LO | BCM_HASH_FIELD_IP4SRC_HI;
+        ip6 |= BCM_HASH_FIELD_IP6SRC_LO | BCM_HASH_FIELD_IP6SRC_HI;
+    }
+    if (f & HWBCM_HASH_F_DST_IP) {
+        ip4 |= BCM_HASH_FIELD_IP4DST_LO | BCM_HASH_FIELD_IP4DST_HI;
+        ip6 |= BCM_HASH_FIELD_IP6DST_LO | BCM_HASH_FIELD_IP6DST_HI;
+    }
+    if (f & HWBCM_HASH_F_PROTOCOL) {
+        ip4 |= BCM_HASH_FIELD_PROTOCOL;
+        ip6 |= BCM_HASH_FIELD_NXT_HDR;
+    }
+    ip4l4 = ip4;
+    ip6l4 = ip6;
+    if (f & HWBCM_HASH_F_L4_SRC) {
+        ip4l4 |= BCM_HASH_FIELD_SRCL4;
+        ip6l4 |= BCM_HASH_FIELD_SRCL4;
+    }
+    if (f & HWBCM_HASH_F_L4_DST) {
+        ip4l4 |= BCM_HASH_FIELD_DSTL4;
+        ip6l4 |= BCM_HASH_FIELD_DSTL4;
+    }
+
+    /* Non-IP frames: the SAI field list is IP-centric (SONiC's default has no
+     * MAC fields), so unless MAC/ethertype fields were asked for explicitly,
+     * hash non-IP traffic on the MACs, ethertype and VLAN instead of the
+     * ingress port alone. */
+    if (f & (HWBCM_HASH_F_SRC_MAC | HWBCM_HASH_F_DST_MAC | HWBCM_HASH_F_ETHERTYPE)) {
+        l2 = common;
+        if (f & HWBCM_HASH_F_SRC_MAC) {
+            l2 |= BCM_HASH_FIELD_MACSA_LO | BCM_HASH_FIELD_MACSA_MI | BCM_HASH_FIELD_MACSA_HI;
+        }
+        if (f & HWBCM_HASH_F_DST_MAC) {
+            l2 |= BCM_HASH_FIELD_MACDA_LO | BCM_HASH_FIELD_MACDA_MI | BCM_HASH_FIELD_MACDA_HI;
+        }
+        if (f & HWBCM_HASH_F_ETHERTYPE) {
+            l2 |= BCM_HASH_FIELD_ETHER_TYPE;
+        }
+    } else {
+        l2 = common | BCM_HASH_FIELD_VLAN | BCM_HASH_FIELD_ETHER_TYPE |
+             BCM_HASH_FIELD_MACSA_LO | BCM_HASH_FIELD_MACSA_MI | BCM_HASH_FIELD_MACSA_HI |
+             BCM_HASH_FIELD_MACDA_LO | BCM_HASH_FIELD_MACDA_MI | BCM_HASH_FIELD_MACDA_HI;
+    }
+
+    if (set == HWBCM_HASH_ECMP) {
+        HASH_SC(bcmSwitchHashIP4Field0, ip4);
+        HASH_SC(bcmSwitchHashIP4TcpUdpField0, ip4l4);
+        HASH_SC(bcmSwitchHashIP4TcpUdpPortsEqualField0, ip4l4);
+        HASH_SC(bcmSwitchHashIP6Field0, ip6);
+        HASH_SC(bcmSwitchHashIP6TcpUdpField0, ip6l4);
+        HASH_SC(bcmSwitchHashIP6TcpUdpPortsEqualField0, ip6l4);
+        HASH_SC(bcmSwitchHashL2Field0, l2);
+    } else {
+        HASH_SC(bcmSwitchHashIP4Field1, ip4);
+        HASH_SC(bcmSwitchHashIP4TcpUdpField1, ip4l4);
+        HASH_SC(bcmSwitchHashIP4TcpUdpPortsEqualField1, ip4l4);
+        HASH_SC(bcmSwitchHashIP6Field1, ip6);
+        HASH_SC(bcmSwitchHashIP6TcpUdpField1, ip6l4);
+        HASH_SC(bcmSwitchHashIP6TcpUdpPortsEqualField1, ip6l4);
+        HASH_SC(bcmSwitchHashL2Field1, l2);
+    }
+    HWBCM_LOGI("hash set %d: fields 0x%x -> ip4 0x%x ip4l4 0x%x ip6 0x%x ip6l4 0x%x l2 0x%x",
+               set, f, ip4, ip4l4, ip6, ip6l4, l2);
+    return 0;
+}
+
+static int hash_init(void)
+{
+    int rv, ctl = 0;
+
+    /* Hash A (ECMP, VXLAN entropy) and hash B (LAG). */
+    HASH_SC(bcmSwitchHashSeed0, 0x5a5a5a5a);
+    HASH_SC(bcmSwitchHashSeed1, 0xa5a5a5a5);
+    HASH_SC(bcmSwitchHashField0PreProcessEnable, 1);
+    HASH_SC(bcmSwitchHashField1PreProcessEnable, 1);
+    HASH_SC(bcmSwitchHashField0Config, BCM_HASH_FIELD_CONFIG_CRC32LO);
+    HASH_SC(bcmSwitchHashField0Config1, BCM_HASH_FIELD_CONFIG_CRC32HI);
+    HASH_SC(bcmSwitchHashField1Config, BCM_HASH_FIELD_CONFIG_CRC16CCITT);
+    HASH_SC(bcmSwitchHashField1Config1, BCM_HASH_FIELD_CONFIG_CRC16XOR8);
+
+    rv = hash_fields_program(HWBCM_HASH_ECMP, HWBCM_HASH_F_DEFAULT);
+    if (rv) {
+        return rv;
+    }
+    rv = hash_fields_program(HWBCM_HASH_LAG, HWBCM_HASH_F_DEFAULT);
+    if (rv) {
+        return rv;
+    }
+
+    /* Port-based (not flow-table) hash selection, then the bit offsets into
+     * {A0(16), B0(16), ...}: ECMP on A0, trunks on B0. */
+    HASH_SC(bcmSwitchHashUseFlowSelEcmp, 0);
+    HASH_SC(bcmSwitchHashUseFlowSelTrunkUc, 0);
+    HASH_SC(bcmSwitchECMPHashSet0Offset, 0);
+    HASH_SC(bcmSwitchTrunkHashSet0UnicastOffset, 16);
+    HASH_SC(bcmSwitchTrunkHashSet0NonUnicastOffset, 16);
+
+    /* Finally move ECMP and non-unicast trunk hashing onto RTAG7. The legacy
+     * DIP/L4 bits are set too, in case anything still uses the legacy hash. */
+    rv = bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashControl, &ctl);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("hash: bcm_switch_control_get(HashControl): %s", bcm_errmsg(rv));
+        return rv;
+    }
+    ctl |= BCM_HASH_CONTROL_ECMP_ENHANCE | BCM_HASH_CONTROL_TRUNK_NUC_ENHANCE |
+           BCM_HASH_CONTROL_MULTIPATH_L4PORTS | BCM_HASH_CONTROL_MULTIPATH_DIP;
+    HASH_SC(bcmSwitchHashControl, ctl);
+    HWBCM_LOGI("hash: RTAG7 enabled for ECMP/trunk (HashControl 0x%x)", ctl);
+    return 0;
+}
+
+int hwbcm_hash_fields_set(int set, uint32_t fields)
+{
+    int rv;
+
+    if (set != HWBCM_HASH_ECMP && set != HWBCM_HASH_LAG) {
+        return BCM_E_PARAM;
+    }
+    pthread_mutex_lock(&g_lock);
+    rv = g_inited ? hash_fields_program(set, fields) : BCM_E_INIT;
+    pthread_mutex_unlock(&g_lock);
+    return rv;
+}
+
+int hwbcm_hash_seed_set(int set, uint32_t seed)
+{
+    int rv;
+
+    if (set != HWBCM_HASH_ECMP && set != HWBCM_HASH_LAG) {
+        return BCM_E_PARAM;
+    }
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) {
+        rv = BCM_E_INIT;
+    } else {
+        rv = hash_sc(set == HWBCM_HASH_ECMP ? "HashSeed0" : "HashSeed1",
+                     set == HWBCM_HASH_ECMP ? bcmSwitchHashSeed0 : bcmSwitchHashSeed1,
+                     (int)seed);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rv;
+}
+
+#undef HASH_SC
 
 int hwbcm_init(const char *config_bcm)
 {
@@ -876,6 +1083,12 @@ int hwbcm_init(const char *config_bcm)
     }
 
     hwbcm_port_map_build();
+
+    /* Load balancing: not fatal, the switch forwards without it. */
+    rv = hash_init();
+    if (rv) {
+        HWBCM_LOGE("hash_init failed (%d); ECMP/LAG fall back to the SDK default hash", rv);
+    }
 
     g_inited = 1;
     pthread_mutex_unlock(&g_lock);
@@ -1289,6 +1502,150 @@ int hwbcm_port_stats_clear(int port)
         return BCM_E_PORT;
     }
     HWBCM_CHECK("bcm_stat_clear", bcm_stat_clear(HWBCM_UNIT, port));
+    return 0;
+}
+
+/* hwbcm_pstat_t -> bcm_stat_val_t. Entries left 0 (snmpIfInOctets is 0, but
+ * no id maps to it) are "no counter"; the NON_UCAST pair is summed below. */
+static const bcm_stat_val_t pstat_map[HWBCM_PSTAT_COUNT] = {
+    [HWBCM_PSTAT_IF_IN_OCTETS]                  = snmpIfHCInOctets,
+    [HWBCM_PSTAT_IF_IN_UCAST_PKTS]              = snmpIfHCInUcastPkts,
+    [HWBCM_PSTAT_IF_IN_DISCARDS]                = snmpIfInDiscards,
+    [HWBCM_PSTAT_IF_IN_ERRORS]                  = snmpIfInErrors,
+    [HWBCM_PSTAT_IF_IN_UNKNOWN_PROTOS]          = snmpIfInUnknownProtos,
+    [HWBCM_PSTAT_IF_IN_BROADCAST_PKTS]          = snmpIfHCInBroadcastPkts,
+    [HWBCM_PSTAT_IF_IN_MULTICAST_PKTS]          = snmpIfHCInMulticastPkts,
+    [HWBCM_PSTAT_IF_OUT_OCTETS]                 = snmpIfHCOutOctets,
+    [HWBCM_PSTAT_IF_OUT_UCAST_PKTS]             = snmpIfHCOutUcastPkts,
+    [HWBCM_PSTAT_IF_OUT_DISCARDS]               = snmpIfOutDiscards,
+    [HWBCM_PSTAT_IF_OUT_ERRORS]                 = snmpIfOutErrors,
+    [HWBCM_PSTAT_IF_OUT_QLEN]                   = snmpIfOutQLen,
+    [HWBCM_PSTAT_IF_OUT_BROADCAST_PKTS]         = snmpIfHCOutBroadcastPckts, /* sic */
+    [HWBCM_PSTAT_IF_OUT_MULTICAST_PKTS]         = snmpIfHCOutMulticastPkts,
+    [HWBCM_PSTAT_ETHER_STATS_DROP_EVENTS]       = snmpEtherStatsDropEvents,
+    [HWBCM_PSTAT_ETHER_STATS_MULTICAST_PKTS]    = snmpEtherStatsMulticastPkts,
+    [HWBCM_PSTAT_ETHER_STATS_BROADCAST_PKTS]    = snmpEtherStatsBroadcastPkts,
+    [HWBCM_PSTAT_ETHER_STATS_UNDERSIZE_PKTS]    = snmpEtherStatsUndersizePkts,
+    [HWBCM_PSTAT_ETHER_STATS_FRAGMENTS]         = snmpEtherStatsFragments,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_64_OCTETS]    = snmpEtherStatsPkts64Octets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_65_TO_127_OCTETS]   = snmpEtherStatsPkts65to127Octets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_128_TO_255_OCTETS]  = snmpEtherStatsPkts128to255Octets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_256_TO_511_OCTETS]  = snmpEtherStatsPkts256to511Octets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_512_TO_1023_OCTETS] = snmpEtherStatsPkts512to1023Octets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS_1024_TO_1518_OCTETS]= snmpEtherStatsPkts1024to1518Octets,
+    [HWBCM_PSTAT_ETHER_STATS_OVERSIZE_PKTS]     = snmpEtherStatsOversizePkts,
+    [HWBCM_PSTAT_ETHER_RX_OVERSIZE_PKTS]        = snmpEtherRxOversizePkts,
+    [HWBCM_PSTAT_ETHER_TX_OVERSIZE_PKTS]        = snmpEtherTxOversizePkts,
+    [HWBCM_PSTAT_ETHER_STATS_JABBERS]           = snmpEtherStatsJabbers,
+    [HWBCM_PSTAT_ETHER_STATS_OCTETS]            = snmpEtherStatsOctets,
+    [HWBCM_PSTAT_ETHER_STATS_PKTS]              = snmpEtherStatsPkts,
+    [HWBCM_PSTAT_ETHER_STATS_COLLISIONS]        = snmpEtherStatsCollisions,
+    [HWBCM_PSTAT_ETHER_STATS_CRC_ALIGN_ERRORS]  = snmpEtherStatsCRCAlignErrors,
+    [HWBCM_PSTAT_ETHER_STATS_TX_NO_ERRORS]      = snmpEtherStatsTXNoErrors,
+    [HWBCM_PSTAT_ETHER_STATS_RX_NO_ERRORS]      = snmpEtherStatsRXNoErrors,
+    [HWBCM_PSTAT_DOT3_STATS_FCS_ERRORS]         = snmpDot3StatsFCSErrors,
+    [HWBCM_PSTAT_PAUSE_RX_PKTS]                 = snmpDot3InPauseFrames,
+    [HWBCM_PSTAT_PAUSE_TX_PKTS]                 = snmpDot3OutPauseFrames,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_64_OCTETS]           = snmpBcmReceivedPkts64Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_65_TO_127_OCTETS]    = snmpBcmReceivedPkts65to127Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_128_TO_255_OCTETS]   = snmpBcmReceivedPkts128to255Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_256_TO_511_OCTETS]   = snmpBcmReceivedPkts256to511Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_512_TO_1023_OCTETS]  = snmpBcmReceivedPkts512to1023Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_1024_TO_1518_OCTETS] = snmpBcmReceivedPkts1024to1518Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_1519_TO_2047_OCTETS] = snmpBcmReceivedPkts1519to2047Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_2048_TO_4095_OCTETS] = snmpBcmReceivedPkts2048to4095Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_4096_TO_9216_OCTETS] = snmpBcmReceivedPkts4095to9216Octets,
+    [HWBCM_PSTAT_ETHER_IN_PKTS_9217_TO_16383_OCTETS]= snmpBcmReceivedPkts9217to16383Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_64_OCTETS]           = snmpBcmTransmittedPkts64Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_65_TO_127_OCTETS]    = snmpBcmTransmittedPkts65to127Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_128_TO_255_OCTETS]   = snmpBcmTransmittedPkts128to255Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_256_TO_511_OCTETS]   = snmpBcmTransmittedPkts256to511Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_512_TO_1023_OCTETS]  = snmpBcmTransmittedPkts512to1023Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_1024_TO_1518_OCTETS] = snmpBcmTransmittedPkts1024to1518Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_1519_TO_2047_OCTETS] = snmpBcmTransmittedPkts1519to2047Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_2048_TO_4095_OCTETS] = snmpBcmTransmittedPkts2048to4095Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_4096_TO_9216_OCTETS] = snmpBcmTransmittedPkts4095to9216Octets,
+    [HWBCM_PSTAT_ETHER_OUT_PKTS_9217_TO_16383_OCTETS]= snmpBcmTransmittedPkts9217to16383Octets,
+    [HWBCM_PSTAT_PFC_0_RX_PKTS] = snmpBcmRxPFCFramePriority0,
+    [HWBCM_PSTAT_PFC_1_RX_PKTS] = snmpBcmRxPFCFramePriority1,
+    [HWBCM_PSTAT_PFC_2_RX_PKTS] = snmpBcmRxPFCFramePriority2,
+    [HWBCM_PSTAT_PFC_3_RX_PKTS] = snmpBcmRxPFCFramePriority3,
+    [HWBCM_PSTAT_PFC_4_RX_PKTS] = snmpBcmRxPFCFramePriority4,
+    [HWBCM_PSTAT_PFC_5_RX_PKTS] = snmpBcmRxPFCFramePriority5,
+    [HWBCM_PSTAT_PFC_6_RX_PKTS] = snmpBcmRxPFCFramePriority6,
+    [HWBCM_PSTAT_PFC_7_RX_PKTS] = snmpBcmRxPFCFramePriority7,
+    [HWBCM_PSTAT_PFC_0_TX_PKTS] = snmpBcmTxPFCFramePriority0,
+    [HWBCM_PSTAT_PFC_1_TX_PKTS] = snmpBcmTxPFCFramePriority1,
+    [HWBCM_PSTAT_PFC_2_TX_PKTS] = snmpBcmTxPFCFramePriority2,
+    [HWBCM_PSTAT_PFC_3_TX_PKTS] = snmpBcmTxPFCFramePriority3,
+    [HWBCM_PSTAT_PFC_4_TX_PKTS] = snmpBcmTxPFCFramePriority4,
+    [HWBCM_PSTAT_PFC_5_TX_PKTS] = snmpBcmTxPFCFramePriority5,
+    [HWBCM_PSTAT_PFC_6_TX_PKTS] = snmpBcmTxPFCFramePriority6,
+    [HWBCM_PSTAT_PFC_7_TX_PKTS] = snmpBcmTxPFCFramePriority7,
+};
+
+/* The bcm counters behind one id: 0, 1 or 2 (NON_UCAST = mcast + bcast). */
+static int pstat_types(int id, bcm_stat_val_t types[2])
+{
+    if (id == HWBCM_PSTAT_IF_IN_NON_UCAST_PKTS) {
+        types[0] = snmpIfHCInMulticastPkts;
+        types[1] = snmpIfHCInBroadcastPkts;
+        return 2;
+    }
+    if (id == HWBCM_PSTAT_IF_OUT_NON_UCAST_PKTS) {
+        types[0] = snmpIfHCOutMulticastPkts;
+        types[1] = snmpIfHCOutBroadcastPckts;
+        return 2;
+    }
+    if (id <= HWBCM_PSTAT_NONE || id >= HWBCM_PSTAT_COUNT || pstat_map[id] == 0) {
+        return 0;
+    }
+    types[0] = pstat_map[id];
+    return 1;
+}
+
+int hwbcm_port_stat_multi_get(int port, int n, const int *ids, uint64_t *out)
+{
+    int i, k, nt, rv;
+    bcm_stat_val_t types[2];
+    uint64_t v;
+
+    if (!port_valid(port) || n < 0 || (n > 0 && (ids == NULL || out == NULL))) {
+        return BCM_E_PARAM;
+    }
+    for (i = 0; i < n; i++) {
+        out[i] = 0;
+        nt = pstat_types(ids[i], types);
+        for (k = 0; k < nt; k++) {
+            rv = stat_one(port, types[k], &v);
+            if (BCM_FAILURE(rv)) {
+                HWBCM_LOGE("bcm_stat_get(port %d, %d): %s", port, (int)types[k], bcm_errmsg(rv));
+                return rv;
+            }
+            out[i] += v;
+        }
+    }
+    return 0;
+}
+
+int hwbcm_port_stat_multi_clear(int port, int n, const int *ids)
+{
+    int i, k, nt, rv;
+    bcm_stat_val_t types[2];
+
+    if (!port_valid(port) || n < 0 || (n > 0 && ids == NULL)) {
+        return BCM_E_PARAM;
+    }
+    for (i = 0; i < n; i++) {
+        nt = pstat_types(ids[i], types);
+        for (k = 0; k < nt; k++) {
+            rv = bcm_stat_clear_single(HWBCM_UNIT, port, types[k]);
+            if (BCM_FAILURE(rv) && rv != BCM_E_UNAVAIL) {
+                HWBCM_LOGE("bcm_stat_clear_single(port %d, %d): %s", port, (int)types[k], bcm_errmsg(rv));
+                return rv;
+            }
+        }
+    }
     return 0;
 }
 

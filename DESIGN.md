@@ -122,3 +122,25 @@ TD2+ 固有で必要だったこと(いずれも hwbcm_vxlan.c):
 再入力フレームを cpu200 netdev で tcpdump。出口ミラーはカプセル化前の姿しか写らない。
 PC 側は NIC の otherhost カウンタ(宛先 MAC 不一致、または VLAN デバイス無しのタグ付き)で切り分け。
 SONiC の `config vlan member del` は vlanmgrd を落として swss を再起動させることがある。
+
+## ポート統計・負荷分散ハッシュ(2026-11-24、ビルド 16〜17)
+
+- **ポート統計**: vslib の `SwitchState::getStatsExt` はポートについて TAP の `/sys` 統計を読むだけで、
+  KNET 構成では常に 0 だった。`SwitchBCM56860HW::getStatsExt` を上書きし、`SAI_PORT_STAT_*` →
+  `HWBCM_PSTAT_*`(C++ 側)→ `bcm_stat_val_t`(`hwbcm_core.c`)で `bcm_stat_get` から返す。
+  `IF_*_NON_UCAST_PKTS` は mcast+bcast の和。READ_AND_CLEAR は `bcm_stat_clear_single`。
+  ポート以外(キュー/PG 等)は従来どおり 0。サイズ別(`ETHER_IN_PKTS_*`)は flex counter の対象に入らず N/A のまま。
+  注意: 診断シェルの `clear c` は SDK のカウンタを消すので SONiC 側の値も戻る。
+- **ECMP/LAG ハッシュ**: SDK 既定では ECMP が旧ハッシュで入力は送信元 IP のみ
+  (`HASH_CONTROL.ECMP_HASH_USE_DIP=0, USE_TCP_UDP_PORTS=0`)、RTAG7 のフィールドビットマップは全 0
+  (VXLAN エントロピーの送信元ポートも常に 0)、`RTAG7_HASH_SEL.USE_FLOW_SEL_ECMP=1`。
+  `hash_init()` で RTAG7 に切替: ECMP = hash A(Field0, Seed0, `ECMPHashSet0Offset=0`= A0)、
+  LAG = hash B(Field1, Seed1, `TrunkHashSet0*Offset=16` = B0)、`HashUseFlowSelEcmp/TrunkUc=0`、
+  既定フィールドは src/dst IP・L4 src/dst・protocol・in-port(非 IP は MAC/ethertype/VLAN)。
+  SAI の `ECMP/LAG_DEFAULT_HASH_SEED` と、スイッチの ECMP/LAG hash オブジェクトの `NATIVE_HASH_FIELD_LIST` を反映。
+  実機: 2 経路 ECMP に 4000 フローで 2016/≈2000、L4 ポートのみ変化でも 2000/≈2000、単一フローは片側固定。
+  VXLAN 外側 UDP 送信元ポートはフロー毎に変化(TD2+ は `EGR_VXLAN_CONTROL.USE_SOURCE_PORT_SEL` の on/off のみで、
+  RFC 7348 推奨の 49152–65535 への範囲制限はできない)。
+- **診断シェルのソケット**: 引数なしの `cint` 等は SDK シェルが syncd 自身の stdin(コンテナの tty)を読みに行き、
+  ソケットのスレッドが永久に止まる(2026-11-24 に発生、TIOCSTI で `exit;` を注入して復旧)。引数なしの
+  `cint/shell/sh/debugshell/bsh` は受け口で拒否する。
