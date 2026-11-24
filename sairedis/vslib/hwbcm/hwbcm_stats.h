@@ -160,6 +160,29 @@ typedef enum {
 int hwbcm_port_xstat_multi_get(int port, int n, const int *ids, int clear,
                                uint64_t *out);
 
+/* Warm boot helpers (Phase 3): sparse persistence of non-zero READ_AND_CLEAR
+ * software baselines (g_qbase / g_xbase) with zero HW writes. */
+typedef struct {
+    uint8_t port;
+    uint8_t mc;
+    uint8_t queue;
+    uint8_t which;
+    uint64_t value;
+} hwbcm_qbase_wb_t;
+
+typedef struct {
+    uint8_t port;
+    uint8_t id;
+    uint64_t value;
+} hwbcm_xbase_wb_t;
+
+/* Pass out == NULL or max == 0 to query total non-zero count. */
+int  hwbcm_stats_wb_get_qbase(hwbcm_qbase_wb_t *out, int max);
+int  hwbcm_stats_wb_get_xbase(hwbcm_xbase_wb_t *out, int max);
+void hwbcm_stats_warm_restore(const hwbcm_qbase_wb_t *qbase, int nq,
+                              const hwbcm_xbase_wb_t *xbase, int nx);
+void hwbcm_stats_warm_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

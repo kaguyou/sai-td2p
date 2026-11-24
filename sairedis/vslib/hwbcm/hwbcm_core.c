@@ -959,6 +959,9 @@ static int hash_fields_program(int set, uint32_t f)
     return 0;
 }
 
+static uint32_t g_hash_fields[2] = { HWBCM_HASH_F_DEFAULT, HWBCM_HASH_F_DEFAULT };
+static uint32_t g_hash_seed[2]   = { 0x5a5a5a5au, 0xa5a5a5a5u };
+
 static int hash_init(void)
 {
     int rv, ctl = 0;
@@ -966,6 +969,8 @@ static int hash_init(void)
     /* Hash A (ECMP, VXLAN entropy) and hash B (LAG). */
     HASH_SC(bcmSwitchHashSeed0, 0x5a5a5a5a);
     HASH_SC(bcmSwitchHashSeed1, 0xa5a5a5a5);
+    g_hash_seed[HWBCM_HASH_ECMP] = 0x5a5a5a5au;
+    g_hash_seed[HWBCM_HASH_LAG]  = 0xa5a5a5a5u;
     HASH_SC(bcmSwitchHashField0PreProcessEnable, 1);
     HASH_SC(bcmSwitchHashField1PreProcessEnable, 1);
     HASH_SC(bcmSwitchHashField0Config, BCM_HASH_FIELD_CONFIG_CRC32LO);
@@ -977,10 +982,12 @@ static int hash_init(void)
     if (rv) {
         return rv;
     }
+    g_hash_fields[HWBCM_HASH_ECMP] = HWBCM_HASH_F_DEFAULT;
     rv = hash_fields_program(HWBCM_HASH_LAG, HWBCM_HASH_F_DEFAULT);
     if (rv) {
         return rv;
     }
+    g_hash_fields[HWBCM_HASH_LAG] = HWBCM_HASH_F_DEFAULT;
 
     /* Port-based (not flow-table) hash selection, then the bit offsets into
      * {A0(16), B0(16), ...}: ECMP on A0, trunks on B0. */
@@ -1013,6 +1020,9 @@ int hwbcm_hash_fields_set(int set, uint32_t fields)
     }
     pthread_mutex_lock(&g_lock);
     rv = g_inited ? hash_fields_program(set, fields) : BCM_E_INIT;
+    if (rv == 0) {
+        g_hash_fields[set] = fields;
+    }
     pthread_mutex_unlock(&g_lock);
     return rv;
 }
@@ -1031,9 +1041,58 @@ int hwbcm_hash_seed_set(int set, uint32_t seed)
         rv = hash_sc(set == HWBCM_HASH_ECMP ? "HashSeed0" : "HashSeed1",
                      set == HWBCM_HASH_ECMP ? bcmSwitchHashSeed0 : bcmSwitchHashSeed1,
                      (int)seed);
+        if (rv == 0) {
+            g_hash_seed[set] = seed;
+        }
     }
     pthread_mutex_unlock(&g_lock);
     return rv;
+}
+
+void hwbcm_hash_wb_get(hwbcm_hash_wb_state_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    out->fields[0] = g_hash_fields[0];
+    out->fields[1] = g_hash_fields[1];
+    out->seed[0]   = g_hash_seed[0];
+    out->seed[1]   = g_hash_seed[1];
+    pthread_mutex_unlock(&g_lock);
+}
+
+void hwbcm_hash_wb_restore(const hwbcm_hash_wb_state_t *in)
+{
+    int hw_s0 = 0, hw_s1 = 0, hw_ctl = 0;
+
+    if (in == NULL) {
+        return;
+    }
+    pthread_mutex_lock(&g_lock);
+    g_hash_fields[0] = in->fields[0];
+    g_hash_fields[1] = in->fields[1];
+    g_hash_seed[0]   = in->seed[0];
+    g_hash_seed[1]   = in->seed[1];
+    if (g_inited) {
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashSeed0, &hw_s0)) &&
+            (uint32_t)hw_s0 != g_hash_seed[0]) {
+            HWBCM_LOGW("wb hash: HW HashSeed0 0x%08x != saved 0x%08x (HW left untouched)",
+                       (unsigned)hw_s0, (unsigned)g_hash_seed[0]);
+        }
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashSeed1, &hw_s1)) &&
+            (uint32_t)hw_s1 != g_hash_seed[1]) {
+            HWBCM_LOGW("wb hash: HW HashSeed1 0x%08x != saved 0x%08x (HW left untouched)",
+                       (unsigned)hw_s1, (unsigned)g_hash_seed[1]);
+        }
+        if (BCM_SUCCESS(bcm_switch_control_get(HWBCM_UNIT, bcmSwitchHashControl, &hw_ctl))) {
+            HWBCM_LOGI("wb hash: restored ECMP(fields=0x%x seed=0x%08x) LAG(fields=0x%x seed=0x%08x) HW HashControl=0x%x",
+                       (unsigned)g_hash_fields[0], (unsigned)g_hash_seed[0],
+                       (unsigned)g_hash_fields[1], (unsigned)g_hash_seed[1],
+                       (unsigned)hw_ctl);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 
 #undef HASH_SC
@@ -1846,6 +1905,7 @@ int hwbcm_warm_deinit(void)
     g_link_cookie = NULL;
     hwbcm_l2_warm_reset();
     hwbcm_l3_warm_reset();
+    hwbcm_vxlan_warm_reset();
 
     /* Preserve KNET DMA rings, netifs, and filters across shutdown. */
     (void)sal_config_set((char *)spn_WARMBOOT_KNET_SHUTDOWN_MODE, (char *)"1");
@@ -1885,6 +1945,7 @@ int hwbcm_deinit(void)
     g_link_cookie = NULL;
     hwbcm_l2_warm_reset();
     hwbcm_l3_warm_reset();
+    hwbcm_vxlan_warm_reset();
 
     for (i = 0; i < HWBCM_KNET_MAX; i++) {
         if (g_knet[i].netif_id != 0) {

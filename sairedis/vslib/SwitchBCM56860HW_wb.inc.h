@@ -5,7 +5,7 @@
  * Implementation: SwitchBCM56860HW_wb.inc.cpp (included by SwitchBCM56860HW.cpp).
  */
 
-        // --- Warm Boot (Phase 1 & Phase 2) --------------------------------
+        // --- Warm Boot (Phase 1, Phase 2 & Phase 3) -----------------------
 
         protected:
 
@@ -31,6 +31,14 @@
 
             /* Rebuild non-persisted LAG / L3 NHG-member bookkeeping from m_objectHash. */
             void hwWarmRebuildLagAndL3FromHash();
+
+            /* Restore base switch OIDs (default VLAN, 1Q bridge, ECMP/LAG hash) from m_objectHash. */
+            void hwWarmRestoreSwitchOids();
+
+            /* Rebuild non-persisted Phase 3 bookkeeping from m_objectHash (zero HW writes). */
+            void hwWarmRebuildVxlanFromHash();
+            void hwWarmRebuildAclFromHash();
+            void hwWarmRebuildMirrorFromHash();
 
             /* SAI_OBJECT_TYPE_BRIDGE_PORT set handler (FDB learning mode freeze/unfreeze). */
             sai_status_t hwSetBridgePort(_In_ sai_object_id_t bp_id, _In_ const sai_attribute_t *attr);

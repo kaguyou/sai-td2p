@@ -1643,3 +1643,148 @@ int hwbcm_vxlan_overlay_egress_replace(int egr_id, int ovl_intf_id, const uint8_
 {
     return hwbcm_vxlan_overlay_egress_do(BCM_L3_REPLACE | BCM_L3_WITH_ID, egr_id, ovl_intf_id, mac, vp_gport, NULL);
 }
+
+/* ------------------------------------------------------------------------ */
+/* warm boot persistence / recovery (Phase 3)                               */
+/* ------------------------------------------------------------------------ */
+
+void hwbcm_vxlan_wb_get_globals(int *inited, int *udp_port)
+{
+    if (inited != NULL) {
+        *inited = s_vxlan_inited;
+    }
+    if (udp_port != NULL) {
+        *udp_port = s_udp_port;
+    }
+}
+
+int hwbcm_vxlan_wb_get_vps(hwbcm_vxlan_vp_wb_t *out, int max)
+{
+    int i, count = 0;
+
+    for (i = 0; i < HWBCM_VXLAN_MAX_VP; i++) {
+        if (!s_vp[i].in_use) {
+            continue;
+        }
+        if (out != NULL && count < max) {
+            out[count].vp_idx     = i;
+            out[count].is_network = s_vp[i].is_network;
+            out[count].port_gport = s_vp[i].port_gport;
+            out[count].egr_id     = s_vp[i].egr_id;
+            out[count].intf_vid   = s_vp[i].intf_vid;
+            out[count].vpn_id     = s_vp[i].vpn_id;
+            out[count].uvid       = s_vp[i].uvid;
+        }
+        count++;
+    }
+    return count;
+}
+
+int hwbcm_vxlan_wb_get_acc_intfs(hwbcm_vxlan_acc_intf_wb_t *out, int max)
+{
+    int vid, count = 0;
+
+    for (vid = 0; vid <= BCM_VLAN_MAX; vid++) {
+        if (s_acc_intf[vid].refcnt <= 0) {
+            continue;
+        }
+        if (out != NULL && count < max) {
+            out[count].vid     = vid;
+            out[count].intf_id = s_acc_intf[vid].intf_id;
+            out[count].refcnt  = s_acc_intf[vid].refcnt;
+        }
+        count++;
+    }
+    return count;
+}
+
+int hwbcm_vxlan_wb_get_vpn_l3(hwbcm_vxlan_vpn_l3_wb_t *out, int max)
+{
+    int vfi, count = 0;
+
+    for (vfi = 0; vfi < HWBCM_VXLAN_MAX_VFI; vfi++) {
+        if (!s_vpn_l3[vfi].bound) {
+            continue;
+        }
+        if (out != NULL && count < max) {
+            out[count].vfi      = vfi;
+            out[count].ovl_intf = s_vpn_l3[vfi].ovl_intf;
+            memcpy(out[count].mac, s_vpn_l3[vfi].mac, 6);
+        }
+        count++;
+    }
+    return count;
+}
+
+void hwbcm_vxlan_warm_reset(void)
+{
+    memset(s_vp, 0, sizeof(s_vp));
+    memset(s_acc_intf, 0, sizeof(s_acc_intf));
+    memset(s_vpn_l3, 0, sizeof(s_vpn_l3));
+    s_vxlan_inited = 0;
+    s_udp_port = HWBCM_VXLAN_UDP_PORT_DEFAULT;
+}
+
+int hwbcm_vxlan_warm_restore(int inited, int udp_port,
+                             const hwbcm_vxlan_vp_wb_t *vps, int nvps,
+                             const hwbcm_vxlan_acc_intf_wb_t *acc_intfs, int nacc,
+                             const hwbcm_vxlan_vpn_l3_wb_t *vpn_l3, int nvpn_l3)
+{
+    int i, hw_port = 0;
+    int restored_vps = 0, restored_acc = 0, restored_l3 = 0;
+
+    hwbcm_vxlan_warm_reset();
+
+    /* NEVER call bcm_vxlan_init() during warm boot — SDK bcm_init() already
+     * recovered the VXLAN module from L2 scache; re-calling bcm_vxlan_init()
+     * would wipe every VPN, tunnel and VP in hardware. */
+    s_vxlan_inited = inited ? 1 : 0;
+
+    if (BCM_SUCCESS(bcm_switch_control_get(U, bcmSwitchVxlanUdpDestPortSet, &hw_port)) &&
+        hw_port > 0 && hw_port <= 65535) {
+        s_udp_port = hw_port;
+    } else if (udp_port > 0 && udp_port <= 65535) {
+        s_udp_port = udp_port;
+    }
+
+    for (i = 0; i < nvps && vps != NULL; i++) {
+        int idx = vps[i].vp_idx;
+        if (idx < 0 || idx >= HWBCM_VXLAN_MAX_VP) {
+            continue;
+        }
+        s_vp[idx].in_use     = 1;
+        s_vp[idx].is_network = vps[i].is_network ? 1 : 0;
+        s_vp[idx].port_gport = vps[i].port_gport;
+        s_vp[idx].egr_id     = vps[i].egr_id;
+        s_vp[idx].intf_vid   = vps[i].intf_vid;
+        s_vp[idx].vpn_id     = vps[i].vpn_id;
+        s_vp[idx].uvid       = vps[i].uvid;
+        restored_vps++;
+    }
+
+    for (i = 0; i < nacc && acc_intfs != NULL; i++) {
+        int vid = acc_intfs[i].vid;
+        if (vid < 0 || vid > BCM_VLAN_MAX || acc_intfs[i].refcnt <= 0) {
+            continue;
+        }
+        s_acc_intf[vid].intf_id = acc_intfs[i].intf_id;
+        s_acc_intf[vid].refcnt  = acc_intfs[i].refcnt;
+        restored_acc++;
+    }
+
+    for (i = 0; i < nvpn_l3 && vpn_l3 != NULL; i++) {
+        int vfi = vpn_l3[i].vfi;
+        if (vfi < 0 || vfi >= HWBCM_VXLAN_MAX_VFI) {
+            continue;
+        }
+        s_vpn_l3[vfi].bound    = 1;
+        s_vpn_l3[vfi].ovl_intf = vpn_l3[i].ovl_intf;
+        memcpy(s_vpn_l3[vfi].mac, vpn_l3[i].mac, 6);
+        restored_l3++;
+    }
+
+    hwbcm_log(HWBCM_LOG_INFO,
+              "hwbcm_vxlan: warm restore inited=%d udp_port=%d vps=%d acc_intfs=%d vpn_l3=%d (zero HW writes)",
+              s_vxlan_inited, s_udp_port, restored_vps, restored_acc, restored_l3);
+    return BCM_E_NONE;
+}

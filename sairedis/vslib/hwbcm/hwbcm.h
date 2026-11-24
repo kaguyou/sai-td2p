@@ -430,6 +430,50 @@ void hwbcm_core_wb_restore(const hwbcm_core_wb_state_t *in);
 /* Restore g_desired_speed[port] in SW only (no HW write). */
 void hwbcm_port_desired_speed_restore(int port, int speed_mbps);
 
+/* Hash SW state persisted in .hwstate (RTAG7 fields & seeds for ECMP/LAG). */
+typedef struct {
+    uint32_t fields[2];  /* [HWBCM_HASH_ECMP], [HWBCM_HASH_LAG] */
+    uint32_t seed[2];    /* [HWBCM_HASH_ECMP], [HWBCM_HASH_LAG] */
+} hwbcm_hash_wb_state_t;
+
+void hwbcm_hash_wb_get(hwbcm_hash_wb_state_t *out);
+void hwbcm_hash_wb_restore(const hwbcm_hash_wb_state_t *in);
+
+/* VXLAN / EVPN / RIOT SW state persisted in .hwstate (Phase 3). */
+typedef struct {
+    int vp_idx;
+    int is_network;
+    int port_gport;
+    int egr_id;
+    int intf_vid;
+    int vpn_id;
+    int uvid;
+} hwbcm_vxlan_vp_wb_t;
+
+typedef struct {
+    int vid;
+    int intf_id;
+    int refcnt;
+} hwbcm_vxlan_acc_intf_wb_t;
+
+typedef struct {
+    int vfi;
+    int ovl_intf;
+    uint8_t mac[6];
+} hwbcm_vxlan_vpn_l3_wb_t;
+
+void hwbcm_vxlan_wb_get_globals(int *inited, int *udp_port);
+/* Pass out == NULL or max == 0 to query total active count. */
+int  hwbcm_vxlan_wb_get_vps(hwbcm_vxlan_vp_wb_t *out, int max);
+int  hwbcm_vxlan_wb_get_acc_intfs(hwbcm_vxlan_acc_intf_wb_t *out, int max);
+int  hwbcm_vxlan_wb_get_vpn_l3(hwbcm_vxlan_vpn_l3_wb_t *out, int max);
+/* Restore VXLAN SW tables with ZERO HW writes (never calls bcm_vxlan_init). */
+int  hwbcm_vxlan_warm_restore(int inited, int udp_port,
+                              const hwbcm_vxlan_vp_wb_t *vps, int nvps,
+                              const hwbcm_vxlan_acc_intf_wb_t *acc_intfs, int nacc,
+                              const hwbcm_vxlan_vpn_l3_wb_t *vpn_l3, int nvpn_l3);
+void hwbcm_vxlan_warm_reset(void);
+
 /* Reset L2 callback registration state (called during warm deinit). */
 void hwbcm_l2_warm_reset(void);
 

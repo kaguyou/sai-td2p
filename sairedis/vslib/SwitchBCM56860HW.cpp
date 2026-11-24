@@ -18,6 +18,10 @@
 
 #include "hwbcm/hwbcm.h"
 #include "hwbcm/hwbcm_stats.h"
+#include "hwbcm/hwbcm_acl.h"
+#include "hwbcm/hwbcm_copp.h"
+#include "hwbcm/hwbcm_qos.h"
+#include "hwbcm/hwbcm_mirror.h"
 
 #include <sys/eventfd.h>
 #include <sys/stat.h>
@@ -143,6 +147,10 @@ SwitchBCM56860HW::~SwitchBCM56860HW()
         }
 
         hwL3RestoreSharedEgress(-1, -1);
+        hwbcm_acl_warm_reset();
+        hwbcm_copp_warm_reset();
+        hwbcm_qos_warm_reset();
+        hwbcm_stats_warm_reset();
         m_hwReady = false;
     }
 }
@@ -315,6 +323,7 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
     SWSS_LOG_ENTER();
 
     CHECK_STATUS(SwitchBCM56850::warm_boot_initialize_objects());
+    hwWarmRestoreSwitchOids();
 
     std::string scachePath = warmBootScachePath(false);
     std::string hwStatePath = warmBootHwStatePath(false);

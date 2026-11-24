@@ -427,3 +427,14 @@ int hwbcm_mirror_dump(void)
     hwbcm_log(HWBCM_LOG_INFO, "mirror dump: %d destination(s)", count);
     return 0;
 }
+
+int hwbcm_mirror_dest_exists(int dest_gport)
+{
+    bcm_mirror_destination_t mdest;
+
+    if (dest_gport == -1) {
+        return 0;
+    }
+    bcm_mirror_destination_t_init(&mdest);
+    return BCM_SUCCESS(bcm_mirror_destination_get(U, (bcm_gport_t)dest_gport, &mdest)) ? 1 : 0;
+}

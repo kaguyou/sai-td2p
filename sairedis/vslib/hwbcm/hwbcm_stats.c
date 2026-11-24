@@ -377,6 +377,7 @@ int hwbcm_queue_stat_multi_get(int port, int queue, int is_mc, int n,
     return rv;
 }
 
+
 /* ------------------------------------------------------------------------ */
 /* priority groups                                                          */
 /* ------------------------------------------------------------------------ */
@@ -467,6 +468,7 @@ int hwbcm_pg_stat_multi_get(int port, int pg, int n, const int *ids,
     pthread_mutex_unlock(&g_lock);
     return rv;
 }
+
 
 /* ------------------------------------------------------------------------ */
 /* buffer pools                                                             */
@@ -585,6 +587,7 @@ int hwbcm_pool_stat_multi_get(int egress, int port, int cosq, int is_mc,
     return rv;
 }
 
+
 /* ------------------------------------------------------------------------ */
 /* extra port counters                                                      */
 /* ------------------------------------------------------------------------ */
@@ -683,4 +686,106 @@ int hwbcm_port_xstat_multi_get(int port, int n, const int *ids, int clear,
     }
     pthread_mutex_unlock(&g_lock);
     return rv;
+}
+
+/* ------------------------------------------------------------------------ */
+/* warm boot (Phase 3)                                                      */
+/* ------------------------------------------------------------------------ */
+
+void hwbcm_stats_warm_reset(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_inited = 0;
+    g_bst_on = 0;
+    g_soft_logs = 0;
+    memset(g_bst_last_ms, 0, sizeof(g_bst_last_ms));
+    memset(g_qbase, 0, sizeof(g_qbase));
+    memset(g_xbase, 0, sizeof(g_xbase));
+    memset(g_egr_rep, 0, sizeof(g_egr_rep));
+    pthread_mutex_unlock(&g_lock);
+}
+
+int hwbcm_stats_wb_get_qbase(hwbcm_qbase_wb_t *out, int max)
+{
+    int p, mc, q, w, count = 0;
+
+    pthread_mutex_lock(&g_lock);
+    for (p = 0; p < HWBCM_MAX_PORTS; p++) {
+        for (mc = 0; mc < 2; mc++) {
+            for (q = 0; q < HWBCM_STATS_MAX_CPU_QUEUES; q++) {
+                for (w = 0; w < QB_COUNT; w++) {
+                    uint64_t val = g_qbase[p][mc][q][w];
+                    if (val == 0) {
+                        continue;
+                    }
+                    if (out != NULL && count < max) {
+                        out[count].port  = (uint8_t)p;
+                        out[count].mc    = (uint8_t)mc;
+                        out[count].queue = (uint8_t)q;
+                        out[count].which = (uint8_t)w;
+                        out[count].value = val;
+                    }
+                    count++;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return count;
+}
+
+int hwbcm_stats_wb_get_xbase(hwbcm_xbase_wb_t *out, int max)
+{
+    int p, id, count = 0;
+
+    pthread_mutex_lock(&g_lock);
+    for (p = 0; p < HWBCM_MAX_PORTS; p++) {
+        for (id = 0; id < HWBCM_XPSTAT_COUNT; id++) {
+            uint64_t val = g_xbase[p][id];
+            if (val == 0) {
+                continue;
+            }
+            if (out != NULL && count < max) {
+                out[count].port  = (uint8_t)p;
+                out[count].id    = (uint8_t)id;
+                out[count].value = val;
+            }
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return count;
+}
+
+void hwbcm_stats_warm_restore(const hwbcm_qbase_wb_t *qbase, int nq,
+                              const hwbcm_xbase_wb_t *xbase, int nx)
+{
+    int i, rq = 0, rx = 0;
+
+    pthread_mutex_lock(&g_lock);
+    memset(g_qbase, 0, sizeof(g_qbase));
+    memset(g_xbase, 0, sizeof(g_xbase));
+    memset(g_egr_rep, 0, sizeof(g_egr_rep));
+    memset(g_bst_last_ms, 0, sizeof(g_bst_last_ms));
+
+    for (i = 0; i < nq && qbase != NULL; i++) {
+        int p = qbase[i].port;
+        int mc = qbase[i].mc;
+        int q = qbase[i].queue;
+        int w = qbase[i].which;
+        if (p < HWBCM_MAX_PORTS && mc < 2 && q < HWBCM_STATS_MAX_CPU_QUEUES && w < QB_COUNT) {
+            g_qbase[p][mc][q][w] = qbase[i].value;
+            rq++;
+        }
+    }
+    for (i = 0; i < nx && xbase != NULL; i++) {
+        int p = xbase[i].port;
+        int id = xbase[i].id;
+        if (p < HWBCM_MAX_PORTS && id < HWBCM_XPSTAT_COUNT) {
+            g_xbase[p][id] = xbase[i].value;
+            rx++;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    HWBCM_LOGI("stats: warm restored %d queue baseline(s) and %d port xstat baseline(s)", rq, rx);
 }

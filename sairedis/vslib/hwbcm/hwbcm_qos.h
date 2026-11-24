@@ -168,6 +168,33 @@ int hwbcm_qos_queue_buffer_set(int port, int cos, int mcast, const hwbcm_qos_buf
  * egress SP shared limit (MMU_THDM_DB_POOL_SHARED_LIMIT) in bytes. */
 int hwbcm_qos_pool_shared_get(int pool, uint32_t *ingress_bytes, uint32_t *egress_bytes);
 
+/* Warm boot helpers (Phase 3): persist/restore boot-time MMU snapshots
+ * (s_pg_snap, s_q_snap) with zero HW writes, and cross-check QoS map ids. */
+typedef struct {
+    int port;
+    int pg;
+    uint32_t min, hdrm, dyn, limit, floor, offset;
+    int spid;
+} hwbcm_qos_pg_snap_wb_t;
+
+typedef struct {
+    int port;
+    int mcast;
+    int cos;
+    int have_min, have_dyn, have_shared, have_limit_en, have_pool;
+    int min_bytes, dyn, shared_bytes, limit_en, pool;
+    uint32_t alpha;
+} hwbcm_qos_q_snap_wb_t;
+
+/* Pass out == NULL or max == 0 to query total valid count. */
+int  hwbcm_qos_wb_get_pg_snaps(hwbcm_qos_pg_snap_wb_t *out, int max);
+int  hwbcm_qos_wb_get_q_snaps(hwbcm_qos_q_snap_wb_t *out, int max);
+void hwbcm_qos_warm_restore(const hwbcm_qos_pg_snap_wb_t *pgs, int npgs,
+                            const hwbcm_qos_q_snap_wb_t *qs, int nqs);
+void hwbcm_qos_warm_reset(void);
+/* Read-only check whether a bcm qos map id exists in the SDK (1 = yes, 0 = no). */
+int  hwbcm_qos_map_exists(int map_id);
+
 #ifdef __cplusplus
 }
 #endif

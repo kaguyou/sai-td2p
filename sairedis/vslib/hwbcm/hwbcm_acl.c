@@ -849,3 +849,43 @@ int hwbcm_acl_dump_entry(int eid)
     return BCM_E_UNAVAIL;
 #endif
 }
+
+/* ------------------------------------------------------------------------ */
+/* warm boot (Phase 3)                                                      */
+/* ------------------------------------------------------------------------ */
+
+void hwbcm_acl_warm_reset(void)
+{
+    memset(s_groups, 0, sizeof(s_groups));
+    s_modid = -1;
+}
+
+int hwbcm_acl_group_restore(int gid, int stage, uint32_t quals)
+{
+    acl_group_info_t *gi;
+    bcm_field_group_status_t st;
+    int rv;
+
+    gi = group_info(gid);
+    if (gi == NULL) {
+        gi = group_info_alloc();
+        if (gi == NULL) {
+            hwbcm_log(HWBCM_LOG_ERR, "wb acl: more than %d ACL groups", HWBCM_ACL_MAX_GROUPS);
+            return BCM_E_RESOURCE;
+        }
+    }
+    gi->gid   = gid;
+    gi->stage = stage;
+    gi->quals = quals;
+
+    memset(&st, 0, sizeof(st));
+    rv = bcm_field_group_status_get(U, (bcm_field_group_t)gid, &st);
+    if (rv < 0) {
+        hwbcm_log(HWBCM_LOG_WARN, "wb acl: restored %s group %d not found in SDK (%s)",
+                  stage_name(stage), gid, bcm_errmsg(rv));
+    } else {
+        hwbcm_log(HWBCM_LOG_DEBUG, "wb acl: restored %s group %d (quals=0x%x, entries=%d, free=%d)",
+                  stage_name(stage), gid, quals, st.entry_count, st.entries_free);
+    }
+    return 0;
+}
