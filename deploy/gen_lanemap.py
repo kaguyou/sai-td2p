@@ -110,7 +110,9 @@ def main():
 
     if args.config_bcm:
         phys_to_logical = parse_portmap(args.config_bcm)
-        missing = [(n, l) for n, ls in ports for l in ls if l not in phys_to_logical]
+        # A multi-lane port (40G = 4 lanes) has one portmap entry, on its first
+        # lane (portmap_<l>=<first>:40); the SAI also maps ports by first lane.
+        missing = [(n, ls[0]) for n, ls in ports if ls[0] not in phys_to_logical]
         if missing:
             for n, l in missing:
                 print("ERROR: %s lane %d is not a physical port in %s portmap" % (n, l, args.config_bcm), file=sys.stderr)
