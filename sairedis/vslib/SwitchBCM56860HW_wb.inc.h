@@ -35,6 +35,12 @@
             /* Restore base switch OIDs (default VLAN, 1Q bridge, ECMP/LAG hash) from m_objectHash. */
             void hwWarmRestoreSwitchOids();
 
+            /* Clear stale function-pointer callbacks restored from sai-warmboot.bin
+             * before warm_boot_initialize_objects() runs hardware init or fallback
+             * replay; VirtualSwitchSaiInterface::create() installs the new process's
+             * live callbacks afterwards via SwitchBCM56860HW::create(SWITCH). */
+            void hwWarmScrubStaleCallbacks();
+
             /* Rebuild non-persisted Phase 3 bookkeeping from m_objectHash (zero HW writes). */
             void hwWarmRebuildVxlanFromHash();
             void hwWarmRebuildAclFromHash();
@@ -67,3 +73,5 @@
              * opts back into live KNET rings. */
             bool warmDeinitForKexec() const;
             bool m_isWarmBoot = false;
+            bool m_inWarmBootInit = false;
+            bool m_pendingVxlanOperNotify = false;

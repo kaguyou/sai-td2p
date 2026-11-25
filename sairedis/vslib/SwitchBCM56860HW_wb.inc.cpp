@@ -2050,6 +2050,55 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
     }
 }
 
+void SwitchBCM56860HW::hwWarmScrubStaleCallbacks()
+{
+    SWSS_LOG_ENTER();
+
+    auto swIt = m_objectHash.find(SAI_OBJECT_TYPE_SWITCH);
+    if (swIt == m_objectHash.end())
+    {
+        return;
+    }
+
+    std::string swKey = sai_serialize_object_id(m_switch_id);
+    auto objIt = swIt->second.find(swKey);
+    if (objIt == swIt->second.end())
+    {
+        return;
+    }
+
+    std::vector<sai_attr_id_t> ptrAttrs;
+    for (const auto &akv : objIt->second)
+    {
+        if (akv.second == nullptr)
+        {
+            continue;
+        }
+        auto meta = akv.second->getAttrMetadata();
+        auto attr = akv.second->getAttr();
+        if (meta != nullptr && attr != nullptr && !meta->isreadonly &&
+            meta->attrvaluetype == SAI_ATTR_VALUE_TYPE_POINTER &&
+            attr->value.ptr != NULL)
+        {
+            ptrAttrs.push_back(meta->attrid);
+        }
+    }
+
+    for (auto id : ptrAttrs)
+    {
+        sai_attribute_t a;
+        a.id = id;
+        a.value.ptr = NULL;
+        set_internal(SAI_OBJECT_TYPE_SWITCH, swKey, &a);
+    }
+
+    if (!ptrAttrs.empty())
+    {
+        SWSS_LOG_NOTICE("wb: scrubbed %zu stale switch callback pointer(s) from restored warm-boot state",
+                ptrAttrs.size());
+    }
+}
+
 void SwitchBCM56860HW::hwWarmRestoreSwitchOids()
 {
     SWSS_LOG_ENTER();
@@ -2910,6 +2959,7 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     m_portIngMirrors.clear();
     m_portEgrMirrors.clear();
     m_statPoolUser.clear();
+    m_pendingVxlanOperNotify = false;
 }
 
 sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
@@ -3541,6 +3591,44 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
             oa.id = SAI_PORT_ATTR_OPER_SPEED;
             oa.value.u32 = operSpeed;
             set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &oa);
+        }
+    }
+
+    // 15. Persist a fresh (.scache, .hwstate, .bootid) snapshot matching the
+    //     newly replayed ASIC so a subsequent warm start (even an unexpected
+    //     syncd restart before a clean warm shutdown) does a true warm boot
+    //     instead of repeating the cold fallback forever.
+    {
+        std::string readBase = warmBootBasePath(/*forWrite=*/false);
+        std::string writeBase = warmBootBasePath(/*forWrite=*/true);
+        sai_status_t syncSt = SAI_STATUS_SUCCESS;
+
+        if (readBase != writeBase)
+        {
+            size_t rBytes = 0;
+            std::string rScache = warmBootScachePath(/*forWrite=*/false);
+            std::string rHwState = warmBootHwStatePath(/*forWrite=*/false);
+            if (hwbcm_warm_sync(rScache.c_str(), &rBytes) < 0 ||
+                hwStateSave(rHwState) != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_WARN("wb fallback: failed to write warm-boot snapshot at read path %s",
+                        readBase.c_str());
+            }
+        }
+
+        syncSt = hwWarmSync();
+        m_warmSynced = false; // checkpoint only; future PRE_SHUTDOWN / destructor still syncs
+        if (syncSt != SAI_STATUS_SUCCESS)
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: post-replay hwWarmSync failed: %s "
+                    "(next warm start may fall back again)",
+                    sai_serialize_status(syncSt).c_str());
+        }
+        else
+        {
+            SWSS_LOG_NOTICE("wb fallback: persisted fresh scache/hwstate snapshot (%s) for subsequent warm boots",
+                    writeBase.c_str());
         }
     }
 

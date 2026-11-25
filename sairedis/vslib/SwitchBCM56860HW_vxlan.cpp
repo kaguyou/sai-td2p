@@ -459,6 +459,19 @@ void SwitchBCM56860HW::vxlanNotifyTunnelOper(
         return;
     }
 
+    if (m_inWarmBootInit)
+    {
+        // During warm_boot_initialize_objects() (including cold-fallback replay),
+        // SwitchBCM56860HW::create(SWITCH) has not yet installed the new syncd
+        // process's live notification callbacks. Defer oper-up notifications
+        // until create(SWITCH) updates SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY.
+        if (up)
+        {
+            m_pendingVxlanOperNotify = true;
+        }
+        return;
+    }
+
     sai_attribute_t attr;
 
     attr.id = SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY;

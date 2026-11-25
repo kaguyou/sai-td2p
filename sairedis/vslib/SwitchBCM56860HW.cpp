@@ -352,7 +352,17 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
 {
     SWSS_LOG_ENTER();
 
+    struct WarmInitGuard
+    {
+        bool &flag;
+        WarmInitGuard(bool &f) : flag(f) { flag = true; }
+        ~WarmInitGuard() { flag = false; }
+    } warmInitGuard(m_inWarmBootInit);
+
+    m_pendingVxlanOperNotify = false;
+
     CHECK_STATUS(SwitchBCM56850::warm_boot_initialize_objects());
+    hwWarmScrubStaleCallbacks();
     hwWarmRestoreSwitchOids();
 
     std::string scachePath = warmBootScachePath(false);
@@ -2772,6 +2782,18 @@ sai_status_t SwitchBCM56860HW::create(
             for (uint32_t i = 0; i < attr_count && hw == SAI_STATUS_SUCCESS; i++)
             {
                 hw = hwSetSwitch(&attr_list[i]);
+            }
+
+            if (m_pendingVxlanOperNotify)
+            {
+                m_pendingVxlanOperNotify = false;
+                for (const auto &kv : m_vtepByIp)
+                {
+                    if (kv.second.vpReady)
+                    {
+                        vxlanNotifyTunnelOper(kv.second, true);
+                    }
+                }
             }
 
             // never roll back the switch
