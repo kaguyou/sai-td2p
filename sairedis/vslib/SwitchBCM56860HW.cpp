@@ -520,8 +520,22 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
         }
     }
 
-    // Pass 1: physical-port TYPE_PORT bridge ports in m_port_list order (same
-    // order as SwitchBCM56850).
+    // Only list physical-port TYPE_PORT bridge ports (in m_port_list order).
+    // Non-physical / user-created bridge ports (TUNNEL, SUB_PORT, 1D_ROUTER,
+    // 1Q_ROUTER, NEXT_HOP_GROUP, and LAG-backed TYPE_PORT whose PORT_ID is a
+    // LAG OID) MUST NOT be listed here:
+    //   1. PortsOrch::removeDefaultBridgePorts() runs in INIT_VIEW with a
+    //      buffer sized to (m_portCount + m_systemPortCount + 1), GETs
+    //      SAI_BRIDGE_PORT_ATTR_TYPE on every returned OID, and only removes
+    //      TYPE_PORT ones. Any non-PORT OID left in TEMP_ASIC_STATE by
+    //      Syncd::snoopGetResponse() stays with only TYPE set, gets pre-matched
+    //      by VID in ComparisonLogic::matchOids(), and crashes APPLY_VIEW on
+    //      mandatory CREATE_AND_SET attributes like BRIDGE_ID.
+    //   2. LAG-backed TYPE_PORT bridge ports are user-created (never default
+    //      switch ports); listing them can overflow PortsOrch's buffer,
+    //      pollute SaiDiscovery with user LAGs, or be removed outside INIT_VIEW.
+    // Leaving all user-created non-physical bridge ports out lets syncd match
+    // them normally against temporaryView during APPLY_VIEW without throwing.
     std::map<sai_object_id_t, std::vector<sai_object_id_t>> portToBps;
     for (const auto &bp : bridge_port_list_on_bridge_id)
     {
@@ -540,7 +554,7 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
     }
 
     std::vector<sai_object_id_t> bridge_port_list;
-    bridge_port_list.reserve(bridge_port_list_on_bridge_id.size());
+    bridge_port_list.reserve(m_port_list.size());
     std::set<sai_object_id_t> placed;
 
     for (const auto &p : m_port_list)
@@ -559,24 +573,14 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
         }
     }
 
-    // Pass 2: append every other bridge port of this bridge in stable ascending
-    // OID order (TUNNEL, SUB_PORT, 1D_ROUTER, 1Q_ROUTER with BRIDGE_ID,
-    // BRIDGE_PORT_NEXT_HOP_GROUP, LAG-backed PORT whose PORT_ID is a LAG OID).
-    for (const auto &bp : bridge_port_list_on_bridge_id)
-    {
-        if (placed.find(bp.first) == placed.end())
-        {
-            bridge_port_list.push_back(bp.first);
-        }
-    }
-
     uint32_t bridge_port_list_count = (uint32_t)bridge_port_list.size();
+    size_t omitted_count = bridge_port_list_on_bridge_id.size() - bridge_port_list.size();
 
-    SWSS_LOG_NOTICE("recalculated %s: %u (port=%zu, other=%zu)",
+    SWSS_LOG_NOTICE("recalculated %s: %u (port=%zu, omitted=%zu)",
             me_port_list->attridname,
             bridge_port_list_count,
-            placed.size(),
-            bridge_port_list.size() - placed.size());
+            bridge_port_list.size(),
+            omitted_count);
 
     attr.id = SAI_BRIDGE_ATTR_PORT_LIST;
     attr.value.objlist.count = bridge_port_list_count;
