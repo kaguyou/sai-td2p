@@ -149,3 +149,50 @@ Audited all `SWSS_LOG_THROW`, `refresh_read_only()` (`SwitchStateBase.cpp:2553-2
 - Branch: `wb-fallback`
 - Code commit: `fedf6e6` (`wb: override refresh_bridge_port_list for tunnel/LAG/non-port bridge ports`)
 - `deploy/build/libsaivs.so.0.0.0` sha256: `f0cf4e1059f8b83c7177bfd34f3e71323499683852613efabb27f36348dc36b9`
+
+---
+
+## 8. Round 4 — `APPLY_VIEW` failure from non-port bridge ports in `SAI_BRIDGE_ATTR_PORT_LIST`
+
+### Task 1: Root cause verification (`notes/f5a4_full.log.gz`, `notes/f5a4_bridge_views.txt`) & filtering policy
+Lead's reading is **100% confirmed** in `orchagent` and `syncd`:
+- **`PortsOrch::removeDefaultBridgePorts()` (`sonic-swss/orchagent/portsorch.cpp:856, 1369-1423`):** runs during `orchagent` warm init (`INIT_VIEW`), allocates `vector<sai_object_id_t> bridge_port_list(m_portCount + m_systemPortCount + 1)` (`:1375`), calls `get_bridge_attribute(m_default1QBridge, SAI_BRIDGE_ATTR_PORT_LIST)` (`:1382`), then calls `get_bridge_port_attribute(bp, SAI_BRIDGE_PORT_ATTR_TYPE)` (`:1401`) on every returned OID and calls `remove_bridge_port(bp)` **only** when `attr.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT` (`:1411-1413`).
+- **`Syncd::processQuadInInitViewModeGet()` -> `sendGetResponse()` -> `snoopGetResponse()` (`sonic-sairedis/syncd/Syncd.cpp:2886-2974, 3988, 4105-4270`):**
+  1. On `SAI_BRIDGE_ATTR_PORT_LIST`, `snoopGetOidList()` -> `snoopGetOid()` (`:4146, 4242`) inserts a dummy `NULL: NULL` entry into `TEMP_ASIC_STATE` for **every** returned bridge port OID (including tunnel bridge port `oid:0x3a000000000cb9`).
+  2. On `SAI_BRIDGE_PORT_ATTR_TYPE`, because `TYPE` is `MANDATORY_ON_CREATE | CREATE_ONLY` (not `READ_ONLY`), `snoopGetAttrValue()` (`:4215, 4234`) writes `SAI_BRIDGE_PORT_ATTR_TYPE = SAI_BRIDGE_PORT_TYPE_TUNNEL` onto `TEMP_ASIC_STATE:SAI_OBJECT_TYPE_BRIDGE_PORT:oid:0x3a000000000cb9`.
+  3. Because `TYPE != SAI_BRIDGE_PORT_TYPE_PORT`, `PortsOrch` does **not** remove `cb9` from `TEMP_ASIC_STATE` (unlike the 5 `TYPE_PORT` bridge ports, which it removes). Later `VxlanOrch` restores EVPN and creates a new tunnel bridge port with a new floating VID (giving 7 `BRIDGE_PORT`s in `TEMP_ASIC_STATE` vs 6 in `ASIC_STATE`).
+- **`ComparisonLogic::matchOids()` & `performObjectSetTransition()` (`sonic-sairedis/syncd/ComparisonLogic.cpp:187-257, 1436-1620, 1915-1932`):**
+  - `matchOids()` finds `0x3a000000000cb9` in both views with the same VID and marks both `SAI_OBJECT_STATUS_MATCHED` (`:216-217`).
+  - `performObjectSetTransition()` sees `SAI_BRIDGE_PORT_ATTR_BRIDGE_ID` (`MANDATORY_ON_CREATE | CREATE_AND_SET`, OID attr) on `currentView` `cb9` but absent on the poisoned `temporaryView` `cb9` (`beginTempSizeZero` is `false` because `TYPE` was snooped, and `meta->isoidattribute` is `true`), fails at `:1613`, and throws at `:1930`.
+
+**Per-type decision for `SwitchBCM56860HW::refresh_bridge_port_list()`:**
+- **Physical-port `SAI_BRIDGE_PORT_TYPE_PORT`** (`PORT_ID` in `m_port_list`): **listed** (sorted in `m_port_list` order, identical to upstream `SwitchBCM56850`). Required on cold boot so `removeDefaultBridgePorts()` removes default physical bridge ports; on warm boot `removeDefaultBridgePorts()` removes them (`TYPE == PORT`) from `TEMP_ASIC_STATE` and adds them to `m_initViewRemovedVidSet`, so recreated bridge ports match cleanly.
+- **LAG-backed `SAI_BRIDGE_PORT_TYPE_PORT`** (`PORT_ID` is a LAG OID, not in `m_port_list`): **omitted (not listed, no throw).** User-created (never a default switch port); listing it risks `SAI_STATUS_BUFFER_OVERFLOW` against `portsorch.cpp:1375`'s fixed `m_portCount + m_systemPortCount + 1` buffer, pollutes `SaiDiscovery` by following `PORT_ID` into user-created `LAG` objects, and risks hardware deletion if `removeDefaultBridgePorts()` runs outside `INIT_VIEW` (`portsorch.cpp:1238`). Leaving it out lets `ComparisonLogic` match the LAG (`findCurrentBestMatchForLag`) and its LAG bridge port (`findCurrentBestMatchForGenericObject`) normally with zero ASIC ops.
+- **`SAI_BRIDGE_PORT_TYPE_SUB_PORT`**: **omitted (not listed, no throw).** User-created; `TYPE != PORT`, so listing it would poison `TEMP_ASIC_STATE` with `TYPE=SUB_PORT` and trigger the exact same `MATCHED` crash as `TUNNEL`, plus count against the `m_portCount + m_systemPortCount + 1` buffer.
+- **`SAI_BRIDGE_PORT_TYPE_TUNNEL`, `1D_ROUTER`, `1Q_ROUTER`, `NEXT_HOP_GROUP`**: **omitted (not listed, no throw).** None has `TYPE == PORT`; listing any present in `ASIC_STATE` poisons `TEMP_ASIC_STATE` and crashes `APPLY_VIEW`. (The default `1Q_ROUTER` bridge port already has no `BRIDGE_ID` and was already skipped.)
+
+### Task 2: Warm-start RID/VID & `APPLY_VIEW` comparison check
+- **`SaiSwitch` warm start (`SaiSwitch.cpp:705-714, 1181-1244`):** `checkWarmBootDiscoveredRids()` only verifies that every RID returned by `SaiDiscovery::discover()` exists in `RID2VID`; it does not require user-created objects in `RID2VID` (tunnels, tunnel maps, VLANs, RIFs, routes, ACLs, tunnel/LAG bridge ports) to be discovered. `helperSaveDiscoveredObjectsToRedis()` is a no-op when `ASIC_STATE` is non-empty. `populateExistingObjects()` (`ComparisonLogic.cpp:2306-2504`) only inspects `m_discovered_rids`, so `cb9` is not injected into `temporaryView`.
+- **`ComparisonLogic` matching (`BestCandidateFinder.cpp:1609-1860`, `ComparisonLogic.cpp:1165-2025`):**
+  - `cb9` stays `NOT_PROCESSED` in `currentView` with all 5 attributes (`TYPE=TUNNEL`, `TUNNEL_ID`, `BRIDGE_ID`, `ADMIN_STATE=true`, `FDB_LEARNING_MODE=DISABLE`).
+  - `ComparisonLogic` processes parent objects first: `BRIDGE` (`0x39..b3e`, `MATCHED`) and the P2P `TUNNEL` (matched by `findCurrentBestMatchForGenericObject` on `TYPE`, `UNDERLAY_INTERFACE`, `ENCAP_SRC_IP`, `ENCAP_DST_IP`; note the `getSaiAttrFromDefaultValue: serialization type SAI_ATTR_VALUE_TYPE_IP_ADDRESS` error at `f5a4_full.log.gz:22525` is a harmless `nullptr` return from `BestCandidateFinder.cpp:3046` when comparing a P2P tunnel candidate against a P2MP tunnel that lacks `ENCAP_DST_IP`).
+  - Once the parent P2P `TUNNEL` is `FINAL` (same RID), `temp_bp` (created via `PortsOrch::addBridgePort`, `portsorch.cpp:6506-6537`) matches `cb9` on all 5 attributes (`TYPE`, `TUNNEL_ID` RID, `BRIDGE_ID` RID, `ADMIN_STATE`, `FDB_LEARNING_MODE`). `performObjectSetTransition()` passes with **zero** ASIC operations — **no remove+create** of the tunnel bridge port and zero data-plane disruption (its RID is preserved and remapped to the new VID).
+
+### Task 3: Audit of other `orchagent` warm-init GETs for our EVPN config
+Audited every `get_*_attribute` call across `sonic-swss/orchagent/*.cpp`:
+- **Default `VLAN` (`removeDefaultVlanMembers`, `portsorch.cpp:1334-1367`):** gets `SAI_VLAN_ATTR_MEMBER_LIST` on `m_defaultVlan` (returns 0 in our config) and unconditionally calls `remove_vlan_member()` on every returned OID, so nothing can remain poisoned in `TEMP_ASIC_STATE`.
+- **Switch / Ports / QoS / Buffers / Hash / STP (`main.cpp`, `portsorch.cpp`, `switchorch.cpp`, `bufferorch.cpp`, `routeorch.cpp`, `aclorch.cpp`, `mirrororch.cpp`, `stporch.cpp`):** only queries switch-default `COLDVIDS` objects (`SWITCH`, `CPU_PORT`, `PORT_LIST` + `HW_LANE_LIST`, `DEFAULT_VIRTUAL_ROUTER_ID`, `DEFAULT_1Q_BRIDGE_ID`, `DEFAULT_VLAN_ID`, `ECMP_HASH`/`LAG_HASH`, `DEFAULT_TRAP_GROUP`, `DEFAULT_STP_INST_ID`, queues/IPGs/SGs) or scalar capabilities. All OID-list attrs are `READ_ONLY` (skipped by `snoopGetResponse` at `Syncd.cpp:4184`), and `HW_LANE_LIST` is explicitly skipped (`:4194-4203`). No user objects are returned.
+- **VXLAN / EVPN (`vxlanorch.cpp`, `tunneldecaporch.cpp`, `fdborch.cpp`, `intfsorch.cpp`):** **zero** `get_*_attribute` calls. All tunnels, tunnel maps/entries, tunnel term entries, VNIs, RIFs, and FDBs are created fresh in `INIT_VIEW` and matched normally on `APPLY_VIEW`.
+- **CoPP (`HOSTIF_TRAP_GROUP` 6 vs 1, `POLICER` 6 vs 0, `HOSTIF_TRAP` 11 vs 1 at `f5a4_full.log.gz:18067-18069, 22518-22520`):** **Confirmed NOT `snoopGetResponse` poisoning — purely "orchagent has not re-created them yet" at `APPLY_VIEW` time.**
+  - `CoppOrch::CoppOrch()` (`copporch.cpp:209-214, 370-390`) makes only one SAI GET: `get_switch_attribute(gSwitchId, SAI_SWITCH_ATTR_DEFAULT_TRAP_GROUP)` (the 1 default trap group in temp view), and creates the 1 default `TTL_ERROR` trap (`initDefaultTrapIds()`, `HOSTIF_TRAP` = 1 in temp view). It makes zero GETs on policers, non-default trap groups, or traps.
+  - At `18:20:21.172288`, `orchagent` logged `bake: Add warm input: COPP_TABLE, 0` (and `POLICER, 0`) because `coppmgrd` (`coppmgr.cpp:395-403`) wrote `COPP_TABLE` via `ProducerStateTable` (`_COPP_TABLE` staging queue), which `orchagent` only pops in its main event loop **after** `APPLY_VIEW` (not during `Consumer::refillToSync()`). None of the 5 extra trap groups, 6 policers, or 10 traps is in `TEMP_ASIC_STATE` or `MATCHED`, so `APPLY_VIEW` reconciles them cleanly without error and `CoppOrch` re-applies them once `orchagent` enters its main loop.
+
+### Fix (`sairedis/vslib/SwitchBCM56860HW.cpp`)
+- Updated `SwitchBCM56860HW::refresh_bridge_port_list()` to remove Pass 2 and return **only** physical-port `SAI_BRIDGE_PORT_TYPE_PORT` bridge ports (whose `PORT_ID` is in `m_port_list`), sorted in `m_port_list` order. All non-physical / user-created bridge ports (`TUNNEL`, `SUB_PORT`, `1D_ROUTER`, `1Q_ROUTER`, `NEXT_HOP_GROUP`, and LAG-backed `TYPE_PORT`) are silently omitted without throwing.
+- Expected log line on the `hwstate`-delete test: `recalculated SAI_BRIDGE_ATTR_PORT_LIST: 5 (port=5, omitted=1)` (instead of `6 (port=5, other=1)`), followed by clean `APPLY_VIEW` and `orchagent` warm start state `reconciled`.
+
+### Round 4 build, commit & sha256
+- Build: `SAI_TD2P_DIR=$PWD SAIREDIS_DIR=~/homelab/sonic-sairedis-merge ./deploy/build_wb.sh --no-meta --force-archive` — **ALL CHECKS PASSED**.
+- Branch: `wb-fallback`
+- Code commit: `191f790` (`wb: omit non-physical/user bridge ports from SAI_BRIDGE_ATTR_PORT_LIST`)
+- `deploy/build/libsaivs.so.0.0.0` sha256: `3b1688a3ea4cae6d0eb0c9d82f3d4ca7c3a16e9d883c945be7aec83a132fb7c5`
