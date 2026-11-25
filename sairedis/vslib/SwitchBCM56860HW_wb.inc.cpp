@@ -2787,3 +2787,774 @@ sai_status_t SwitchBCM56860HW::hwSetBridgePort(
     }
     return SAI_STATUS_SUCCESS;
 }
+
+void SwitchBCM56860HW::hwTeardownForColdFallback()
+{
+    SWSS_LOG_ENTER();
+
+    m_linkRun = false;
+    if (m_linkEventFd >= 0)
+    {
+        uint64_t one = 1;
+        ssize_t w = write(m_linkEventFd, &one, sizeof(one));
+        (void)w;
+    }
+    if (m_linkThread.joinable())
+    {
+        m_linkThread.join();
+    }
+
+    if (m_hwReady)
+    {
+        (void)hwbcm_deinit();
+        hwL3RestoreSharedEgress(-1, -1);
+        hwbcm_acl_warm_reset();
+        hwbcm_copp_warm_reset();
+        hwbcm_qos_warm_reset();
+        hwbcm_stats_warm_reset();
+        m_hwReady = false;
+    }
+    m_isWarmBoot = false;
+
+    if (m_linkEventFd >= 0)
+    {
+        close(m_linkEventFd);
+        m_linkEventFd = -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mapMutex);
+        m_portToBcm.clear();
+        m_bcmToPort.clear();
+        m_bcmIfName.clear();
+    }
+    m_lagToTrunk.clear();
+    m_lagMembers.clear();
+    m_lagMemberInfo.clear();
+    m_hostifToNetif.clear();
+
+    m_vrToVrf.clear();
+    m_rifToIntf.clear();
+    m_rifToVid.clear();
+    m_nhToEgr.clear();
+    m_nhgToEcmp.clear();
+    m_nhgMemberToNh.clear();
+    m_nhgMemberToNhg.clear();
+    m_neighborEgr.clear();
+    m_routeEgr.clear();
+
+    m_tunnelInit.clear();
+    m_tunnelTerm.clear();
+    m_vniToVpn.clear();
+    m_bridgeToVpn.clear();
+    m_bridgePortToVp.clear();
+    m_vtepByIp.clear();
+    m_tunnelRemoteIp.clear();
+    m_bridgePortRemoteIp.clear();
+    m_termEntryTunnel.clear();
+    m_vtepTunnel = SAI_NULL_OBJECT_ID;
+    m_vtepSrcValid = false;
+    memset(m_vtepSrcIp4, 0, sizeof(m_vtepSrcIp4));
+    m_vtepTtl = 64;
+    m_vtepDscp = -1;
+    m_vxlanInited = false;
+    m_vxlanStationId = -1;
+    m_tunnelMapType.clear();
+    m_mapEntryVidVni.clear();
+    m_vniRefs.clear();
+    m_vidToVni.clear();
+    m_vpnAccessVps.clear();
+
+    m_aclTables.clear();
+    m_aclEntries.clear();
+    m_aclCounters.clear();
+    m_aclRanges.clear();
+    m_aclGroups.clear();
+    m_aclGroupMembers.clear();
+    m_aclBindings.clear();
+    m_aclPrioUsed.clear();
+    m_aclMirrorDest.clear();
+
+    m_coppTrapHandle.clear();
+    m_coppPolicer.clear();
+    m_coppLocalEgress = -1;
+
+    m_qosQueueHw.clear();
+    m_qosPgHw.clear();
+    m_qosSgHw.clear();
+    m_qosPort.clear();
+    for (int s = 0; s < QOS_SLOT_COUNT; s++)
+    {
+        m_qosSwitchMaps[s] = SAI_NULL_OBJECT_ID;
+    }
+    m_qosSwitchDefaultTc = -1;
+    m_qosMapType.clear();
+    m_qosHwMaps.clear();
+    m_qosSchedulers.clear();
+    m_qosSgSched.clear();
+    m_qosQueueSched.clear();
+    m_qosWreds.clear();
+    m_qosQueueWred.clear();
+    m_qosPools.clear();
+    for (int i = 0; i < 4; i++)
+    {
+        m_qosIngressSpUsed[i] = false;
+        m_qosEgressSpUsed[i] = false;
+    }
+    m_qosProfiles.clear();
+    m_qosPgProfile.clear();
+    m_qosQueueProfile.clear();
+    m_qosPgPending.clear();
+
+    m_mirrorSessions.clear();
+    m_portIngMirrors.clear();
+    m_portEgrMirrors.clear();
+    m_statPoolUser.clear();
+}
+
+sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
+{
+    SWSS_LOG_ENTER();
+
+    if (!m_hwReady)
+    {
+        SWSS_LOG_ERROR("wb fallback: hardware not initialized");
+        return SAI_STATUS_FAILURE;
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Ensure warm-shutdown flags stay clear after cold fallback until syncd
+    // explicitly asks for a future warm shutdown.
+    m_restartWarm = false;
+    m_uninitDataPlaneOnRemoval = false;
+    m_warmSynced = false;
+    m_preShutdown = false;
+
+    // Cold init re-started KNET DMA rings; consume any stale dma_idle marker
+    // from the previous warm shutdown so a later syncd restart sees live state.
+    {
+        std::string dmaMarker = warmBootBasePath(false) + ".dma_idle";
+        if (unlink(dmaMarker.c_str()) == 0)
+        {
+            SWSS_LOG_NOTICE("wb fallback: consumed %s", dmaMarker.c_str());
+        }
+    }
+
+    // Build port OID <-> BCM port maps WITHOUT overwriting stored SPEED/MTU in
+    // m_objectHash (buildPortMaps(true) would clobber stored values with cold
+    // SDK defaults before we push them to hardware below).
+    CHECK_STATUS(buildPortMaps(/*applyDefaults=*/false));
+
+    size_t errors = 0;
+    auto sortedKeys = [&](sai_object_type_t ot) -> std::vector<std::string>
+    {
+        std::vector<std::string> keys;
+        auto oit = m_objectHash.find(ot);
+        if (oit != m_objectHash.end())
+        {
+            keys.reserve(oit->second.size());
+            for (const auto &kv : oit->second)
+            {
+                keys.push_back(kv.first);
+            }
+            std::sort(keys.begin(), keys.end());
+        }
+        return keys;
+    };
+
+    auto collectAttrs = [&](sai_object_type_t ot, const std::string &serialized) -> std::vector<sai_attribute_t>
+    {
+        std::vector<sai_attribute_t> out;
+        auto oit = m_objectHash.find(ot);
+        if (oit == m_objectHash.end())
+        {
+            return out;
+        }
+        auto it = oit->second.find(serialized);
+        if (it == oit->second.end())
+        {
+            return out;
+        }
+        out.reserve(it->second.size());
+        for (const auto &akv : it->second)
+        {
+            if (akv.second != nullptr && akv.second->getAttr() != nullptr)
+            {
+                out.push_back(*akv.second->getAttr());
+            }
+        }
+        return out;
+    };
+
+    auto record = [&](sai_status_t st, size_t &okCnt, const char *what, const std::string &key)
+    {
+        if (st == SAI_STATUS_SUCCESS)
+        {
+            okCnt++;
+        }
+        else
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: replay %s %s failed: %s",
+                    what, key.c_str(), sai_serialize_status(st).c_str());
+        }
+    };
+
+    // 1. Switch global attributes (explicitly skipping RESTART_WARM /
+    //    PRE_SHUTDOWN / UNINIT_DATA_PLANE_ON_REMOVAL) + ECMP/LAG hash fields.
+    {
+        static const sai_attr_id_t swAttrs[] = {
+            SAI_SWITCH_ATTR_SRC_MAC_ADDRESS,
+            SAI_SWITCH_ATTR_FDB_AGING_TIME,
+            SAI_SWITCH_ATTR_ECMP_DEFAULT_HASH_SEED,
+            SAI_SWITCH_ATTR_LAG_DEFAULT_HASH_SEED,
+        };
+        for (auto id : swAttrs)
+        {
+            sai_attribute_t a;
+            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, id, a))
+            {
+                sai_status_t st = hwSetSwitch(&a);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    errors++;
+                    SWSS_LOG_ERROR("wb fallback: replay switch attr %d failed: %s",
+                            id, sai_serialize_status(st).c_str());
+                }
+            }
+        }
+
+        sai_object_id_t hashOids[2] = { m_ecmp_hash_id, m_lag_hash_id };
+        for (auto hid : hashOids)
+        {
+            sai_attribute_t a;
+            if (hid != SAI_NULL_OBJECT_ID &&
+                getStoredAttr(SAI_OBJECT_TYPE_HASH, hid, SAI_HASH_ATTR_NATIVE_HASH_FIELD_LIST, a))
+            {
+                sai_status_t st = hwSetHash(hid, &a);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    errors++;
+                    SWSS_LOG_ERROR("wb fallback: replay hash %s failed: %s",
+                            sai_serialize_object_id(hid).c_str(), sai_serialize_status(st).c_str());
+                }
+            }
+        }
+    }
+
+    // 2. Port attributes before L2/L3 (flow control, speed/autoneg, MTU, PVID).
+    //    PORT_VLAN_ID MUST precede ROUTER_INTERFACE so port-RIF dedicated VLAN
+    //    PVIDs override it; ADMIN_STATE is applied last after all tables exist.
+    size_t nPortsCfg = 0;
+    for (auto port_oid : m_port_list)
+    {
+        int bcm = bcmPortOf(port_oid);
+        if (bcm < 0)
+        {
+            continue;
+        }
+        nPortsCfg++;
+
+        sai_attribute_t a;
+        int tx = 0, rx = 0;
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_GLOBAL_FLOW_CONTROL_MODE, a))
+        {
+            tx = (a.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_TX_ONLY ||
+                  a.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_BOTH_ENABLE) ? 1 : 0;
+            rx = (a.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_RX_ONLY ||
+                  a.value.s32 == SAI_PORT_FLOW_CONTROL_MODE_BOTH_ENABLE) ? 1 : 0;
+        }
+        if (hwbcm_port_pause_set(bcm, tx, rx) < 0)
+        {
+            SWSS_LOG_WARN("wb fallback: hwbcm_port_pause_set(%d, %d, %d) failed", bcm, tx, rx);
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_SPEED, a) && a.value.u32 > 0)
+        {
+            sai_status_t st = hwSetPort(port_oid, &a);
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                errors++;
+                SWSS_LOG_ERROR("wb fallback: port %s speed %u failed: %s",
+                        sai_serialize_object_id(port_oid).c_str(), a.value.u32,
+                        sai_serialize_status(st).c_str());
+            }
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_MTU, a) && a.value.u32 > 0)
+        {
+            sai_status_t st = hwSetPort(port_oid, &a);
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                errors++;
+                SWSS_LOG_ERROR("wb fallback: port %s mtu %u failed: %s",
+                        sai_serialize_object_id(port_oid).c_str(), a.value.u32,
+                        sai_serialize_status(st).c_str());
+            }
+        }
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_PORT_VLAN_ID, a))
+        {
+            sai_status_t st = hwSetPort(port_oid, &a);
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                errors++;
+                SWSS_LOG_ERROR("wb fallback: port %s pvid %u failed: %s",
+                        sai_serialize_object_id(port_oid).c_str(), a.value.u16,
+                        sai_serialize_status(st).c_str());
+            }
+        }
+    }
+
+    // 3. HOSTIF (KNET netdevs)
+    size_t nHostif = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_HOSTIF))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_HOSTIF, key);
+        record(hwCreateHostif(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nHostif, "HOSTIF", key);
+    }
+
+    // 4. VLAN
+    size_t nVlans = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_VLAN))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_VLAN, key);
+        record(hwCreateVlan(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nVlans, "VLAN", key);
+    }
+
+    // 5. LAG & LAG_MEMBER
+    size_t nLags = 0, nLagMembers = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_LAG))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        record(hwCreateLag(oid), nLags, "LAG", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_LAG_MEMBER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_LAG_MEMBER, key);
+        record(hwCreateLagMember(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nLagMembers, "LAG_MEMBER", key);
+    }
+
+    // 6. VLAN_MEMBER, BRIDGE (1D), and non-tunnel BRIDGE_PORT FDB learning mode
+    size_t nVlanMembers = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_VLAN_MEMBER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_VLAN_MEMBER, key);
+        record(hwCreateVlanMember(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nVlanMembers, "VLAN_MEMBER", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_BRIDGE, key);
+        (void)hwCreateBridge(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE_PORT))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        sai_attribute_t typeAttr, learnAttr;
+        if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, oid, SAI_BRIDGE_PORT_ATTR_TYPE, typeAttr) &&
+            typeAttr.value.s32 == SAI_BRIDGE_PORT_TYPE_TUNNEL)
+        {
+            continue;
+        }
+        if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, oid, SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE, learnAttr))
+        {
+            (void)hwSetBridgePort(oid, &learnAttr);
+        }
+    }
+
+    // 7. L3: VIRTUAL_ROUTER -> ROUTER_INTERFACE -> NEIGHBOR_ENTRY ->
+    //        NEXT_HOP -> NEXT_HOP_GROUP -> NEXT_HOP_GROUP_MEMBER -> ROUTE_ENTRY
+    size_t nVrs = 0, nRifs = 0, nNeigh = 0, nNh = 0, nNhg = 0, nNhgMem = 0, nRoutes = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_VIRTUAL_ROUTER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_VIRTUAL_ROUTER, key);
+        record(hwCreateVirtualRouter(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nVrs, "VIRTUAL_ROUTER", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ROUTER_INTERFACE))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ROUTER_INTERFACE, key);
+        record(hwCreateRouterInterface(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nRifs, "ROUTER_INTERFACE", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY))
+    {
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, key);
+        record(hwCreateNeighbor(key, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nNeigh, "NEIGHBOR_ENTRY", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_NEXT_HOP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_NEXT_HOP, key);
+        record(hwCreateNextHop(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nNh, "NEXT_HOP", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_NEXT_HOP_GROUP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_NEXT_HOP_GROUP, key);
+        record(hwCreateNextHopGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nNhg, "NEXT_HOP_GROUP", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER, key);
+        record(hwCreateNextHopGroupMember(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nNhgMem, "NEXT_HOP_GROUP_MEMBER", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ROUTE_ENTRY))
+    {
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ROUTE_ENTRY, key);
+        sai_status_t st = hwCreateRoute(key, static_cast<uint32_t>(attrs.size()), attrs.data());
+        if (st == SAI_STATUS_SUCCESS)
+        {
+            hwCoppOnRoute(key);
+        }
+        record(st, nRoutes, "ROUTE_ENTRY", key);
+    }
+
+    // 8. VXLAN / EVPN / RIOT:
+    //    P2MP local VTEP tunnels first (so m_vtepSrcIp4 is set), then P2P remote
+    //    VTEP tunnels -> TUNNEL_MAP -> TUNNEL_MAP_ENTRY -> TUNNEL_TERM_TABLE_ENTRY
+    //    -> tunnel BRIDGE_PORTs.
+    size_t nTunnels = 0, nTunnelMapEntries = 0, nTunnelBps = 0;
+    {
+        auto tunnelKeys = sortedKeys(SAI_OBJECT_TYPE_TUNNEL);
+        for (int pass = 0; pass < 2; pass++)
+        {
+            for (const auto &key : tunnelKeys)
+            {
+                sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+                sai_deserialize_object_id(key, oid);
+                auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL, key);
+                auto *peer = findAttr(static_cast<uint32_t>(attrs.size()), attrs.data(), SAI_TUNNEL_ATTR_PEER_MODE);
+                auto *dst = findAttr(static_cast<uint32_t>(attrs.size()), attrs.data(), SAI_TUNNEL_ATTR_ENCAP_DST_IP);
+                bool p2p = (peer != nullptr && peer->value.s32 == SAI_TUNNEL_PEER_MODE_P2P && dst != nullptr);
+                if ((pass == 0 && p2p) || (pass == 1 && !p2p))
+                {
+                    continue;
+                }
+                record(hwCreateTunnel(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                        nTunnels, "TUNNEL", key);
+            }
+        }
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_TUNNEL_MAP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL_MAP, key);
+        (void)hwCreateTunnelMap(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY, key);
+        record(hwCreateTunnelMapEntry(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nTunnelMapEntries, "TUNNEL_MAP_ENTRY", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, key);
+        (void)hwCreateTunnelTermEntry(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE_PORT))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        sai_attribute_t typeAttr;
+        if (!getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, oid, SAI_BRIDGE_PORT_ATTR_TYPE, typeAttr) ||
+            typeAttr.value.s32 != SAI_BRIDGE_PORT_TYPE_TUNNEL)
+        {
+            continue;
+        }
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_BRIDGE_PORT, key);
+        record(hwCreateBridgePort(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nTunnelBps, "BRIDGE_PORT(tunnel)", key);
+    }
+
+    // 9. FDB_ENTRY (static local MACs + remote EVPN tunnel MACs -> RIOT neighbor re-resolve)
+    size_t nFdb = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_FDB_ENTRY))
+    {
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_FDB_ENTRY, key);
+        record(hwCreateFdbEntry(key, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nFdb, "FDB_ENTRY", key);
+    }
+    (void)hwVxlanRetryPending();
+
+    // 10. CoPP: POLICER -> HOSTIF_TRAP_GROUP -> HOSTIF_TRAP
+    size_t nTraps = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_POLICER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_POLICER, key);
+        (void)hwCreatePolicer(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP, key);
+        (void)hwCreateHostifTrapGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_HOSTIF_TRAP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_HOSTIF_TRAP, key);
+        sai_status_t st = hwCreateHostifTrap(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        if (st == SAI_STATUS_SUCCESS)
+        {
+            st = hwCoppOnTrapCreate(oid);
+        }
+        record(st, nTraps, "HOSTIF_TRAP", key);
+    }
+    hwCoppRefresh();
+
+    // 11. QoS / buffers (rebuilds queue/SG/PG maps and replays pools, maps,
+    //     schedulers, WRED, and buffer profiles from m_objectHash).
+    {
+        sai_status_t qst = qosBuildHwMap(/*warmBoot=*/false);
+        if (qst != SAI_STATUS_SUCCESS)
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: qosBuildHwMap(cold) failed: %s",
+                    sai_serialize_status(qst).c_str());
+        }
+    }
+
+    // 12. Mirror sessions + port ingress/egress mirror bindings (before ACL
+    //     so ACL mirror actions see the hardware mirror destinations immediately).
+    size_t nMirrors = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_MIRROR_SESSION))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_MIRROR_SESSION, key);
+        record(hwCreateMirrorSession(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nMirrors, "MIRROR_SESSION", key);
+    }
+    for (auto port_oid : m_port_list)
+    {
+        if (bcmPortOf(port_oid) < 0)
+        {
+            continue;
+        }
+        static const sai_attr_id_t mAttrs[2] = {
+            SAI_PORT_ATTR_INGRESS_MIRROR_SESSION,
+            SAI_PORT_ATTR_EGRESS_MIRROR_SESSION,
+        };
+        for (auto id : mAttrs)
+        {
+            sai_attribute_t a;
+            if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, id, a) && a.value.objlist.count > 0)
+            {
+                sai_status_t st = mirrorHwSetPort(port_oid, &a);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    errors++;
+                    SWSS_LOG_ERROR("wb fallback: port %s mirror attr %d failed: %s",
+                            sai_serialize_object_id(port_oid).c_str(), id,
+                            sai_serialize_status(st).c_str());
+                }
+            }
+        }
+    }
+
+    // 13. ACL: RANGE -> TABLE -> TABLE_GROUP -> TABLE_GROUP_MEMBER -> COUNTER
+    //          -> bind points -> ENTRY (bound before entries so each entry is
+    //          programmed once with its final scope).
+    size_t nAclTables = 0, nAclEntries = 0;
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_RANGE))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_RANGE, key);
+        sai_status_t st = hwCreateAclRange(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: replay ACL_RANGE %s failed: %s",
+                    key.c_str(), sai_serialize_status(st).c_str());
+        }
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_TABLE))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_TABLE, key);
+        record(hwCreateAclTable(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nAclTables, "ACL_TABLE", key);
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_TABLE_GROUP))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_TABLE_GROUP, key);
+        (void)hwCreateAclTableGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_TABLE_GROUP_MEMBER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_TABLE_GROUP_MEMBER, key);
+        sai_status_t st = hwCreateAclTableGroupMember(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: replay ACL_TABLE_GROUP_MEMBER %s failed: %s",
+                    key.c_str(), sai_serialize_status(st).c_str());
+        }
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_COUNTER))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_COUNTER, key);
+        (void)hwCreateAclCounter(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+    }
+    {
+        struct BindSpec
+        {
+            sai_object_type_t ot;
+            sai_attr_id_t attrId;
+        };
+        static const BindSpec specs[] = {
+            { SAI_OBJECT_TYPE_PORT,             SAI_PORT_ATTR_INGRESS_ACL },
+            { SAI_OBJECT_TYPE_PORT,             SAI_PORT_ATTR_EGRESS_ACL },
+            { SAI_OBJECT_TYPE_LAG,              SAI_LAG_ATTR_INGRESS_ACL },
+            { SAI_OBJECT_TYPE_LAG,              SAI_LAG_ATTR_EGRESS_ACL },
+            { SAI_OBJECT_TYPE_VLAN,             SAI_VLAN_ATTR_INGRESS_ACL },
+            { SAI_OBJECT_TYPE_VLAN,             SAI_VLAN_ATTR_EGRESS_ACL },
+            { SAI_OBJECT_TYPE_ROUTER_INTERFACE, SAI_ROUTER_INTERFACE_ATTR_INGRESS_ACL },
+            { SAI_OBJECT_TYPE_ROUTER_INTERFACE, SAI_ROUTER_INTERFACE_ATTR_EGRESS_ACL },
+            { SAI_OBJECT_TYPE_SWITCH,           SAI_SWITCH_ATTR_INGRESS_ACL },
+            { SAI_OBJECT_TYPE_SWITCH,           SAI_SWITCH_ATTR_EGRESS_ACL },
+            { SAI_OBJECT_TYPE_SWITCH,           SAI_SWITCH_ATTR_PRE_INGRESS_ACL },
+        };
+        for (const auto &sp : specs)
+        {
+            for (const auto &key : sortedKeys(sp.ot))
+            {
+                sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+                sai_deserialize_object_id(key, oid);
+                sai_attribute_t a;
+                if (getStoredAttr(sp.ot, oid, sp.attrId, a) && a.value.oid != SAI_NULL_OBJECT_ID)
+                {
+                    sai_status_t st = hwAclBind(sp.ot, oid, &a);
+                    if (st != SAI_STATUS_SUCCESS)
+                    {
+                        errors++;
+                        SWSS_LOG_ERROR("wb fallback: replay ACL bind %s %s attr %d failed: %s",
+                                sai_serialize_object_type(sp.ot).c_str(), key.c_str(),
+                                sp.attrId, sai_serialize_status(st).c_str());
+                    }
+                }
+            }
+        }
+    }
+    for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_ENTRY))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(key, oid);
+        auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_ENTRY, key);
+        record(hwCreateAclEntry(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nAclEntries, "ACL_ENTRY", key);
+    }
+
+    // 14. Port ADMIN_STATE last, now that VLAN/LAG/L3/VXLAN/KNET/CoPP/QoS/Mirror/ACL
+    //     are programmed in the ASIC.
+    size_t nPortsUp = 0;
+    for (auto port_oid : m_port_list)
+    {
+        int bcm = bcmPortOf(port_oid);
+        if (bcm < 0)
+        {
+            continue;
+        }
+        sai_attribute_t a;
+        if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_ADMIN_STATE, a) &&
+            a.value.booldata)
+        {
+            sai_status_t st = hwSetPort(port_oid, &a);
+            if (st == SAI_STATUS_SUCCESS)
+            {
+                nPortsUp++;
+            }
+            else
+            {
+                errors++;
+                SWSS_LOG_ERROR("wb fallback: port %s admin up failed: %s",
+                        sai_serialize_object_id(port_oid).c_str(),
+                        sai_serialize_status(st).c_str());
+            }
+        }
+
+        int up = 0;
+        if (hwbcm_port_link_get(bcm, &up) == 0)
+        {
+            sai_attribute_t oa;
+            oa.id = SAI_PORT_ATTR_OPER_STATUS;
+            oa.value.s32 = up ? SAI_PORT_OPER_STATUS_UP : SAI_PORT_OPER_STATUS_DOWN;
+            set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &oa);
+
+            uint32_t operSpeed = 0;
+            if (up)
+            {
+                int sp = 0;
+                if (hwbcm_port_speed_get(bcm, &sp) == 0 && sp > 0)
+                {
+                    operSpeed = static_cast<uint32_t>(sp);
+                }
+            }
+            oa.id = SAI_PORT_ATTR_OPER_SPEED;
+            oa.value.u32 = operSpeed;
+            set_internal(SAI_OBJECT_TYPE_PORT, sai_serialize_object_id(port_oid), &oa);
+        }
+    }
+
+    long elapsedMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+
+    SWSS_LOG_NOTICE("wb fallback: cold hardware replay complete in %ld ms "
+            "(ports=%zu admin_up=%zu hostif=%zu vlans=%zu vlan_mem=%zu lags=%zu lag_mem=%zu "
+            "vrs=%zu rifs=%zu neigh=%zu nh=%zu nhg=%zu/%zu routes=%zu "
+            "tunnels=%zu vnis=%zu tun_bp=%zu fdb=%zu traps=%zu mirrors=%zu acl=%zu/%zu errors=%zu)",
+            elapsedMs, nPortsCfg, nPortsUp, nHostif, nVlans, nVlanMembers, nLags, nLagMembers,
+            nVrs, nRifs, nNeigh, nNh, nNhg, nNhgMem, nRoutes,
+            nTunnels, nTunnelMapEntries, nTunnelBps, nFdb, nTraps, nMirrors,
+            nAclTables, nAclEntries, errors);
+
+    return SAI_STATUS_SUCCESS;
+}

@@ -370,33 +370,52 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
         sai_status_t wst = hwInitialize(/*warmBoot=*/true);
         if (wst == SAI_STATUS_SUCCESS)
         {
-            CHECK_STATUS(buildPortMaps(/*applyDefaults=*/false));
-            CHECK_STATUS(hwWarmRecoverKnet());
-            CHECK_STATUS(hwStateLoad(hwStatePath));
-            CHECK_STATUS(qosBuildHwMap(/*warmBoot=*/true));
+            wst = buildPortMaps(/*applyDefaults=*/false);
+            if (wst == SAI_STATUS_SUCCESS)
+            {
+                wst = hwWarmRecoverKnet();
+            }
+            if (wst == SAI_STATUS_SUCCESS)
+            {
+                wst = hwStateLoad(hwStatePath);
+            }
+            if (wst == SAI_STATUS_SUCCESS)
+            {
+                wst = qosBuildHwMap(/*warmBoot=*/true);
+            }
+            if (wst == SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_NOTICE("wb: true warm boot completed (zero ASIC resets, zero port flaps)");
+                return SAI_STATUS_SUCCESS;
+            }
 
-            SWSS_LOG_NOTICE("wb: true warm boot completed (zero ASIC resets, zero port flaps)");
-            return SAI_STATUS_SUCCESS;
+            SWSS_LOG_ERROR("wb: warm state recovery failed after SDK attach (%s); "
+                    "tearing down warm SDK and falling back to cold SDK init + full hardware replay",
+                    sai_serialize_status(wst).c_str());
+            hwTeardownForColdFallback();
         }
-
-        SWSS_LOG_ERROR("wb: warm SDK attach failed (%s); falling back to cold SDK init "
-                "(full ASIC reset, data-plane loss; knet verdict %d%s)",
-                sai_serialize_status(wst).c_str(), hwbcm_warm_knet_state(),
-                hwbcm_warm_knet_fresh() ? ", host kexec'd or KNET reloaded" : "");
+        else
+        {
+            SWSS_LOG_ERROR("wb: warm SDK attach failed (%s); falling back to cold SDK init + full hardware replay "
+                    "(full ASIC reset, data-plane loss; knet verdict %d%s)",
+                    sai_serialize_status(wst).c_str(), hwbcm_warm_knet_state(),
+                    hwbcm_warm_knet_fresh() ? ", host kexec'd or KNET reloaded" : "");
+        }
     }
     else
     {
         int ks = hwbcm_warm_knet_probe(scachePath.c_str());
         SWSS_LOG_ERROR("wb: warm boot sidecar files missing or invalid (scache_ok=%d hwstate_ok=%d); "
-                "falling back to cold SDK init (full ASIC reset, data-plane loss; knet verdict %d%s)",
+                "falling back to cold SDK init + full hardware replay "
+                "(full ASIC reset, data-plane loss; knet verdict %d%s)",
                 haveScache ? 1 : 0, haveHwState ? 1 : 0, ks,
                 ks == HWBCM_KNET_FRESH ? ", host kexec'd or KNET reloaded" : "");
     }
 
-    // Fallback: cold SDK init (preserves pre-warm-boot behavior on missing/corrupt files).
+    // Fallback: cold SDK init AND full replay of every restored SAI object into
+    // hardware so syncd's WARM path finds a programmed ASIC instead of an empty one.
     CHECK_STATUS(hwInitialize(/*warmBoot=*/false));
-    CHECK_STATUS(buildPortMaps(/*applyDefaults=*/true));
-    return qosBuildHwMap(/*warmBoot=*/false);
+    return hwColdFallbackReplay();
 }
 
 sai_status_t SwitchBCM56860HW::set_switch_default_attributes()

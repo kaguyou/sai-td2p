@@ -43,6 +43,12 @@
             /* SAI_OBJECT_TYPE_BRIDGE_PORT set handler (FDB learning mode freeze/unfreeze). */
             sai_status_t hwSetBridgePort(_In_ sai_object_id_t bp_id, _In_ const sai_attribute_t *attr);
 
+            /* Warm-boot fallback helpers: tear down a partially recovered warm
+             * attach cleanly, then replay every restored SAI object from
+             * m_objectHash into a freshly cold-initialized ASIC. */
+            void hwTeardownForColdFallback();
+            sai_status_t hwColdFallbackReplay();
+
             /* Accessors for anonymous-namespace shared L3 egresses in _l3.cpp. */
             void hwL3GetSharedEgress(_Out_ int &cpuEgr, _Out_ int &dropEgr) const;
             void hwL3RestoreSharedEgress(_In_ int cpuEgr, _In_ int dropEgr);

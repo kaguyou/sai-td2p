@@ -158,6 +158,7 @@
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE12_M_constructEmc@GLIBCXX_3.4.21
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE13_S_copy_charsEPcPKcS7_@GLIBCXX_3.4.21
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE14_M_replace_auxEmmmc@GLIBCXX_3.4.21
+                 U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE4swapERS4_@GLIBCXX_3.4.21
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE6resizeEmc@GLIBCXX_3.4.21
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE7reserveEm@GLIBCXX_3.4.21
                  U _ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE8_M_eraseEmm@GLIBCXX_3.4.21
