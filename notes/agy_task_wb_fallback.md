@@ -93,3 +93,40 @@ Tasks:
 5. Rebuild (ALL CHECKS PASSED), commit on wb-fallback, append "Round 3" (root cause, fix, sha256) to
    notes/agy_report_wb_fallback.md. Same rules as before: do not ssh to the switch, do not install, do not push,
    do not run sairedis/sync_from_sairedis.sh, do not touch ~/homelab/sai-td2p-p4 or ~/homelab/sonic-sairedis-p4.
+
+## Round 4 (2026-11-25 18:40, lead tested f0cf4e10 = fedf6e6 on the box) — NOT passed yet, one step further
+Logs: notes/f5a4_full.log.gz (file order, clock jumps back after kexec), notes/f5a4_bridge_views.txt (redis dump of
+BRIDGE/BRIDGE_PORT in ASIC_STATE and TEMP_ASIC_STATE + VIDTORID; TEMP was being rebuilt by the next orchagent try
+when dumped, the first two TEMP entries are the interesting ones).
+Good: `recalculated SAI_BRIDGE_ATTR_PORT_LIST: 6 (port=5, other=1)`, onSyncdStart OK, INIT_VIEW OK, orchagent
+`restored`. Then APPLY_VIEW fails (orchagent `Failed to notify syncd APPLY_VIEW -1` -> SIGABRT, loops):
+- `ERR syncd: performObjectSetTransition: current attribute is mandatory on create, crate and set, and object MATCHED,
+  FIXME oid:0x3a000000000cb9 SAI_BRIDGE_PORT_ATTR_BRIDGE_ID:oid:0x39000000000b3e`
+- `ERR syncd: applyView: Exception: processObjectForViewTransition: performObjectSetTransition on MATCHED object
+  (oid:0x3a000000000cb9) FAILED! bug?`
+- view counts: BRIDGE_PORT current 6, temporary 7.
+Lead's reading: 0x3a..cb9 is the TUNNEL bridge port (ASIC_STATE: TYPE=TUNNEL, TUNNEL_ID, BRIDGE_ID=default 1Q,
+ADMIN_STATE, LEARNING_MODE). Because PORT_LIST of the default 1Q bridge now contains it, orchagent's warm init
+(PortsOrch default bridge port enumeration: get PORT_LIST, then get TYPE of each) touches it in INIT_VIEW mode, so it
+lands in TEMP_ASIC_STATE as an "existing" object with only TYPE (`NULL NULL` + `SAI_BRIDGE_PORT_ATTR_TYPE=TUNNEL`).
+orchagent then creates its own tunnel bridge port (new VID, hence 7). The comparison matches cb9 by VID and cannot
+remove the mandatory BRIDGE_ID -> exception. So listing non-port bridge ports in SAI_BRIDGE_ATTR_PORT_LIST is what
+breaks the view comparison.
+Tasks:
+1. Verify that reading against orchagent (~/homelab/sonic-swss/orchagent/portsorch.cpp, removeDefaultBridgePorts /
+   the 1Q bridge PORT_LIST get) and syncd (processQuadInInitViewModeGet, ComparisonLogic). If it is right, change the
+   override so SAI_BRIDGE_ATTR_PORT_LIST of a bridge returns ONLY bridge ports that orchagent/syncd can treat as
+   default/discoverable ones: TYPE_PORT with a physical port (sorted by port as before); decide from the code whether
+   LAG-backed PORT and SUB_PORT ones must be listed or left out for the same reason (they are user-created too) and
+   say why. TUNNEL / 1D_ROUTER / 1Q_ROUTER / NEXT_HOP_GROUP bridge ports: not listed, no throw.
+   If you find the reading wrong, fix the real cause instead and explain.
+2. Check that leaving the tunnel bridge port out of discovery does not break syncd's warm start (RID/VID checks in
+   SaiSwitch::helperCheck*/redisUpdate*, "discovered" vs RIDTOVID) or the later comparison (current view cb9 with all
+   attrs vs the temp view's newly created tunnel bridge port must match as normal user objects, no remove+create of
+   the tunnel bridge port if avoidable; if a remove+create is unavoidable say what the data-plane effect is).
+3. Walk the rest of orchagent's warm init GETs the same way for our EVPN config (tunnel, tunnel map, tunnel term,
+   VNI, hostif trap group / policer / trap: the log shows trap group 6 vs 1, policer 6 vs 0, trap 11 vs 1 at
+   compare time — confirm that is only "orchagent has not re-created them yet" and not the same poisoning).
+4. Rebuild (ALL CHECKS PASSED), commit on wb-fallback, append "Round 4" to notes/agy_report_wb_fallback.md with root
+   cause, fix, commit, sha256. Same rules: no ssh to the switch, no install, no push, no sync_from_sairedis.sh, do
+   not touch ~/homelab/sai-td2p-p4 or ~/homelab/sonic-sairedis-p4.
