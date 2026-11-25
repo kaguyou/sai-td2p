@@ -3015,6 +3015,54 @@ sai_status_t SwitchBCM56860HW::set(
     return SAI_STATUS_SUCCESS;
 }
 
+sai_status_t SwitchBCM56860HW::bulkSet(
+        _In_ sai_object_type_t object_type,
+        _In_ const std::vector<std::string> &serialized_object_ids,
+        _In_ const sai_attribute_t *attr_list,
+        _In_ sai_bulk_op_error_mode_t mode,
+        _Out_ sai_status_t *object_statuses)
+{
+    SWSS_LOG_ENTER();
+
+    uint32_t object_count = (uint32_t)serialized_object_ids.size();
+
+    if (!object_count || !attr_list || !object_statuses)
+    {
+        SWSS_LOG_ERROR("Invalid arguments");
+        return SAI_STATUS_FAILURE;
+    }
+
+    sai_status_t status = SAI_STATUS_SUCCESS;
+    uint32_t it;
+
+    // SwitchStateBase::bulkSet calls set_internal() directly, bypassing our
+    // set() override (and therefore skipping HW programming for bulk queue/PG
+    // buffer profile bindings from SONiC BufferOrch). Route through set().
+    for (it = 0; it < object_count; it++)
+    {
+        object_statuses[it] = set(object_type, serialized_object_ids[it], &attr_list[it]);
+
+        if (object_statuses[it] != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("Failed to bulk-set attribute for object with type = %u", object_type);
+
+            status = SAI_STATUS_FAILURE;
+
+            if (mode == SAI_BULK_OP_ERROR_MODE_STOP_ON_ERROR)
+            {
+                break;
+            }
+        }
+    }
+
+    while (++it < object_count)
+    {
+        object_statuses[it] = SAI_STATUS_NOT_EXECUTED;
+    }
+
+    return status;
+}
+
 sai_status_t SwitchBCM56860HW::get(
         _In_ sai_object_type_t objectType,
         _In_ const std::string &serializedObjectId,
@@ -3054,6 +3102,46 @@ sai_status_t SwitchBCM56860HW::get(
         }
 
         return hwAclCounterGet(serializedObjectId, attr_count, attr_list);
+    }
+
+    if (m_hwReady && (objectType == SAI_OBJECT_TYPE_SWITCH || objectType == SAI_OBJECT_TYPE_BUFFER_POOL))
+    {
+        sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+        if (objectType == SAI_OBJECT_TYPE_BUFFER_POOL)
+        {
+            sai_deserialize_object_id(serializedObjectId, oid);
+        }
+
+        std::vector<sai_attribute_t> other;
+        std::vector<uint32_t> otherIdx;
+        bool anyHandled = false;
+
+        for (uint32_t i = 0; i < attr_count; i++)
+        {
+            bool handled = (objectType == SAI_OBJECT_TYPE_SWITCH)
+                    ? qosGetSwitchAttr(attr_list[i])
+                    : qosGetBufferPoolAttr(oid, attr_list[i]);
+            if (handled)
+            {
+                anyHandled = true;
+                continue;
+            }
+            other.push_back(attr_list[i]);
+            otherIdx.push_back(i);
+        }
+
+        if (anyHandled)
+        {
+            if (!other.empty())
+            {
+                CHECK_STATUS(SwitchBCM56850::get(objectType, serializedObjectId, (uint32_t)other.size(), other.data()));
+                for (size_t k = 0; k < other.size(); k++)
+                {
+                    attr_list[otherIdx[k]] = other[k];
+                }
+            }
+            return SAI_STATUS_SUCCESS;
+        }
     }
 
     return SwitchBCM56850::get(objectType, serializedObjectId, attr_count, attr_list);
