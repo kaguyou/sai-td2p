@@ -59,3 +59,37 @@ Tasks:
 2. Make a second warm start after a fallback not repeat the fallback forever: after a successful fallback replay,
    (re)write a valid scache/hwstate pair (or otherwise make the next warm start a true warm boot).
 3. Rebuild, commit on wb-fallback, append the root cause + fix to notes/agy_report_wb_fallback.md with the new sha256.
+
+## Round 3 (2026-11-25 18:15, lead tested 0eabfdd0 = a79f4b3 on the box) — NOT passed yet, new failure
+Logs: notes/f5a3_full.log.gz (syslog from the warm-reboot on; the clock jumps BACK ~3 min after kexec, so read it
+in file order, not by timestamp). Round 2 fixes work: `scrubbed 5 stale switch callback pointer(s)`, no segfault,
+`persisted fresh scache/hwstate snapshot`, `cold hardware replay complete in 5756 ms (ports=66 ... tunnels=3 vnis=1
+tun_bp=1 fdb=1 ... errors=0)`, `initialized switch ... in WARM boot mode`, tunnel oper-up reported after that.
+Then:
+- `syncd: onSyncdStart: on syncd start took 41.5 sec`
+- `ERR syncd: run: Runtime error during syncd init: :- refresh_bridge_port_list: bridge port is missing
+  SAI_BRIDGE_PORT_ATTR_PORT_ID, not supported yet, FIXME`
+- syncd stays alive but never serves the redis channel -> orchagent `Failed to notify syncd INIT_VIEW` after 60 s
+  -> SIGABRT -> swss restart churn.
+Cause as far as the lead read it: syncd's warm discovery GETs SAI_BRIDGE_ATTR_PORT_LIST on the default 1Q bridge;
+vslib `SwitchBCM56850::refresh_bridge_port_list` (SwitchBCM56850.cpp:467-597, throw at :571) sorts the bridge's
+bridge ports by SAI_BRIDGE_PORT_ATTR_PORT_ID and throws for any bridge port without PORT_ID. With EVPN up there is a
+TUNNEL bridge port (remote VTEP 10.1.0.2, tun_bp=1) on that bridge.
+Tasks:
+1. Confirm from the code whether a TRUE warm boot (no fallback) with a remote VTEP up hits the same throw (the
+   passing kexec test of 16:19 may have had no tunnel bridge port). Say so in the report either way, and say which
+   other callers reach refresh_bridge_port_list at runtime (e.g. orchagent/SaiDiscovery get of PORT_LIST).
+2. Fix it in OUR class (override refresh_bridge_port_list in SwitchBCM56860HW; do not edit upstream
+   SwitchBCM56850.cpp unless unavoidable): port-type bridge ports sorted by port as today, then every other bridge
+   port of that bridge (TUNNEL, SUB_PORT, 1D_ROUTER, 1Q_ROUTER with a bridge id, LAG-backed PORT type whose PORT_ID is
+   a LAG oid — check what the size check at :580 does with a LAG) appended in a stable order (oid). No throw, the
+   list must contain every bridge port whose BRIDGE_ID is this bridge.
+3. Grep the other refresh_* / warm_update_* paths syncd's warm discovery and SaiDiscovery walk (SwitchStateBase.cpp
+   refresh_read_only and the BCM56850 overrides) for the same kind of "not supported yet"/THROW on objects we do
+   create (tunnels, tunnel maps, VNI bridge ports, RIF on VFI, ACL, mirror, hostif trap groups, scheduler groups,
+   buffer/QoS) and fix or report each one, so the next on-box run does not stop at the next throw.
+4. A throw during syncd init must not leave a zombie syncd: check Syncd::run's catch (syncd/Syncd.cpp, "Runtime
+   error during syncd init") — upstream behaviour is what it is, do not change syncd; just report what it does.
+5. Rebuild (ALL CHECKS PASSED), commit on wb-fallback, append "Round 3" (root cause, fix, sha256) to
+   notes/agy_report_wb_fallback.md. Same rules as before: do not ssh to the switch, do not install, do not push,
+   do not run sairedis/sync_from_sairedis.sh, do not touch ~/homelab/sai-td2p-p4 or ~/homelab/sonic-sairedis-p4.
