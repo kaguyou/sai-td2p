@@ -66,3 +66,34 @@ Citations in `~/homelab/sonic-sairedis` and `sai-td2p-merge/deploy/ref`:
 - Branch: `wb-fallback`
 - Code commit: `7fa0365` (`wb: replay restored SAI DB into hardware on warm-boot cold fallback`)
 - `deploy/build/libsaivs.so.0.0.0` sha256: `94772b7cd6f8e3161352f95a2507d7d624c9cce53b68ddcad921ab9cb9970d75`
+
+---
+
+## 6. Round 2 — Root cause of `syncd` exit status 3 & fix
+
+### Root cause (`notes/f5a2_full.log.gz`)
+- Every single one of the 5 post-kexec warm-restart crashes (lines `78266`, `81376`, `82681`, `85097`, `87552`) was a **SIGSEGV** at the exact same stale PIE address `0x559cb1615050` (`error 14` = user instruction fetch on unmapped page):
+  - `syncd[13194]: segfault at 559cb1615050 ip 0000559cb1615050 ... error 14 in syncd[5632f6b62000+93000]`
+  - `dsserve: child /usr/bin/syncd exited status: 139` (128+11) -> `supervisord: exited: syncd (exit status 3; not expected)`.
+- Lines `87547`–`87552` show the exact trigger (1.8 ms apart): `vxlanNotifyTunnelOper: remote VTEP 10.1.0.2: tunnel oid:0x2a00000002 oper up reported` -> `segfault at 559cb1615050`.
+- **Why:** In `VirtualSwitchSaiInterface::create()` (`vslib/VirtualSwitchSaiInterface.cpp:708-728`), `init_switch()` runs `SwitchBCM56860HW::warm_boot_initialize_objects()` **before** line `728` calls `ss->create(SAI_OBJECT_TYPE_SWITCH, ..., attr_count, attr_list)` to overwrite `m_objectHash` with the new `syncd` process's live notification callback pointers. During `hwColdFallbackReplay()` step 8, `hwCreateBridgePort()` -> `vxlanTryBringUpVtep()` -> `vxlanNotifyTunnelOper()` (`SwitchBCM56860HW_vxlan.cpp:464-490`) read the **stale pre-kexec** `SAI_SWITCH_ATTR_PORT_STATE_CHANGE_NOTIFY` (`0x559cb1615050`) from `m_objectHash` and enqueued `EVENT_TYPE_NOTIFICATION`. `Sai::eventQueueThreadProc()` (`vslib/SaiEventQueue.cpp:70-71, 100-110`) dispatches `EVENT_TYPE_NOTIFICATION` without acquiring `MUTEX()` and immediately jumped to the dead address. (RID discovery / `SaiDiscovery` was fine — `m_objectHash` already preserves all restored RIDs.)
+
+### Fix
+1. **Eliminate stale callback dereference (`SwitchBCM56860HW.cpp`, `SwitchBCM56860HW_wb.inc.cpp`, `SwitchBCM56860HW_vxlan.cpp`, `SwitchBCM56860HW_wb.inc.h`):**
+   - `hwWarmScrubStaleCallbacks()` runs at the start of `warm_boot_initialize_objects()` and sets every non-readonly `SAI_ATTR_VALUE_TYPE_POINTER` attribute on `SAI_OBJECT_TYPE_SWITCH` in `m_objectHash` to `NULL` before any warm/fallback hardware work begins.
+   - `m_inWarmBootInit` (RAII-guarded) suppresses `vxlanNotifyTunnelOper()` during `warm_boot_initialize_objects()` and records `m_pendingVxlanOperNotify = true`.
+   - In `SwitchBCM56860HW::create()` under `SAI_OBJECT_TYPE_SWITCH` (after `SwitchBCM56850::create()` installs the new `syncd` process's live callback pointers), pending tunnel oper-up notifications are emitted for all `vpReady` remote VTEPs.
+2. **Prevent repeated fallback on subsequent warm starts (`SwitchBCM56860HW_wb.inc.cpp`):**
+   - Step 15 of `hwColdFallbackReplay()` calls `hwWarmSync()` (plus the read path if it differs from the write path) to atomically write a fresh `(.scache, .hwstate, .bootid)` snapshot matching the newly replayed ASIC, then clears `m_warmSynced = false` so future `PRE_SHUTDOWN` / destructor still syncs cleanly. Any subsequent warm start (even an unexpected `syncd` restart without clean warm shutdown) now enters the true warm-boot path.
+
+### Expected new syslog lines on the `hwstate`-delete test
+- `wb: scrubbed <N> stale switch callback pointer(s) from restored warm-boot state`
+- `wb fallback: persisted fresh scache/hwstate snapshot (/var/warmboot/sai-warmboot.bin) for subsequent warm boots`
+- `wb fallback: cold hardware replay complete in <N> ms (... errors=0)`
+- `vxlanNotifyTunnelOper: remote VTEP ... oper up reported` (now **after** `initialized switch ... in WARM boot mode`, with zero segfaults)
+
+### Round 2 build, commit & sha256
+- Build: `SAI_TD2P_DIR=$PWD SAIREDIS_DIR=~/homelab/sonic-sairedis-merge ./deploy/build_wb.sh --no-meta --force-archive` — **ALL CHECKS PASSED**.
+- Branch: `wb-fallback`
+- Code commit: `a79f4b3` (`wb: fix stale callback SIGSEGV and persist warm state after cold fallback`)
+- `deploy/build/libsaivs.so.0.0.0` sha256: `0eabfdd04968f037879a538b37b01dec24d2f744d5caac455b3a4b2d3c42cb55`
