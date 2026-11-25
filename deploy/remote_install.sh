@@ -3,7 +3,7 @@
 # Do not run by hand on the PC.
 #
 #   bash -s -- <lib-path-on-switch> <extra-profile-path> <gen_lanemap.py-path> [--stop] [--skip-load-test] [--devnode-only]
-#              [--plugin <warm-reboot_plugin-path-on-switch>]
+#              [--plugin <warm-reboot_plugin-path-on-switch>] [--qos-dir <hwsku-qos-dir-on-switch>]
 #
 # Everything is idempotent and never deletes the vendor library:
 #   1. /dev/linux-user-bde                 create (major from /proc/devices), chmod 666
@@ -13,18 +13,20 @@
 #                                           (+ host copy in /home/admin/sai-td2p/backup), then
 #                                           docker cp our lib over the file libsai.so.1 points to
 #   5. hwsku dir (host, sudo)               sai.profile -> sai.profile.vendor (once), write lanemap.ini,
-#                                           write sai.profile = vendor profile minus SAI_VS_* + extra keys
+#                                           write sai.profile = vendor profile minus SAI_VS_* + extra keys,
+#                                           install QoS/buffer templates (--qos-dir) if absent or different
 #   6. platform dir (host, sudo, --plugin)  warm-reboot_plugin + fast-reboot_plugin (kexec DMA guard)
 set -euo pipefail
 
 LIB="${1:?lib path}"; EXTRA="${2:?extra profile}"; GEN="${3:?gen_lanemap.py}"; shift 3
-STOP=0; LOADTEST=1; DEVNODE_ONLY=0; PLUGIN=""
+STOP=0; LOADTEST=1; DEVNODE_ONLY=0; PLUGIN=""; QOS_DIR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --stop) STOP=1 ;;
         --skip-load-test) LOADTEST=0 ;;
         --devnode-only) DEVNODE_ONLY=1 ;;
         --plugin) PLUGIN="${2:?--plugin needs a path}"; shift ;;
+        --qos-dir) QOS_DIR="${2:?--qos-dir needs a path}"; shift ;;
         *) echo "remote: unknown flag $1" >&2; exit 2 ;;
     esac
     shift
@@ -238,6 +240,22 @@ lm_host="${lm_ct/\/usr\/share\/sonic\/platform/\/usr\/share\/sonic\/device\/x86_
 lm_host="${lm_host/\/usr\/share\/sonic\/hwsku/$HWSKU}"
 [ -f "$lm_host" ] || die "lane map path in profile ($lm_ct) does not resolve on host ($lm_host)"
 log "lane map: container $lm_ct == host $lm_host"
+
+# --- 5b. hwsku QoS / buffer templates (copy only if absent or different) --------
+if [ -n "$QOS_DIR" ]; then
+    [ -d "$QOS_DIR" ] || die "QoS template dir $QOS_DIR not found"
+    for f in qos.json.j2 buffers.json.j2 buffers_defaults_t0.j2 buffers_defaults_t1.j2 pg_profile_lookup.ini; do
+        src="$QOS_DIR/$f"
+        dst="$HWSKU/$f"
+        [ -f "$src" ] || continue
+        if [ -f "$dst" ] && cmp -s "$src" "$dst"; then
+            log "$dst already up to date"
+        else
+            sudo install -m 644 -o root -g root "$src" "$dst"
+            log "installed $dst (sha256 $(sha "$dst"))"
+        fi
+    done
+fi
 
 # --- 6. platform warm-reboot / fast-reboot plugin (host side) --------------------
 # /usr/local/bin/warm-reboot (== fast-reboot) runs ${DEVPATH}/${PLATFORM}/<name>_plugin after
