@@ -95,6 +95,9 @@ namespace saivs
             virtual sai_status_t set_switch_default_attributes() override;
             virtual sai_status_t refresh_port_list(
                     _In_ const sai_attr_metadata_t *meta) override;
+            virtual sai_status_t refresh_bridge_port_list(
+                    _In_ const sai_attr_metadata_t *meta,
+                    _In_ sai_object_id_t bridge_id) override;
 
             sai_status_t hwCreatePort(_In_ sai_object_id_t port_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwSetPort(_In_ sai_object_id_t port_id, _In_ const sai_attribute_t *attr);

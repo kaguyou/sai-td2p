@@ -443,6 +443,148 @@ sai_status_t SwitchBCM56860HW::refresh_port_list(
     return SwitchBCM56850::refresh_port_list(meta);
 }
 
+sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
+        _In_ const sai_attr_metadata_t *meta,
+        _In_ sai_object_id_t bridge_id)
+{
+    SWSS_LOG_ENTER();
+
+    (void)meta;
+
+    auto me_port_list = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE, SAI_BRIDGE_ATTR_PORT_LIST);
+    auto m_port_id    = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_PORT_ID);
+    auto m_bridge_id  = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_BRIDGE_ID);
+    auto m_type       = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_BRIDGE_PORT, SAI_BRIDGE_PORT_ATTR_TYPE);
+
+    sai_attribute_t attr;
+
+    attr.id = SAI_SWITCH_ATTR_DEFAULT_1Q_BRIDGE_ID;
+    CHECK_STATUS(get(SAI_OBJECT_TYPE_SWITCH, m_switch_id, 1, &attr));
+    sai_object_id_t default_1q_bridge_id = attr.value.oid;
+
+    auto bpHashIt = m_objectHash.find(SAI_OBJECT_TYPE_BRIDGE_PORT);
+
+    // Populate default 1Q BRIDGE_ID on TYPE_PORT bridge ports created without one
+    // (SAI makes BRIDGE_ID optional for TYPE_PORT, defaulting to the 1Q bridge).
+    if (bpHashIt != m_objectHash.end())
+    {
+        for (const auto &bp : bpHashIt->second)
+        {
+            auto it = bp.second.find(m_type->attridname);
+            if (it == bp.second.end() || it->second == nullptr)
+            {
+                continue;
+            }
+            if (it->second->getAttr()->value.s32 != SAI_BRIDGE_PORT_TYPE_PORT)
+            {
+                continue;
+            }
+            if (bp.second.find(m_bridge_id->attridname) != bp.second.end())
+            {
+                continue;
+            }
+
+            SWSS_LOG_NOTICE("setting default bridge id (%s) on bridge port %s",
+                    sai_serialize_object_id(default_1q_bridge_id).c_str(),
+                    bp.first.c_str());
+
+            attr.id = SAI_BRIDGE_PORT_ATTR_BRIDGE_ID;
+            attr.value.oid = default_1q_bridge_id;
+
+            CHECK_STATUS(set_internal(SAI_OBJECT_TYPE_BRIDGE_PORT, bp.first, &attr));
+        }
+    }
+
+    // Collect every bridge port whose BRIDGE_ID equals bridge_id.
+    // std::map keeps them in stable ascending sai_object_id_t order.
+    std::map<sai_object_id_t, SwitchState::AttrHash> bridge_port_list_on_bridge_id;
+
+    if (bpHashIt != m_objectHash.end())
+    {
+        for (const auto &bp : bpHashIt->second)
+        {
+            auto it = bp.second.find(m_bridge_id->attridname);
+            if (it == bp.second.end() || it->second == nullptr)
+            {
+                // Expected on the default 1Q_ROUTER bridge port (no BRIDGE_ID).
+                SWSS_LOG_NOTICE("not found %s on bridge port: %s", m_bridge_id->attridname, bp.first.c_str());
+                continue;
+            }
+
+            if (bridge_id == it->second->getAttr()->value.oid)
+            {
+                sai_object_id_t bridge_port = SAI_NULL_OBJECT_ID;
+                sai_deserialize_object_id(bp.first, bridge_port);
+                bridge_port_list_on_bridge_id[bridge_port] = bp.second;
+            }
+        }
+    }
+
+    // Pass 1: physical-port TYPE_PORT bridge ports in m_port_list order (same
+    // order as SwitchBCM56850).
+    std::map<sai_object_id_t, std::vector<sai_object_id_t>> portToBps;
+    for (const auto &bp : bridge_port_list_on_bridge_id)
+    {
+        auto tit = bp.second.find(m_type->attridname);
+        if (tit == bp.second.end() || tit->second == nullptr ||
+            tit->second->getAttr()->value.s32 != SAI_BRIDGE_PORT_TYPE_PORT)
+        {
+            continue;
+        }
+        auto pit = bp.second.find(m_port_id->attridname);
+        if (pit == bp.second.end() || pit->second == nullptr)
+        {
+            continue;
+        }
+        portToBps[pit->second->getAttr()->value.oid].push_back(bp.first);
+    }
+
+    std::vector<sai_object_id_t> bridge_port_list;
+    bridge_port_list.reserve(bridge_port_list_on_bridge_id.size());
+    std::set<sai_object_id_t> placed;
+
+    for (const auto &p : m_port_list)
+    {
+        auto pit = portToBps.find(p);
+        if (pit == portToBps.end())
+        {
+            continue;
+        }
+        for (sai_object_id_t bp_oid : pit->second)
+        {
+            if (placed.insert(bp_oid).second)
+            {
+                bridge_port_list.push_back(bp_oid);
+            }
+        }
+    }
+
+    // Pass 2: append every other bridge port of this bridge in stable ascending
+    // OID order (TUNNEL, SUB_PORT, 1D_ROUTER, 1Q_ROUTER with BRIDGE_ID,
+    // BRIDGE_PORT_NEXT_HOP_GROUP, LAG-backed PORT whose PORT_ID is a LAG OID).
+    for (const auto &bp : bridge_port_list_on_bridge_id)
+    {
+        if (placed.find(bp.first) == placed.end())
+        {
+            bridge_port_list.push_back(bp.first);
+        }
+    }
+
+    uint32_t bridge_port_list_count = (uint32_t)bridge_port_list.size();
+
+    SWSS_LOG_NOTICE("recalculated %s: %u (port=%zu, other=%zu)",
+            me_port_list->attridname,
+            bridge_port_list_count,
+            placed.size(),
+            bridge_port_list.size() - placed.size());
+
+    attr.id = SAI_BRIDGE_ATTR_PORT_LIST;
+    attr.value.objlist.count = bridge_port_list_count;
+    attr.value.objlist.list = bridge_port_list.data();
+
+    return set_internal(SAI_OBJECT_TYPE_BRIDGE, sai_serialize_object_id(bridge_id), &attr);
+}
+
 // ---------------------------------------------------------------------------
 // ports
 // ---------------------------------------------------------------------------
