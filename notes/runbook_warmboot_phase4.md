@@ -123,7 +123,11 @@ hook will always take the rmmod path.
 SW$ sudo config warm_restart disable syncd           # else warm-reboot aborts (check_warm_restart_in_progress)
 SW$ sonic-installer list                             # Next == Current (same image only)
 SW$ cat /sys/kernel/kexec_loaded                     # 0
-SW$ docker exec swss orchagent_restart_check -w 2000 -r 1   # must succeed (pause + resume)
+SW$ docker exec swss orchagent_restart_check -n -w 2000 -r 1   # must succeed. -n is REQUIRED: without it orchagent
+   # stays frozen (there is no resume) and warm-reboot then fails with "RESTARTCHECK failed" (code 10);
+   # recover with: config warm_restart enable swss; systemctl restart swss; config warm_restart disable swss
+   # SONiC 202505 warm-reboot aborts (code 30, "leftover CPA tunnel") whenever ASIC_DB has a VXLAN tunnel,
+   # i.e. with any EVPN config. Run a copy with that check skipped: /home/admin/sai-td2p/wr/warm-reboot
    # start the traffic harness (L2 flow, then L3 in a second run) and the serial capture
 SW$ sudo warm-reboot -v
 ```
