@@ -39,3 +39,23 @@ A warm boot whose SAI-side state cannot be used must end in a correctly programm
 ## Report
 notes/agy_report_wb_fallback.md: syncd behaviour found (file:line), decision + why, diff summary, commits,
 sha256 of deploy/build/libsaivs.so.0.0.0. Short.
+
+## Round 2 (2026-11-25 17:35, lead tested 94772b7c on the box) — NOT passed yet
+Logs: notes/f5a2_full.log.gz (syncd/orchagent/swss lines of syslog.1+syslog, clock jumps backwards after kexec).
+Sequence (line numbers in the unzipped file):
+- 83544 17:08:10 `sidecar files missing ... falling back to cold SDK init + full hardware replay`
+- 85093 17:08:52 `hwColdFallbackReplay: ... replay complete in 4397 ms (ports=66 admin_up=66 hostif=66 ...)` — replay itself OK
+- 17:08:52 last syncd lines are syncOnLinkMsg newlink for all Ethernet*, then
+  `supervisord: WARN exited: syncd (exit status 3; not expected)` at 17:08:55 — syncd DIED ~3 s after the replay.
+- 85209 17:09:05 orchagent `Failed to notify syncd INIT_VIEW` -> abort -> swss restart -> syncd starts WARM again
+  (85409 17:09:18 fallback again, since hwstate is still missing) -> orchagent timeouts/aborts at 17:10:05 and 17:13:10
+  -> finally a cold start at 17:14:54 when the warm flag expired. Total ~6 min of churn; end state OK.
+Tasks:
+1. Find why syncd exits with status 3 right after a successful replay (look for the ERR/throw just before line ~85200;
+   sairedis Syncd warm path: helperDiscover / checkWarmBootDiscoveredRids / RID-VID consistency, onSyncdStart,
+   exit codes). A cold ASIC reset may make discovered RIDs differ from the saved ones (default queues, scheduler
+   groups, PGs, CPU port, default VLAN/bridge/1Q bridge ports, hostif trap group...). Make the replay keep every RID
+   that syncd will compare, or make discovery after fallback report exactly the restored objects.
+2. Make a second warm start after a fallback not repeat the fallback forever: after a successful fallback replay,
+   (re)write a valid scache/hwstate pair (or otherwise make the next warm start a true warm boot).
+3. Rebuild, commit on wb-fallback, append the root cause + fix to notes/agy_report_wb_fallback.md with the new sha256.
