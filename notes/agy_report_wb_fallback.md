@@ -97,3 +97,55 @@ Citations in `~/homelab/sonic-sairedis` and `sai-td2p-merge/deploy/ref`:
 - Branch: `wb-fallback`
 - Code commit: `a79f4b3` (`wb: fix stale callback SIGSEGV and persist warm state after cold fallback`)
 - `deploy/build/libsaivs.so.0.0.0` sha256: `0eabfdd04968f037879a538b37b01dec24d2f744d5caac455b3a4b2d3c42cb55`
+
+---
+
+## 7. Round 3 — `refresh_bridge_port_list` throw on warm discovery with tunnel/LAG bridge ports
+
+### Root cause (`notes/f5a3_full.log.gz`)
+- Round 2 fixes succeeded cleanly (`scrubbed 5 stale switch callback pointer(s)`, `cold hardware replay complete ... (ports=66 ... tunnels=3 vnis=1 tun_bp=1 fdb=1 ... errors=0)`, `persisted fresh scache/hwstate snapshot`, `initialized switch ... in WARM boot mode`, `vxlanNotifyTunnelOper ... oper up reported` with zero segfaults).
+- Immediately after `create(SAI_OBJECT_TYPE_SWITCH)` returned, `Syncd::performWarmRestartSingleSwitch()` (`syncd/Syncd.cpp:5294`) constructed `SaiSwitch(..., true)` -> `SaiSwitch::helperDiscover()` (`syncd/SaiSwitch.cpp:52,711`) -> `SaiDiscovery::discover(m_switch_rid)` (`syncd/SaiDiscovery.cpp:249`).
+- Walking `SAI_SWITCH_ATTR_DEFAULT_1Q_BRIDGE_ID` -> `SAI_BRIDGE_ATTR_PORT_LIST` entered `SwitchStateBase::get()` -> `refresh_read_only()` (`vslib/SwitchStateBase.cpp:2697-2700`) -> `SwitchBCM56850::refresh_bridge_port_list()` (`vslib/SwitchBCM56850.cpp:467-597`).
+- `SwitchBCM56850::refresh_bridge_port_list()` has **two** throws (already flagged by upstream's `// XXX possible issues with vxlan and lag.` at `:473`):
+  1. **`:571`:** throws `"bridge port is missing SAI_BRIDGE_PORT_ATTR_PORT_ID, not supported yet, FIXME"` on any bridge port belonging to the bridge without `PORT_ID` — hit immediately by the EVPN remote VTEP's `SAI_BRIDGE_PORT_TYPE_TUNNEL` bridge port (`tun_bp=1`), and equally applicable to `1D_ROUTER`, `1Q_ROUTER` (with `BRIDGE_ID`), and `BRIDGE_PORT_NEXT_HOP_GROUP`.
+  2. **`:583`:** throws `"filter by port id failed size on lists is different"` on any `SAI_BRIDGE_PORT_TYPE_PORT` (or `SUB_PORT`) whose `PORT_ID` is a **LAG** OID, because the filter loop at `:563` only scans physical `m_port_list` and omits LAGs.
+
+### Task 1: True warm boot & other runtime callers
+- **Confirmed: a TRUE warm boot (no fallback) with a remote VTEP (or LAG bridge port) up hits the exact same throw.** Both true warm boot and cold-fallback replay populate `m_objectHash` from `/var/warmboot/sai-warmboot.bin` and return `SAI_STATUS_SUCCESS` from `create(SWITCH)`, after which `performWarmRestartSingleSwitch()` unconditionally runs `SaiSwitch::helperDiscover()` -> `SaiDiscovery::discover()` -> `get(BRIDGE, default_1q_bridge, SAI_BRIDGE_ATTR_PORT_LIST)` -> `refresh_bridge_port_list()`. The passing 16:19 kexec test did not have a tunnel (or LAG) bridge port on the 1Q bridge.
+- **All callers reaching `refresh_bridge_port_list()` at runtime:**
+  1. `syncd` `SaiSwitch::helperDiscover()` -> `SaiDiscovery::discover(m_switch_rid)` (`syncd/SaiSwitch.cpp:52,711`, `syncd/SaiDiscovery.cpp:249`) on **every** switch create (cold boot, true warm boot, fallback warm boot, and `SingleReiniter` hard reinit).
+  2. `orchagent` (`PortsOrch` default bridge-port enumeration) via `get_bridge_attribute(gDefault1QBridgeId, SAI_BRIDGE_ATTR_PORT_LIST)` during warm restart `INIT_VIEW` (`Syncd::processQuadInInitViewModeGet`, `syncd/Syncd.cpp:2959` calls `m_vendorSai->get()` directly) and during normal `APPLY_VIEW` (`Syncd::processOid` `SAI_COMMON_API_GET`, e.g. on `swss` restart while `syncd` stays up with EVPN/LAG configured).
+  3. Any other SAI client or vslib test (`vslib/tests.cpp:441`) calling `get` on `SAI_BRIDGE_ATTR_PORT_LIST`.
+
+### Task 2: Fix (`SwitchBCM56860HW.h`, `SwitchBCM56860HW.cpp`)
+- Overrode `SwitchBCM56860HW::refresh_bridge_port_list()` (upstream `SwitchBCM56850.cpp` untouched):
+  - Preserves setting `SAI_BRIDGE_PORT_ATTR_BRIDGE_ID = default_1q_bridge_id` on `SAI_BRIDGE_PORT_TYPE_PORT` bridge ports that omit it (using `set_internal()`).
+  - Collects every bridge port whose `BRIDGE_ID == bridge_id` in a `std::map<sai_object_id_t, ...>` (ascending OID order), keeping the existing skip of the default `1Q_ROUTER` bridge port that has no `BRIDGE_ID`.
+  - **Pass 1:** Emits physical-port `SAI_BRIDGE_PORT_TYPE_PORT` bridge ports sorted in `m_port_list` order (identical to `SwitchBCM56850`).
+  - **Pass 2:** Appends every remaining bridge port of that bridge (`TUNNEL`, `SUB_PORT`, `1D_ROUTER`, `1Q_ROUTER` with `BRIDGE_ID`, `BRIDGE_PORT_NEXT_HOP_GROUP`, and LAG-backed `PORT` whose `PORT_ID` is a LAG OID) in stable ascending OID order, with zero throws and exact count parity by construction.
+- Verified downstream `syncd` compatibility: `SaiDiscovery::discover()` skips `SAI_BRIDGE_PORT_ATTR_TUNNEL_ID` and `SAI_BRIDGE_PORT_ATTR_RIF_ID` (`SaiDiscovery.cpp:171-172`), handles `NOT_IMPLEMENTED` on `PORT_ID` gracefully (`:188-200`), and `ComparisonLogic::populateExistingObjects()` (`ComparisonLogic.cpp:2394-2458`) treats non-cold-boot-discovered user objects (tunnel BPs, LAG BPs, LAGs) as normal user objects to match against `temporaryView`.
+
+### Task 3: Audit of other `refresh_*` / `warm_update_*` / `SaiDiscovery` paths
+Audited all `SWSS_LOG_THROW`, `refresh_read_only()` (`SwitchStateBase.cpp:2553-2761`), `refresh_*`, `warm_update_*` (`SwitchStateBase.cpp:1926-2536`, `SwitchBCM56850.cpp:467-658`), and every RO `OBJECT_ID`/`OBJECT_LIST` attribute in `saimetadata.c` for all object types we create:
+- **`TUNNEL` / `TUNNEL_MAP` / `TUNNEL_MAP_ENTRY` / `TUNNEL_TERM_TABLE_ENTRY`:** `SAI_TUNNEL_ATTR_TERM_TABLE_ENTRY_LIST` and `SAI_TUNNEL_MAP_ATTR_ENTRY_LIST` are not in `refresh_read_only()` -> return `SAI_STATUS_NOT_IMPLEMENTED` (no throw; `SaiDiscovery` skips `NOT_IMPLEMENTED` and also skips `BRIDGE_PORT_ATTR_TUNNEL_ID`).
+- **VNI / 1D `BRIDGE` & `BRIDGE_PORT`:** `refresh_bridge_port_list` was the only thrower (both `:571` and `:583` fixed above).
+- **`ROUTER_INTERFACE` (including RIF on VFI):** no RO OID/OBJLIST attributes; `SaiDiscovery` skips `BRIDGE_PORT_ATTR_RIF_ID`. No throw.
+- **ACL (`ACL_TABLE`, `ACL_TABLE_GROUP`, `MEMBER`, `ENTRY`, `COUNTER`, `RANGE`):** `refresh_acl_table_entries()` / `refresh_acl_table_counters()` use safe `findObjects()`; `ENTRY_LIST` / `MEMBER_LIST` / `CHAIN_GROUP_LIST` return `NOT_IMPLEMENTED` (no throw); `ACL_COUNTER` stats handled in `SwitchBCM56860HW::get()`.
+- **`MIRROR_SESSION`:** no RO OID/OBJLIST attributes; stored `MONITOR_PORT`/`POLICER` walked cleanly if bound to a port. No throw.
+- **`HOSTIF` / `HOSTIF_TRAP` / `HOSTIF_TRAP_GROUP` / `POLICER`:** no RO OID/OBJLIST attributes. No throw.
+- **`SCHEDULER_GROUP` / `QUEUE` / `INGRESS_PRIORITY_GROUP` / `BUFFER_POOL` / `BUFFER_PROFILE` / `SCHEDULER` / `WRED` / `QOS_MAP`:** `refresh_scheduler_groups()`, `refresh_qos_queues()`, `refresh_ingress_priority_group()` are no-ops returning `SUCCESS`; `refresh_queue_pause_status()` returns `SUCCESS`; `warm_update_queues()` (`SwitchBCM56850.cpp:599`), `warm_update_scheduler_groups()`, `warm_update_ingress_priority_groups()`, `warm_update_cpu_queues()`, `warm_update_switch()` only iterate `m_port_list`/`m_cpu_port_id` with `CHECK_STATUS` (no throw). `PORT_POOL_LIST` returns `NOT_IMPLEMENTED` (skipped).
+- **`LAG` / `LAG_MEMBER`:** `SAI_LAG_ATTR_PORT_LIST` returns `NOT_IMPLEMENTED` (skipped by `SaiDiscovery`); LAG bridge ports on `default_1q_bridge` are now handled without throwing by our `refresh_bridge_port_list()` override.
+- **`VLAN` / `VLAN_MEMBER`:** `refresh_vlan_member_list()` (`SwitchStateBase.cpp:2241-2294`) uses `.at(SAI_VLAN_MEMBER_ATTR_VLAN_ID)` which is `MANDATORY_ON_CREATE` on every valid `VLAN_MEMBER`; no throw.
+- **`PORT`:** `refresh_port_list()`, `refresh_port_serdes_id()`, `SwitchBCM56860HW::refresh_port_oper_speed()` all use safe `.find()` / `getStoredAttr` with no throws.
+- **Conclusion:** `SwitchBCM56850::refresh_bridge_port_list()` (`:571` and `:583`) were the **only** runtime-reachable `"not supported yet"`/THROW sites across `SwitchStateBase`, `SwitchBCM56850`, and `SwitchBCM56860HW`.
+
+### Task 4: Why an init throw leaves a zombie `syncd` (`syncd/Syncd.cpp:5753-5767`)
+- `Syncd::run()` catches `std::exception` thrown during `onSyncdStart()` (`:5753`), logs `Runtime error during syncd init: ...` (`:5755`), and calls `sendShutdownRequestAfterException()` (`:5757`, sending `SWITCH_SHUTDOWN_REQUEST` for `oid:0x0` since `m_switches` is still empty — missed if `orchagent` is not yet subscribed).
+- It then replaces the event-loop `Select` with **only** `m_restartQuery` (`:5759-5763` — dropping `m_selectableChannel` so `ASIC_STATE` / `INIT_VIEW` requests are never read) and checks `if (m_commandLineOptions->m_disableExitSleep) runMainLoop = false;` (`:5765-5766`).
+- Because `m_disableExitSleep` defaults to `false` (`syncd/CommandLineOptions.cpp:19`) and Broadcom's `syncd_init_common.sh` does not pass `-S`, `syncd` enters `while (runMainLoop)` parked on `m_restartQuery` forever instead of exiting. `supervisord` sees `syncd` alive, while `orchagent` times out waiting 60 s for `INIT_VIEW` and `SIGABRT`s in a loop. (Upstream `syncd` behaviour left unchanged.)
+
+### Round 3 build, commit & sha256
+- Build: `SAI_TD2P_DIR=$PWD SAIREDIS_DIR=~/homelab/sonic-sairedis-merge ./deploy/build_wb.sh --no-meta --force-archive` — **ALL CHECKS PASSED**.
+- Branch: `wb-fallback`
+- Code commit: `fedf6e6` (`wb: override refresh_bridge_port_list for tunnel/LAG/non-port bridge ports`)
+- `deploy/build/libsaivs.so.0.0.0` sha256: `f0cf4e1059f8b83c7177bfd34f3e71323499683852613efabb27f36348dc36b9`
