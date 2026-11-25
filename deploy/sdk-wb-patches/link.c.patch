@@ -1,0 +1,41 @@
+--- sdk-6.5.27/src/soc/common/link.c	2026-11-20 18:05:50.176849791 +0900
++++ sdk-6.5.27-wb/src/soc/common/link.c	2026-11-24 15:22:48.309359645 +0900
+@@ -17,6 +17,9 @@
+  * support is provided for the Serdes MAC.
+  */
+ 
++#if defined(LINUX)
++#include <syslog.h>
++#endif
+ #include <shared/bsl.h>
+ 
+ #include <sal/core/libc.h>
+@@ -167,6 +170,14 @@
+ 
+     SOC_PBMP_ASSIGN(pbm, sop->link_fwd);
+     SOC_PBMP_AND(pbm, soc->link_mask2);
++#if defined(BCM_WARM_BOOT_SUPPORT) && defined(LINUX)
++    /* sai-td2p: trace EPC_LINK updates while the unit is warm booting */
++    if (SOC_WARM_BOOT(unit)) {
++        char tb[SOC_PBMP_FMT_LEN];
++        syslog(LOG_WARNING, "sai-td2p wbtrace: _soc_link_update pbm=%s caller=%p",
++               SOC_PBMP_FMT(pbm, tb), __builtin_return_address(0));
++    }
++#endif
+ 
+ #if defined(BCM_SABER2_SUPPORT)
+     if (SOC_IS_SABER2(unit)) {
+@@ -357,6 +368,13 @@
+ int
+ soc_link_fwd_set(int unit, pbmp_t fwd)
+ {
++#if defined(BCM_WARM_BOOT_SUPPORT) && defined(LINUX)
++    if (SOC_WARM_BOOT(unit)) {
++        char tb[SOC_PBMP_FMT_LEN];
++        syslog(LOG_WARNING, "sai-td2p wbtrace: soc_link_fwd_set fwd=%s caller=%p",
++               SOC_PBMP_FMT(fwd, tb), __builtin_return_address(0));
++    }
++#endif
+     SOC_PERSIST(unit)->link_fwd = fwd;
+ 
+     return _soc_link_update(unit);
