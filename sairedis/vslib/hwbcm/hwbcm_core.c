@@ -2035,6 +2035,25 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             return rv;
         }
 
+        /* sdk-6.5.27-wb (src/soc/esw/trident2.c) allocates _fwd_ctrl_lock and
+         * _soc_td2_mmu_traffic_ctrl in soc_td2_mmu_traffic_ctrl_wb_restore()
+         * when soc_mmu_init() was skipped, so bcm_td2_cosq_reinit() advances
+         * scache_ptr and restores NUM_COS(unit) cleanly. Guard here in SW only
+         * (no HW writes) in case a pre-fix scache synced NUM_COS = 0. */
+        if (NUM_COS(unit) <= 0) {
+            int numq = soc_property_get(unit, spn_BCM_NUM_COS, BCM_COS_DEFAULT);
+            if (numq < 1) {
+                numq = 1;
+            } else if (numq > 8) {
+                numq = 8;
+            }
+            HWBCM_LOGW("hwbcm_init_ex[warm]: NUM_COS was %d after cosq reinit, restored %d (SW only)",
+                       NUM_COS(unit), numq);
+            NUM_COS(unit) = numq;
+        } else {
+            HWBCM_LOGI("hwbcm_init_ex[warm]: NUM_COS=%d (restored from scache)", NUM_COS(unit));
+        }
+
         if (SOC_WARM_BOOT(unit)) {
             SOC_WARM_BOOT_DONE(unit);
         }
@@ -2736,16 +2755,20 @@ int hwbcm_port_speed_set(int port, int speed_mbps, int autoneg)
         return BCM_E_PARAM;
     }
 
-    if (autoneg && g_desired_speed[port] == speed_mbps) {
-        /* Same request as the one already in effect (orchagent re-sends the
-         * port config after a warm restart). Re-running autoneg_set and the
-         * SGMII interface_set goes all the way to the copper PHY and drops
-         * the link, so leave a live port alone. */
+    if (autoneg) {
+        /* Autoneg is requested and the port already has AN on and link up
+         * (e.g. orchagent re-sends port config after a warm restart or kexec
+         * warm-reboot when g_desired_speed[port] is still 0). Re-running
+         * bcm_port_autoneg_set(1) and SGMII interface_set goes all the way to
+         * the BCM84858 copper PHY and drops the link, so leave a live port
+         * alone, record g_desired_speed, and keep g_sgmii_applied as marked by
+         * the warm probe. */
         int an = 0, link = 0;
         if (BCM_SUCCESS(bcm_port_autoneg_get(unit, port, &an)) && an &&
             BCM_SUCCESS(bcm_port_link_status_get(unit, port, &link)) &&
             link == BCM_PORT_LINK_STATUS_UP) {
-            HWBCM_LOGI("port %d: speed %d Mbps autoneg 1 unchanged, link up, not reprogrammed",
+            g_desired_speed[port] = speed_mbps;
+            HWBCM_LOGI("port %d: speed %d Mbps autoneg 1 already active, link up, not reprogrammed",
                        port, speed_mbps);
             return 0;
         }

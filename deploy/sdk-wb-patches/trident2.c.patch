@@ -1,0 +1,84 @@
+--- sdk-6.5.27/src/soc/esw/trident2.c	2026-11-20 18:05:50.764794576 +0900
++++ sdk-6.5.27-wb/src/soc/esw/trident2.c	2026-11-25 15:42:34.876184184 +0900
+@@ -13437,10 +13437,16 @@
+         SOC_IF_ERROR_RETURN
+             (WRITE_EGR_ENABLEm(unit, MEM_BLOCK_ALL, loopback_port, entry));
+     }
+-    sal_memset(entry, 0, ent_sz);
+-    soc_mem_pbmp_field_set(unit, EPC_LINK_BMAPm, entry, PORT_BITMAPf,
+-                           &PBMP_CMIC(unit));
+-    SOC_IF_ERROR_RETURN(WRITE_EPC_LINK_BMAPm(unit, MEM_BLOCK_ALL, 0, entry));
++    /* sai-td2p: on warm boot keep the live EPC_LINK_BMAP. Overwriting it with
++     * CMIC only stopped egress on every front port, and warm linkscan never
++     * rewrites it because it assumes the links stayed up (bcm/esw/link.c
++     * lc_warm_boot) - traffic died until a cold restart (2026-11-24). */
++    if (!SOC_WARM_BOOT(unit)) {
++        sal_memset(entry, 0, ent_sz);
++        soc_mem_pbmp_field_set(unit, EPC_LINK_BMAPm, entry, PORT_BITMAPf,
++                               &PBMP_CMIC(unit));
++        SOC_IF_ERROR_RETURN(WRITE_EPC_LINK_BMAPm(unit, MEM_BLOCK_ALL, 0, entry));
++    }
+ 
+ #ifdef BCM_TRIDENT2PLUS_SUPPORT
+     if ((SOC_IS_TRIDENT2PLUS(unit) || SOC_IS_TITAN2PLUS(unit))) {
+@@ -16030,15 +16036,19 @@
+     _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl_scache_p;
+     _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl;
+ 
++    if (scache_ptr == NULL || *scache_ptr == NULL) {
++        return SOC_E_NONE;
++    }
+     mmu_traffic_ctrl_scache_p =
+         (_soc_td2_mmu_traffic_ctrl_t *)(*scache_ptr);
+ 
+-
+     mmu_traffic_ctrl = _soc_td2_mmu_traffic_ctrl[unit];
+-    if (mmu_traffic_ctrl == NULL || mmu_traffic_ctrl_scache_p == NULL) {
+-        return SOC_E_NONE;
++    if (mmu_traffic_ctrl == NULL) {
++        /* sai-td2p: keep scache layout aligned even if soc_mmu_init was skipped */
++        sal_memset(mmu_traffic_ctrl_scache_p, 0, sizeof(_soc_td2_mmu_traffic_ctrl_t));
++    } else {
++        sal_memcpy(mmu_traffic_ctrl_scache_p, mmu_traffic_ctrl, sizeof(_soc_td2_mmu_traffic_ctrl_t));
+     }
+-    sal_memcpy(mmu_traffic_ctrl_scache_p, mmu_traffic_ctrl, sizeof(_soc_td2_mmu_traffic_ctrl_t));
+     mmu_traffic_ctrl_scache_p++;
+ 
+     *scache_ptr = (uint8 *)mmu_traffic_ctrl_scache_p;
+@@ -16051,14 +16061,33 @@
+     _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl_scache_p;
+     _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl;
+ 
++    if (scache_ptr == NULL || *scache_ptr == NULL) {
++        return SOC_E_NONE;
++    }
+     mmu_traffic_ctrl_scache_p =
+         (_soc_td2_mmu_traffic_ctrl_t *)(*scache_ptr);
+ 
++    /* sai-td2p: warm init skips soc_mmu_init (no warm guard on TD2+ LLS reset),
++     * so _fwd_ctrl_lock and _soc_td2_mmu_traffic_ctrl are NULL here. Allocate
++     * them in SW only so thdo_drop_bmp is restored and *scache_ptr advances;
++     * returning early without advancing *scache_ptr made bcm_td2_cosq_reinit
++     * read NUM_COS(unit) = 0 from thdo_drop_bmp[0..3] and shifted v1.6..1.8. */
++    if (_fwd_ctrl_lock[unit] == NULL) {
++        _fwd_ctrl_lock[unit] = sal_mutex_create("_fwd_ctrl_lock");
++        if (_fwd_ctrl_lock[unit] == NULL) {
++            return SOC_E_MEMORY;
++        }
++    }
++    if (_soc_td2_mmu_traffic_ctrl[unit] == NULL) {
++        _soc_td2_mmu_traffic_ctrl[unit] =
++            sal_alloc(sizeof(_soc_td2_mmu_traffic_ctrl_t), "_soc_td2_mmu_traffic_ctrl");
++        if (_soc_td2_mmu_traffic_ctrl[unit] == NULL) {
++            return SOC_E_MEMORY;
++        }
++        sal_memset(_soc_td2_mmu_traffic_ctrl[unit], 0, sizeof(_soc_td2_mmu_traffic_ctrl_t));
++    }
+ 
+     mmu_traffic_ctrl = _soc_td2_mmu_traffic_ctrl[unit];
+-    if (mmu_traffic_ctrl == NULL || mmu_traffic_ctrl_scache_p == NULL) {
+-        return SOC_E_NONE;
+-    }
+     sal_memcpy(mmu_traffic_ctrl, mmu_traffic_ctrl_scache_p, sizeof(_soc_td2_mmu_traffic_ctrl_t));
+     mmu_traffic_ctrl_scache_p++;
+ 
