@@ -33,7 +33,7 @@ netns hostA (192.168.52.50). Sender `tools/qos-test/udpblast.py` (UDP, IP TOS), 
 2. `config qos reload` on a running system leaves `SCHEDULER|scheduler.N` DEL+SET pending in orchagent
    (still referenced by queues), so the next warm-reboot is refused (`RESTARTCHECK failed`). Upstream
    behaviour; needs a swss restart (or avoid reloading twice).
-3. Template: queues use `egress_lossy_profile` (dynamic_th 3) and PGs `ingress_lossy_profile` (dynamic_th 3)
+3. (fixed, see below) Template: queues use `egress_lossy_profile` (dynamic_th 3) and PGs `ingress_lossy_profile` (dynamic_th 3)
    on equal pools, so with one ingress port feeding congested queues the ingress limit drops first
    (DROP_PKT_ING on the ingress port, no egress queue drops). `q_lossy_profile` is defined but unused.
 4. The build tree ~/homelab/sonic-sairedis-merge had a stale hwbcm_core.c: libs f0cf4e10 and 3b1688a3 were
@@ -69,3 +69,22 @@ topology setup) it became `ge0` and `xe39` moved to BCM port 41, which is down. 
 correct all along. Use port numbers in diag commands (`show c all 40`, `cos port show PortBitMap=40`). warmboot-finalizer saves whatever is in
 CONFIG_DB ~6 min after the warm boot (test entries got into config_db.json and were removed again).
 Log: notes/2026-11-26_wr-lls_syslog.log.gz.
+
+## Template fix for problem 3 (ingress drops before the egress queues)
+
+Test: one ingress port (Ethernet30), two flows 150 Mbit/s each (DSCP 8 -> UC0, DSCP 46 -> UC5, equal weights)
+into Ethernet39 shaped to 100 Mbit/s, 14 s (`tools/qos-test/ingdrop.sh`).
+
+| ingress_lossy_profile | DROP_PKT_ING (ingress port) | egress drops UC0 / UC5 | sent UC0 / UC5 |
+|---|---|---|---|
+| dynamic_th 3 (old template) | 142699 | 0 / 94986 | 61289 / 68698 |
+| static_th 12766208 (= declared pool) | 233632 | 0 / 0 | 35961 / 95491 |
+| static_th 16777216 (whole MMU, new template) | 0 | 118692 / 118772 | 65159 / 65069 |
+
+Why: the SAI records the SONiC pool size only; the hardware pools stay at the init-MMU values (ingress
+16.6 MB, egress 16.1 MB). Two congested queues at dynamic_th 3 can hold ~15 MB, more than a 12.8 MB PG
+limit, so the PG limit dropped first, blind to queue and colour. With the PG limit at the whole MMU the egress
+queues are the drop point and equal-weight queues share the port evenly.
+A live `static_th` change on the profile reaches the hardware (PG_SHARED_LIMIT 0xefc0 -> 0x13b14 on 288 PGs).
+Cold swss start and kexec warm-reboot with the new template: ok (true warm boot, QoS restored with zero HW
+writes, MMU tables identical before/after, PC carrier unchanged).

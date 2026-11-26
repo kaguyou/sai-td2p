@@ -3,6 +3,11 @@
 
 {%- set ingress_lossy_pool_size = '12766208' -%}
 {%- set egress_lossy_pool_size = '12766208' -%}
+{#- Lossy only: the egress queues must be the drop point. The PG limit is the whole MMU (16 MB), above what
+    the egress queues can hold (HW egress pool 16.1 MB, dynamic_th 3). With dynamic_th 3 or static = pool size
+    on the PGs, one ingress port feeding congested queues was dropped at ingress (DROP_PKT_ING), colour- and
+    queue-blind, before any queue reached its limit (measured 2026-11-26). -#}
+{%- set ingress_lossy_pg_static_th = '16777216' -%}
 
 {%- macro generate_buffer_pool_and_profiles() %}
     "BUFFER_POOL": {
@@ -21,7 +26,7 @@
         "ingress_lossy_profile": {
             "pool": "ingress_lossy_pool",
             "size": "0",
-            "dynamic_th": "3"
+            "static_th": "{{ ingress_lossy_pg_static_th }}"
         },
         "egress_lossy_profile": {
             "pool": "egress_lossy_pool",
