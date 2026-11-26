@@ -196,3 +196,24 @@ Audited every `get_*_attribute` call across `sonic-swss/orchagent/*.cpp`:
 - Branch: `wb-fallback`
 - Code commit: `191f790` (`wb: omit non-physical/user bridge ports from SAI_BRIDGE_ATTR_PORT_LIST`)
 - `deploy/build/libsaivs.so.0.0.0` sha256: `3b1688a3ea4cae6d0eb0c9d82f3d4ca7c3a16e9d883c945be7aec83a132fb7c5`
+
+---
+
+## 9. Round 4 hardware results (2026-11-26, lib 3b1688a3, commit 191f790)
+
+Remote VTEP = pseudo EVPN (APP_DB, 10.1.0.2 / Vlan200 / vni 2000), PC on Ethernet30. All passed:
+
+| test | result |
+|---|---|
+| syncd warm restart with a tunnel bridge port | no throw, `PORT_LIST: 6 (port=6, omitted=1)`, PC carrier unchanged |
+| normal kexec warm-reboot with the remote VTEP up | `true warm boot completed`, Case B 66/66, APPLY_VIEW ok (30 ops, none on the tunnel bridge port), all reconciled, PC carrier unchanged, CPU path down ~105 s |
+| failure path (hwstate deleted, then kexec), no tunnel | cold SDK init + hardware replay, APPLY_VIEW ok, reconciled, no manual recovery |
+| failure path with the tunnel bridge port (the case that failed in rounds 2-4) | replay `tun_bp=1 errors=0`, `omitted=1`, APPLY_VIEW ok, reconciled, VTEP kept |
+
+Not measured: data-plane loss (the PC hairpin harness needs root); only carrier and function were checked.
+Logs: `notes/2026-11-26_wr-evpn_syslog.log.gz`, `2026-11-26_f5a5_syslog.log.gz` (no tunnel),
+`2026-11-26_f5a6_syslog.log.gz` (tunnel), `2026-11-26_pc_linkmon.log` (PC carrier / SVI ping).
+
+Procedure notes: a warm-reboot is refused until warmboot-finalizer of the previous one has finished (~6 min),
+and the finalizer runs `config save`; the pseudo EVPN entries disappear after the post-warm reconcile and must be
+re-applied with swssconfig before each run.
