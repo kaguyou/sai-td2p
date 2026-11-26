@@ -38,7 +38,8 @@ netns hostA (192.168.52.50). Sender `tools/qos-test/udpblast.py` (UDP, IP TOS), 
    (DROP_PKT_ING on the ingress port, no egress queue drops). `q_lossy_profile` is defined but unused.
 4. The build tree ~/homelab/sonic-sairedis-merge had a stale hwbcm_core.c: libs f0cf4e10 and 3b1688a3 were
    built without 16c9d22 (NUM_COS guard) and 8d046dd (autoneg skip). e9a3ba13 has both.
-5. Diag port names change after a warm boot (ge0/ge1 -> xe30/xe39).
+5. Diag port names are not stable (1G ports become geN and the xeN names shift; they change on link flaps
+   and warm boots). Use BCM port numbers.
 6. PC side: r8169 `NETDEV WATCHDOG: transmit queue timed out` above ~450 Mbit/s of UDP; keep tests below.
 
 Logs: notes/2026-11-26_wr-qos_syslog.log.gz, notes/2026-11-26_syncd_segfault_lines.txt.
@@ -61,7 +62,10 @@ PC carrier unchanged. After that warm boot, same syncd process throughout:
 | DWRR w14 vs w2 (whole 12 s run, SONiC queue counters) | 135.9 : 23.5 MB = 5.8 (7 expected; not a steady-state sample) |
 | revert of all of the above | weights 14/15, shapers 0, WRED off, alpha 0xa; RESTARTCHECK succeeded |
 
-Still open: diag `show c` reads 0 for the renamed ports (xe30/xe39) after a warm boot; SONiC
-`show queue counters` / `show interfaces counters` are correct. warmboot-finalizer saves whatever is in
+Not a bug (checked later the same day): diag `show c all xe39` read 0 because the name no longer meant
+Ethernet39. Right after the warm boot Ethernet39 (BCM port 40) was `xe39`; after its link flapped (test
+topology setup) it became `ge0` and `xe39` moved to BCM port 41, which is down. `show c all 40` and
+`show c all ge0` show the real counters; SONiC `show queue counters` / `show interfaces counters` were
+correct all along. Use port numbers in diag commands (`show c all 40`, `cos port show PortBitMap=40`). warmboot-finalizer saves whatever is in
 CONFIG_DB ~6 min after the warm boot (test entries got into config_db.json and were removed again).
 Log: notes/2026-11-26_wr-lls_syslog.log.gz.
