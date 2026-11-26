@@ -45,6 +45,9 @@ enum {
 #include <sal/appl/sal.h>
 #include <sal/appl/config.h>
 #include <soc/drv.h>
+#ifdef BCM_WARM_BOOT_SUPPORT
+#include <soc/trident2.h>
+#endif
 #ifdef BCM_CMICM_SUPPORT
 #include <soc/cmicm.h>
 #endif
@@ -1966,32 +1969,33 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
             return rv;
         }
 
-        /* soc_mmu_init has no warm-boot guard on TD2+: soc_td2_lls_init resets
-         * the LLS scheduler and rebuilds each port's tree with MMU TX disabled,
-         * which stopped forwarding ~3 s into the warm init (2026-11-24). The
-         * MMU is still programmed from the cold boot and bcm cosq reinit reads
-         * it back from hardware, so leave it alone (HWBCM_WB_MMU_INIT=1 restores
-         * the old behaviour for debugging). */
+        /* Warm boot: keep live MMU/LLS hardware configuration from cold boot
+         * (zero HW writes), and rebuild the SW-only LLS state that cold
+         * soc_mmu_init -> soc_td2_lls_init would have built:
+         *   - _td2_cpu_port_lls_config (NULL -> SIGSEGV in soc_td2_sched_hw_index_get)
+         *   - _td2p_dyn_sched_unit_data (mutex + slot array for SP/WRR switchover)
+         *   - _td2_invalid_ptr (needed before bcm_attach -> bcm_td2_cosq_init)
+         *   - CPU_ARM_{QUEUE,RSVD_QUEUE}_BITMAP (bit 58 for PCI CPU RX0)
+         *   - port_lls_l{0,1,2}_bmap (reconstructed read-only from HW parent tables
+         *     for _soc_egress_metering_freeze).
+         * _soc_trident2_mmu_init is also guarded on SOC_WARM_BOOT, so
+         * HWBCM_WB_MMU_INIT=1 takes the same zero-HW-write restore path. */
         if (getenv("HWBCM_WB_MMU_INIT") && getenv("HWBCM_WB_MMU_INIT")[0] == '1') {
             HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init (forced by HWBCM_WB_MMU_INIT)");
             rv = soc_mmu_init(unit);
+        } else if (SOC_IS_TD2_TT2(unit)) {
+            long t_lls = mono_ms();
+            rv = soc_td2_lls_wb_restore(unit);
+            if (SOC_SUCCESS(rv)) {
+                HWBCM_LOGI("hwbcm_init_ex[warm]: soc_td2_lls_wb_restore ok in %ld ms "
+                           "(MMU/LLS HW kept, inv_ptr=%d/%d/%d, zero HW writes)",
+                           mono_ms() - t_lls,
+                           _soc_td2_invalid_parent_index(unit, SOC_TD2_NODE_LVL_L0),
+                           _soc_td2_invalid_parent_index(unit, SOC_TD2_NODE_LVL_L1),
+                           _soc_td2_invalid_parent_index(unit, SOC_TD2_NODE_LVL_L2));
+            }
         } else {
             HWBCM_LOGI("hwbcm_init_ex[warm]: soc_mmu_init skipped (MMU/LLS kept from cold boot)");
-            if (SOC_IS_TD2P_TT2P(unit)) {
-                /* soc_td2_cpu_port_lls_init() (inside soc_mmu_init) is the only
-                 * place that populates CPU_ARM_RSVD_QUEUE_BITMAP (bit 58 for
-                 * PCI CPU L0.0, plus 59/60 for ARM0/1 if configured). Without
-                 * bit 58, bcm_rx_start() -> _bcm_common_rx_queue_channel_set()
-                 * after SOC_WARM_BOOT_DONE overwrites CMIC_CMC0_CH1_COS_CTRL_RX_1
-                 * with 0x0000ffff (clearing 0x04000000), silencing CPU RX0. */
-                SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 0), 58);
-                if (NUM_CPU_ARM_COSQ(unit, SOC_ARM_CMC(unit, 0)) > 0) {
-                    SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 1), 59);
-                }
-                if (NUM_CPU_ARM_COSQ(unit, SOC_ARM_CMC(unit, 1)) > 0) {
-                    SHR_BITSET(CPU_ARM_RSVD_QUEUE_BITMAP(unit, 2), 60);
-                }
-            }
             rv = SOC_E_NONE;
         }
         if (SOC_FAILURE(rv)) {

@@ -1,0 +1,12 @@
+--- sdk-6.5.27/include/soc/trident2.h	2026-11-20 18:05:48.572657066 +0900
++++ sdk-6.5.27-wb/include/soc/trident2.h	2026-11-26 17:49:13.292177490 +0900
+@@ -738,6 +738,9 @@
+ extern int soc_td2_dump_port_hsp(int unit, int port);
+ 
+ extern int soc_td2_lls_init(int unit);
++#ifdef BCM_WARM_BOOT_SUPPORT
++extern int soc_td2_lls_wb_restore(int unit);
++#endif
+ 
+ extern int soc_td2_lls_port_uninit(int unit, soc_port_t port);
+ 

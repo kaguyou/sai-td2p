@@ -1,5 +1,5 @@
 --- sdk-6.5.27/src/soc/esw/trident2.c	2026-11-20 18:05:50.764794576 +0900
-+++ sdk-6.5.27-wb/src/soc/esw/trident2.c	2026-11-25 15:42:34.876184184 +0900
++++ sdk-6.5.27-wb/src/soc/esw/trident2.c	2026-11-26 17:49:16.712154651 +0900
 @@ -13437,10 +13437,16 @@
          SOC_IF_ERROR_RETURN
              (WRITE_EGR_ENABLEm(unit, MEM_BLOCK_ALL, loopback_port, entry));
@@ -81,4 +81,19 @@
 -    }
      sal_memcpy(mmu_traffic_ctrl, mmu_traffic_ctrl_scache_p, sizeof(_soc_td2_mmu_traffic_ctrl_t));
      mmu_traffic_ctrl_scache_p++;
+ 
+@@ -16113,6 +16142,14 @@
+         sal_memset(_soc_td2_mmu_traffic_ctrl[unit], 0, alloc_size);
+     }
+ 
++#ifdef BCM_WARM_BOOT_SUPPORT
++    if (SOC_WARM_BOOT(unit)) {
++        /* sai-td2p: keep live MMU/LLS HW state from cold boot; rebuild SW-only
++         * LLS state from HW/config with zero HW writes. */
++        return soc_td2_lls_wb_restore(unit);
++    }
++#endif
++
+     test_only = (SAL_BOOT_BCMSIM || SAL_BOOT_XGSSIM) ? TRUE : FALSE;
+     SOC_IF_ERROR_RETURN(soc_td2_mmu_config_init(unit, test_only));
  

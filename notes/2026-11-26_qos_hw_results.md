@@ -42,3 +42,26 @@ netns hostA (192.168.52.50). Sender `tools/qos-test/udpblast.py` (UDP, IP TOS), 
 6. PC side: r8169 `NETDEV WATCHDOG: transmit queue timed out` above ~450 Mbit/s of UDP; keep tests below.
 
 Logs: notes/2026-11-26_wr-qos_syslog.log.gz, notes/2026-11-26_syncd_segfault_lines.txt.
+
+## Fix for problem 1 (branch wb-lls-sched, lib b7db1af7)
+
+Root cause and code by agy (it stopped before building: headless mode denied a command permission; the lead
+built and tested). `soc_td2_lls_wb_restore` in the wb SDK + call from hwbcm_init_ex[warm].
+On the switch: cold boot ok; kexec warm-reboot with QoS + pseudo EVPN: `soc_td2_lls_wb_restore ok in 60 ms
+(... zero HW writes)`, COS_CTRL_RX_1=0x0400ffff, NUM_COS=8, Case B 66/66, true warm boot, all reconciled,
+PC carrier unchanged. After that warm boot, same syncd process throughout:
+
+| operation after warm boot | result |
+|---|---|
+| diag `cos port show PortBitMap=xe39` | prints weights (crashed before) |
+| SAI queue scheduler bind, weight 2 / weight 1 + 50 Mbit/s shaper | COSQ 6 = 2, COSQ 1 = 1, KbpsMax 50000; 50 Mbit/s received |
+| port shaper 100 Mbit/s | 100 Mbit/s received |
+| WRED profile bind on queue 2 | Min 104000 Max 416000 10 % Ena 1 |
+| buffer profile dynamic_th 3 -> 0 | alpha 0xa -> 7 on 288 queues |
+| DWRR w14 vs w2 (whole 12 s run, SONiC queue counters) | 135.9 : 23.5 MB = 5.8 (7 expected; not a steady-state sample) |
+| revert of all of the above | weights 14/15, shapers 0, WRED off, alpha 0xa; RESTARTCHECK succeeded |
+
+Still open: diag `show c` reads 0 for the renamed ports (xe30/xe39) after a warm boot; SONiC
+`show queue counters` / `show interfaces counters` are correct. warmboot-finalizer saves whatever is in
+CONFIG_DB ~6 min after the warm boot (test entries got into config_db.json and were removed again).
+Log: notes/2026-11-26_wr-lls_syslog.log.gz.

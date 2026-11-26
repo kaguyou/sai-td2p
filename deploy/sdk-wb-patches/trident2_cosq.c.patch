@@ -1,0 +1,282 @@
+--- sdk-6.5.27/src/soc/esw/trident2/cosq.c	2026-11-20 18:05:50.768142017 +0900
++++ sdk-6.5.27-wb/src/soc/esw/trident2/cosq.c	2026-11-26 17:50:03.923839363 +0900
+@@ -2059,9 +2059,7 @@
+ }
+ 
+ STATIC int
+-soc_td2_cpu_port_lls_init(int unit, int port, int setup, int reserve,
+-                          _soc_td2_lls_traverse_cb cb, void *cookie)
+-
++_soc_td2_cpu_port_lls_config_init(int unit, int reserve)
+ {
+     int num_l0, num_l1, l0_0, l0_1, l0_2, num_nodes, w, ii, jj;
+     int l1_cnt[3], l2_cnt[3], nc, cmc;
+@@ -2187,6 +2185,14 @@
+     pnode->uc_mc_map = 0;
+ 
+     _td2_cpu_port_lls_config[unit] = lnc;
++    return SOC_E_NONE;
++}
++
++STATIC int
++soc_td2_cpu_port_lls_init(int unit, int port, int setup, int reserve,
++                          _soc_td2_lls_traverse_cb cb, void *cookie)
++{
++    SOC_IF_ERROR_RETURN(_soc_td2_cpu_port_lls_config_init(unit, reserve));
+ 
+     SOC_IF_ERROR_RETURN(soc_td2_port_lls_init(unit, port, 
+                                               _td2_cpu_port_lls_config[unit], setup,
+@@ -2330,6 +2336,9 @@
+         }
+ 
+         pcb->lock = sal_mutex_create("td2plus_dyn_lock");
++        if (pcb->lock == NULL) {
++            return SOC_E_MEMORY;
++        }
+         for (i = 0; i < _SOC_TD2PLUS_DYN_REGISTER_SET; i++) {
+             pcb->port[i] = -1;
+         }
+@@ -2339,6 +2348,230 @@
+     return SOC_E_NONE;
+ }
+ 
++#ifdef BCM_WARM_BOOT_SUPPORT
++/*
++ * sai-td2p: Rebuild SW-only LLS state during warm boot with ZERO HW writes:
++ *   1. _td2p_dyn_sched_unit_data[unit] (mutex + port[] = -1 + init_done)
++ *   2. _td2_invalid_ptr[unit][0..3] (must precede bcm_td2_cosq_init)
++ *   3. _td2_cpu_port_lls_config[unit] + CPU_ARM_{QUEUE,RSVD_QUEUE}_BITMAP
++ *   4. SOC_CONTROL(unit)->port_lls_l{0,1,2}_bmap[port] from live HW parent tables
++ */
++int
++soc_td2_lls_wb_restore(int unit)
++{
++    soc_control_t *soc = SOC_CONTROL(unit);
++    soc_info_t *si = &SOC_INFO(unit);
++    int port, pipe, port_pipe, phy_port, mmu_port, root_idx;
++    int reserve_queues, rv = SOC_E_NONE;
++    int l0_cnt, l1_cnt, l2_cnt, ii, parent, owner;
++    int alloc_size_l0, alloc_size_l1, alloc_size_l2;
++    int inv_l0, inv_l1, inv_l2;
++    int root_to_port[64];
++    int *l0_owner = NULL, *l1_owner = NULL;
++    soc_mem_t l0_mem, l1_mem, l2_mem;
++    uint32 entry[SOC_MAX_MEM_WORDS];
++    int l0_total = 0, l1_total = 0, l2_total = 0;
++
++    reserve_queues = soc_feature(unit, soc_feature_cmic_reserved_queues);
++
++    /* 1. Dynamic SPRI switchover mutex/slot state (TD2+ vector_based_spri) */
++    SOC_IF_ERROR_RETURN(_soc_td2plus_lls_init(unit));
++
++    /* 2. Invalid parent indices (pure SW; required before bcm_td2_cosq_init) */
++    SOC_IF_ERROR_RETURN(soc_td2_init_invalid_pointers(unit));
++
++    /* 3. CPU port LLS config table + CPU/ARM queue & reserved bitmaps */
++    PBMP_ALL_ITER(unit, port) {
++        if (IS_CPU_PORT(unit, port) &&
++            _soc_trident2_port_sched_type_get(unit, port) != SOC_TD2_SCHED_HSP) {
++            SOC_IF_ERROR_RETURN(
++                _soc_td2_cpu_port_lls_config_init(unit, reserve_queues));
++            break;
++        }
++    }
++
++    /* 4. Ensure per-port LLS bitmaps exist; clear LLS ports, set HSP ports */
++    alloc_size_l0 = SHR_BITALLOCSIZE(soc_mem_index_count(unit, ES_PIPE0_LLS_L0_PARENTm));
++    alloc_size_l1 = SHR_BITALLOCSIZE(soc_mem_index_count(unit, ES_PIPE0_LLS_L1_PARENTm));
++    alloc_size_l2 = SHR_BITALLOCSIZE(soc_mem_index_count(unit, ES_PIPE0_LLS_L2_PARENTm));
++
++    PBMP_ALL_ITER(unit, port) {
++        if (soc->port_lls_l0_bmap[port] == NULL) {
++            soc->port_lls_l0_bmap[port] = sal_alloc(alloc_size_l0, "LLS_L0_BMAP");
++            if (soc->port_lls_l0_bmap[port] == NULL) {
++                return SOC_E_MEMORY;
++            }
++        }
++        if (soc->port_lls_l1_bmap[port] == NULL) {
++            soc->port_lls_l1_bmap[port] = sal_alloc(alloc_size_l1, "LLS_L1_BMAP");
++            if (soc->port_lls_l1_bmap[port] == NULL) {
++                return SOC_E_MEMORY;
++            }
++        }
++        if (soc->port_lls_l2_bmap[port] == NULL) {
++            soc->port_lls_l2_bmap[port] = sal_alloc(alloc_size_l2, "LLS_L2_BMAP");
++            if (soc->port_lls_l2_bmap[port] == NULL) {
++                return SOC_E_MEMORY;
++            }
++        }
++        SOC_LLS_SCHEDULER_LOCK(unit);
++        sal_memset(soc->port_lls_l0_bmap[port], 0, alloc_size_l0);
++        sal_memset(soc->port_lls_l1_bmap[port], 0, alloc_size_l1);
++        sal_memset(soc->port_lls_l2_bmap[port], 0, alloc_size_l2);
++        if (SOC_PBMP_MEMBER(si->eq_pbm, port)) { /* VBS (HSP) port */
++            phy_port = si->port_l2p_mapping[port];
++            mmu_port = si->port_p2m_mapping[phy_port];
++            for (ii = 0; ii < 5; ii++) {
++                SHR_BITSET(soc->port_lls_l0_bmap[port], (mmu_port & 0x3f) * 5 + ii);
++            }
++            for (ii = 0; ii < 10; ii++) {
++                SHR_BITSET(soc->port_lls_l1_bmap[port], (mmu_port & 0x3f) * 10 + ii);
++            }
++            for (ii = 0; ii < 10; ii++) {
++                SHR_BITSET(soc->port_lls_l2_bmap[port], (mmu_port & 0x3f) * 10 + ii);
++            }
++        }
++        SOC_LLS_SCHEDULER_UNLOCK(unit);
++    }
++
++    /* 5. Reconstruct L0/L1/L2 port bitmaps from live HW LLS parent tables (read-only) */
++    inv_l0 = INVALID_PARENT(unit, SOC_TD2_NODE_LVL_L0);
++    inv_l1 = INVALID_PARENT(unit, SOC_TD2_NODE_LVL_L1);
++    inv_l2 = INVALID_PARENT(unit, SOC_TD2_NODE_LVL_L2);
++
++    for (pipe = _TD2_XPIPE; pipe <= _TD2_YPIPE; pipe++) {
++        for (ii = 0; ii < 64; ii++) {
++            root_to_port[ii] = -1;
++        }
++        PBMP_ALL_ITER(unit, port) {
++            if (_soc_trident2_port_sched_type_get(unit, port) != SOC_TD2_SCHED_LLS) {
++                continue;
++            }
++            rv = soc_td2_port_common_attributes_get(unit, port, &port_pipe, &mmu_port, NULL);
++            if (SOC_FAILURE(rv)) {
++                goto cleanup;
++            }
++            if (port_pipe != pipe) {
++                continue;
++            }
++            root_idx = (pipe == 0) ? mmu_port : (mmu_port - 64);
++            if (root_idx >= 0 && root_idx < 64) {
++                root_to_port[root_idx] = port;
++            }
++        }
++
++        l0_mem = (pipe == _TD2_XPIPE) ? ES_PIPE0_LLS_L0_PARENTm : ES_PIPE1_LLS_L0_PARENTm;
++        l1_mem = (pipe == _TD2_XPIPE) ? ES_PIPE0_LLS_L1_PARENTm : ES_PIPE1_LLS_L1_PARENTm;
++        l2_mem = (pipe == _TD2_XPIPE) ? ES_PIPE0_LLS_L2_PARENTm : ES_PIPE1_LLS_L2_PARENTm;
++
++        l0_cnt = soc_mem_index_count(unit, l0_mem);
++        l1_cnt = soc_mem_index_count(unit, l1_mem);
++        l2_cnt = soc_mem_index_count(unit, l2_mem);
++
++        l0_owner = sal_alloc(sizeof(int) * l0_cnt, "lls_wb_l0_owner");
++        l1_owner = sal_alloc(sizeof(int) * l1_cnt, "lls_wb_l1_owner");
++        if (l0_owner == NULL || l1_owner == NULL) {
++            rv = SOC_E_MEMORY;
++            goto cleanup;
++        }
++        for (ii = 0; ii < l0_cnt; ii++) {
++            l0_owner[ii] = -1;
++        }
++        for (ii = 0; ii < l1_cnt; ii++) {
++            l1_owner[ii] = -1;
++        }
++
++        /* L0 -> root (port) */
++        for (ii = 0; ii < l0_cnt; ii++) {
++            rv = soc_mem_read(unit, l0_mem, MEM_BLOCK_ANY, ii, entry);
++            if (SOC_FAILURE(rv)) {
++                goto cleanup;
++            }
++            parent = (int)soc_mem_field32_get(unit, l0_mem, entry, C_PARENTf);
++            if (parent == inv_l0 &&
++                (soc_feature(unit, soc_feature_lls_port_mema_config_match) || parent != 0)) {
++                continue;
++            }
++            if (parent >= 0 && parent < 64 && root_to_port[parent] >= 0) {
++                owner = root_to_port[parent];
++                l0_owner[ii] = owner;
++                if (parent != inv_l0) {
++                    SOC_LLS_SCHEDULER_LOCK(unit);
++                    SHR_BITSET(soc->port_lls_l0_bmap[owner], ii);
++                    SOC_LLS_SCHEDULER_UNLOCK(unit);
++                    l0_total++;
++                }
++            }
++        }
++
++        /* L1 -> L0 */
++        for (ii = 0; ii < l1_cnt; ii++) {
++            rv = soc_mem_read(unit, l1_mem, MEM_BLOCK_ANY, ii, entry);
++            if (SOC_FAILURE(rv)) {
++                goto cleanup;
++            }
++            parent = (int)soc_mem_field32_get(unit, l1_mem, entry, C_PARENTf);
++            if (parent == inv_l1 || parent < 0 || parent >= l0_cnt) {
++                continue;
++            }
++            owner = l0_owner[parent];
++            if (owner >= 0) {
++                l1_owner[ii] = owner;
++                SOC_LLS_SCHEDULER_LOCK(unit);
++                if (!SHR_BITGET(soc->port_lls_l0_bmap[owner], parent)) {
++                    SHR_BITSET(soc->port_lls_l0_bmap[owner], parent);
++                    l0_total++;
++                }
++                SHR_BITSET(soc->port_lls_l1_bmap[owner], ii);
++                SOC_LLS_SCHEDULER_UNLOCK(unit);
++                l1_total++;
++            }
++        }
++
++        /* L2 -> L1 */
++        for (ii = 0; ii < l2_cnt; ii++) {
++            rv = soc_mem_read(unit, l2_mem, MEM_BLOCK_ANY, ii, entry);
++            if (SOC_FAILURE(rv)) {
++                goto cleanup;
++            }
++            parent = (int)soc_mem_field32_get(unit, l2_mem, entry, C_PARENTf);
++            if (parent == inv_l2 || parent < 0 || parent >= l1_cnt) {
++                continue;
++            }
++            owner = l1_owner[parent];
++            if (owner >= 0) {
++                SOC_LLS_SCHEDULER_LOCK(unit);
++                SHR_BITSET(soc->port_lls_l2_bmap[owner], ii);
++                SOC_LLS_SCHEDULER_UNLOCK(unit);
++                l2_total++;
++            }
++        }
++
++        sal_free(l0_owner);
++        sal_free(l1_owner);
++        l0_owner = NULL;
++        l1_owner = NULL;
++    }
++
++    LOG_INFO(BSL_LS_SOC_COSQ,
++             (BSL_META_U(unit,
++                         "soc_td2_lls_wb_restore: restored L0=%d L1=%d L2=%d "
++                         "inv_ptr=(%d,%d,%d) cpu_cfg=%p\n"),
++              l0_total, l1_total, l2_total, inv_l0, inv_l1, inv_l2,
++              (void *)_td2_cpu_port_lls_config[unit]));
++    return SOC_E_NONE;
++
++cleanup:
++    if (l0_owner != NULL) {
++        sal_free(l0_owner);
++    }
++    if (l1_owner != NULL) {
++        sal_free(l1_owner);
++    }
++    return rv;
++}
++#endif /* BCM_WARM_BOOT_SUPPORT */
++
+ int soc_td2_lls_init(int unit)
+ {
+     int port, rv = SOC_E_NONE, reserve_queues, pipe;
+@@ -2351,6 +2584,12 @@
+     static const soc_reg_t llfc_cfgr[] = {
+         ES_PIPE0_LLS_FC_CONFIGr, ES_PIPE1_LLS_FC_CONFIGr };
+ 
++#ifdef BCM_WARM_BOOT_SUPPORT
++    if (SOC_WARM_BOOT(unit)) {
++        return soc_td2_lls_wb_restore(unit);
++    }
++#endif
++
+     reserve_queues = soc_feature(unit, soc_feature_cmic_reserved_queues);
+ 
+     SOC_IF_ERROR_RETURN(_soc_td2plus_lls_init(unit));
