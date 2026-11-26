@@ -1,0 +1,11 @@
+/var/log/syslog:2026 Nov 26 17:30:27.881477 sonic INFO syncd#supervisord: syncd [5] child /usr/bin/syncd exited status: 139
+/var/log/syslog.1:2026 Nov 26 17:06:30.222847 sonic ERR syncd#syncd: hwbcm: diag shell "g EGRMETERINGCONFIG.ge1" failed: -1
+/var/log/syslog.1:2026 Nov 26 17:28:46.065467 sonic ERR syncd#syncd: hwbcm: diag shell "cos port show PortBitMap=ge1" failed: -1
+/var/log/syslog.1:2026 Nov 26 17:28:46.638601 sonic ERR syncd#syncd: hwbcm: diag shell "cos port show PortBitMap=ge0" failed: -1
+/var/log/syslog.1:2026 Nov 26 17:29:02.760128 sonic ERR syncd#syncd: hwbcm: diag shell "cos port show PortBitMap=ge1" failed: -1
+/var/log/syslog.1:2026 Nov 26 17:29:03.315932 sonic INFO kernel: [  129.123483] syncd[3547]: segfault at 0 ip 00007f7410a57599 sp 00007f73fdd97ef0 error 4 in libsaivs.so.0.0.0[7f741088c000+1d26000] likely on CPU 1 (core 1, socket 0)
+/var/log/syslog.1:2026 Nov 26 17:29:07.984620 sonic NOTICE syncd#dsserve: child /usr/bin/syncd exited status: 139
+/var/log/syslog.1:2026 Nov 26 17:29:07.984620 sonic INFO syncd#supervisord: syncd [5] child /usr/bin/syncd exited status: 139
+-rw-r--r-- 1 root root  5849681 Nov 26 17:00 syncd.1795680006.30.core.gz
+-rw-r--r-- 1 root root 13165686 Nov 26 17:29 syncd.1795681743.43.core.gz
+-rw-r--r-- 1 root root 10027992 Nov 26 17:30 syncd.1795681823.48.core.gz

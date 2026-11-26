@@ -73,6 +73,13 @@ namespace saivs
                     _In_ const std::string &serializedObjectId,
                     _In_ const sai_attribute_t* attr) override;
 
+            virtual sai_status_t bulkSet(
+                    _In_ sai_object_type_t object_type,
+                    _In_ const std::vector<std::string> &serialized_object_ids,
+                    _In_ const sai_attribute_t *attr_list,
+                    _In_ sai_bulk_op_error_mode_t mode,
+                    _Out_ sai_status_t *object_statuses) override;
+
             virtual sai_status_t get(
                     _In_ sai_object_type_t objectType,
                     _In_ const std::string &serializedObjectId,

@@ -78,6 +78,11 @@
             static bool qosIsSwitchAttr(_In_ sai_attr_id_t id);
             sai_status_t qosHwSetSwitch(_In_ const sai_attribute_t *attr);
 
+            /* Read-only hardware getters for SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE
+             * and SAI_BUFFER_POOL_ATTR_SHARED_SIZE. */
+            bool qosGetSwitchAttr(_Inout_ sai_attribute_t &attr) const;
+            bool qosGetBufferPoolAttr(_In_ sai_object_id_t pool_id, _Inout_ sai_attribute_t &attr) const;
+
             sai_status_t hwCreateQosMap(_In_ sai_object_id_t map_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwSetQosMap(_In_ sai_object_id_t map_id, _In_ const sai_attribute_t *attr);
             sai_status_t hwRemoveQosMap(_In_ sai_object_id_t map_id);
@@ -194,6 +199,8 @@
             bool qosDecodeScheduler(_In_ sai_object_id_t sched_id, _Out_ QosSched &out);
             bool qosDecodeBufferProfile(_In_ sai_object_id_t profile_id, _In_ bool ingress, _Out_ QosBuffer &out);
 
+            sai_status_t qosApplyCosScheduler(_In_ sai_object_id_t port_id, _In_ int cos);
+            sai_status_t qosApplyPortEffectiveShaper(_In_ sai_object_id_t port_id);
             sai_status_t qosApplySgScheduler(_In_ sai_object_id_t sg_id);
             sai_status_t qosApplyQueueScheduler(_In_ sai_object_id_t queue_id);
             sai_status_t qosApplyQueueWred(_In_ sai_object_id_t queue_id);

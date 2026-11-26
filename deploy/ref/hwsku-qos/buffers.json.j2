@@ -1,0 +1,41 @@
+{# Accton-AS5812-54T (BCM56864 Trident2+, 16 MB MMU, 208 B cells, mmu_lossless=0) #}
+{# Lossy-only buffer template (no PFC). Modeled on Force10-S6000 for SONiC 202505. #}
+{%- set dev_type = DEVICE_METADATA['localhost']['type'] if (DEVICE_METADATA is defined and 'localhost' in DEVICE_METADATA and 'type' in DEVICE_METADATA['localhost']) else 'ToRRouter' -%}
+{%- if dev_type in ['SpineRouter', 'BackEndLeafRouter', 'LeafRouter'] -%}
+    {%- set filename_postfix = 't1' -%}
+{%- else -%}
+    {%- set filename_postfix = 't0' -%}
+{%- endif -%}
+{%- import 'buffers_defaults_%s.j2' % filename_postfix as defs with context -%}
+{%- set port_idx_list = [] -%}
+{%- if PORT is defined and PORT -%}
+    {%- for p in PORT.keys() -%}
+        {%- if p.startswith('Ethernet') and p[8:].isdigit() -%}
+            {%- set _ = port_idx_list.append(p[8:] | int) -%}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {# Fallback: AS5812-54T with Ethernet48 and Ethernet60 as 1x40G (Ethernet49-51, 61-63 absent) #}
+    {%- for idx in range(0, 72) -%}
+        {%- if idx not in [49, 50, 51, 61, 62, 63] -%}
+            {%- set _ = port_idx_list.append(idx) -%}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endif -%}
+{%- set port_names_list = [] -%}
+{%- for idx in port_idx_list | sort -%}
+    {%- set _ = port_names_list.append('Ethernet' ~ idx) -%}
+{%- endfor -%}
+{%- set port_names = port_names_list | join(',') -%}
+{
+    "CABLE_LENGTH": {
+        "AZURE": {
+{%- for p in port_names_list %}
+            "{{ p }}": "{{ defs.default_cable }}"{% if not loop.last %},{% endif %}
+{%- endfor %}
+        }
+    },
+{{ defs.generate_buffer_pool_and_profiles() }}
+{{ defs.generate_pg_profiles(port_names) }}
+{{ defs.generate_queue_buffers(port_names) }}
+}

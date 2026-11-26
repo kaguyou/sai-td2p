@@ -1,0 +1,124 @@
+{# Accton-AS5812-54T (BCM56864 Trident2+, non-ETS 8 cos/port, mmu_lossless=0) #}
+{# Lossy-only QoS template (DSCP->TC->queue/PG, DWRR schedulers, WRED/ECN).   #}
+{# Matches hardware-verified DSCP 46 -> TC 5 -> UC5 and DSCP 10 -> TC 1 -> UC1. #}
+{%- set port_idx_list = [] -%}
+{%- if PORT is defined and PORT -%}
+    {%- for p in PORT.keys() -%}
+        {%- if p.startswith('Ethernet') and p[8:].isdigit() -%}
+            {%- set _ = port_idx_list.append(p[8:] | int) -%}
+        {%- endif -%}
+    {%- endfor -%}
+{%- else -%}
+    {# Fallback: AS5812-54T with Ethernet48 and Ethernet60 as 1x40G (Ethernet49-51, 61-63 absent) #}
+    {%- for idx in range(0, 72) -%}
+        {%- if idx not in [49, 50, 51, 61, 62, 63] -%}
+            {%- set _ = port_idx_list.append(idx) -%}
+        {%- endif -%}
+    {%- endfor -%}
+{%- endif -%}
+{%- set port_names_list = [] -%}
+{%- for idx in port_idx_list | sort -%}
+    {%- set _ = port_names_list.append('Ethernet' ~ idx) -%}
+{%- endfor -%}
+{
+    "DSCP_TO_TC_MAP": {
+        "AZURE": {
+{%- for dscp in range(0, 64) %}
+    {%- if dscp == 8 -%}
+        {%- set tc = 0 -%}
+    {%- elif dscp == 3 -%}
+        {%- set tc = 3 -%}
+    {%- elif dscp == 4 -%}
+        {%- set tc = 4 -%}
+    {%- elif dscp == 46 -%}
+        {%- set tc = 5 -%}
+    {%- elif dscp == 48 -%}
+        {%- set tc = 6 -%}
+    {%- else -%}
+        {%- set tc = 1 -%}
+    {%- endif %}
+            "{{ dscp }}": "{{ tc }}"{% if not loop.last %},{% endif %}
+{%- endfor %}
+        }
+    },
+    "TC_TO_QUEUE_MAP": {
+        "AZURE": {
+{%- for tc in range(0, 8) %}
+            "{{ tc }}": "{{ tc }}"{% if not loop.last %},{% endif %}
+{%- endfor %}
+        }
+    },
+    "TC_TO_PRIORITY_GROUP_MAP": {
+        "AZURE": {
+{%- for tc in range(0, 8) %}
+            "{{ tc }}": "0"{% if not loop.last %},{% endif %}
+{%- endfor %}
+        }
+    },
+    "SCHEDULER": {
+        "scheduler.0": {
+            "type": "DWRR",
+            "weight": "14"
+        },
+        "scheduler.1": {
+            "type": "DWRR",
+            "weight": "15"
+        }
+    },
+    "WRED_PROFILE": {
+        "AZURE_LOSSY": {
+            "ecn": "ecn_all",
+            "wred_green_enable": "true",
+            "green_min_threshold": "1048576",
+            "green_max_threshold": "2097152",
+            "green_drop_probability": "5",
+            "wred_yellow_enable": "true",
+            "yellow_min_threshold": "1048576",
+            "yellow_max_threshold": "2097152",
+            "yellow_drop_probability": "5",
+            "wred_red_enable": "true",
+            "red_min_threshold": "1048576",
+            "red_max_threshold": "2097152",
+            "red_drop_probability": "5"
+        }
+    },
+    "PORT_QOS_MAP": {
+{%- for p in port_names_list %}
+        "{{ p }}": {
+            "dscp_to_tc_map": "AZURE",
+            "tc_to_queue_map": "AZURE",
+            "tc_to_pg_map": "AZURE"
+        }{% if not loop.last %},{% endif %}
+{%- endfor %}
+    },
+    "QUEUE": {
+{%- for p in port_names_list %}
+        "{{ p }}|0": {
+            "scheduler": "scheduler.0"
+        },
+        "{{ p }}|1": {
+            "scheduler": "scheduler.0"
+        },
+        "{{ p }}|2": {
+            "scheduler": "scheduler.0"
+        },
+        "{{ p }}|3": {
+            "scheduler": "scheduler.1",
+            "wred_profile": "AZURE_LOSSY"
+        },
+        "{{ p }}|4": {
+            "scheduler": "scheduler.1",
+            "wred_profile": "AZURE_LOSSY"
+        },
+        "{{ p }}|5": {
+            "scheduler": "scheduler.0"
+        },
+        "{{ p }}|6": {
+            "scheduler": "scheduler.0"
+        },
+        "{{ p }}|7": {
+            "scheduler": "scheduler.0"
+        }{% if not loop.last %},{% endif %}
+{%- endfor %}
+    }
+}

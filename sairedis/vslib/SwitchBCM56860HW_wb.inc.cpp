@@ -53,6 +53,7 @@ namespace
         HWSTATE_TAG_QOS_SNAPS     = 21u,
         HWSTATE_TAG_MIRROR        = 22u,
         HWSTATE_TAG_STATS_BASE    = 23u,
+        HWSTATE_TAG_QOS_QGRP_MIN  = 24u,
     };
 
     uint32_t wbCrc32Update(uint32_t crc, const uint8_t *data, size_t len)
@@ -984,6 +985,27 @@ sai_status_t SwitchBCM56860HW::hwStateSave(
             w.putU32(s.alpha);
         }
         payload.putTlv(HWSTATE_TAG_QOS_SNAPS, w.buf);
+
+        // 21b. Optional UC qgroup-min boot snapshots (TD2+ mmu_lossless=0)
+        int nqgrp = hwbcm_qos_wb_get_qgrp_snaps(nullptr, 0);
+        if (nqgrp > 0)
+        {
+            std::vector<hwbcm_qos_qgrp_wb_t> qgrps(static_cast<size_t>(nqgrp));
+            nqgrp = hwbcm_qos_wb_get_qgrp_snaps(qgrps.data(), nqgrp);
+            if (nqgrp > 0)
+            {
+                WbWriter qw;
+                qw.putU32(static_cast<uint32_t>(nqgrp));
+                for (int i = 0; i < nqgrp; i++)
+                {
+                    const auto &g = qgrps[static_cast<size_t>(i)];
+                    qw.putI32(g.port);
+                    qw.putI32(g.cos);
+                    qw.putI32(g.qgrp_min_en);
+                }
+                payload.putTlv(HWSTATE_TAG_QOS_QGRP_MIN, qw.buf);
+            }
+        }
     }
 
     // 22. Mirror sessions
@@ -1216,6 +1238,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     bool haveQosSnaps = false;
     std::vector<hwbcm_qos_pg_snap_wb_t> qosPgSnaps;
     std::vector<hwbcm_qos_q_snap_wb_t> qosQSnaps;
+    std::vector<hwbcm_qos_qgrp_wb_t> qosQgrpSnaps;
 
     bool haveStatsBase = false;
     std::vector<hwbcm_qbase_wb_t> statsQBase;
@@ -1833,6 +1856,22 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                 }
                 break;
 
+            case HWSTATE_TAG_QOS_QGRP_MIN:
+                {
+                    uint32_t ng = 0;
+                    if (!tr.getU32(ng)) return SAI_STATUS_FAILURE;
+                    qosQgrpSnaps.resize(ng);
+                    for (uint32_t i = 0; i < ng; i++)
+                    {
+                        auto &g = qosQgrpSnaps[i];
+                        if (!tr.getI32(g.port) || !tr.getI32(g.cos) || !tr.getI32(g.qgrp_min_en))
+                        {
+                            return SAI_STATUS_FAILURE;
+                        }
+                    }
+                }
+                break;
+
             case HWSTATE_TAG_MIRROR:
                 {
                     uint32_t n = 0;
@@ -1975,6 +2014,10 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
         hwbcm_qos_warm_restore(
                 qosPgSnaps.empty() ? NULL : qosPgSnaps.data(), static_cast<int>(qosPgSnaps.size()),
                 qosQSnaps.empty() ? NULL : qosQSnaps.data(), static_cast<int>(qosQSnaps.size()));
+        if (!qosQgrpSnaps.empty())
+        {
+            hwbcm_qos_warm_restore_qgrp(qosQgrpSnaps.data(), static_cast<int>(qosQgrpSnaps.size()));
+        }
     }
     else
     {

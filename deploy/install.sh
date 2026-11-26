@@ -54,10 +54,19 @@ rscp_to "$DEPLOY_DIR/gen_lanemap.py" "$REMOTE_DIR/gen_lanemap.py"
 rscp_to "$DEPLOY_DIR/sai.profile.td2p.extra" "$REMOTE_DIR/sai.profile.td2p.extra"
 rscp_to "$DEPLOY_DIR/platform/warm-reboot_plugin" "$REMOTE_DIR/warm-reboot_plugin"
 
+QOS_FLAGS=()
+if [ -d "$DEPLOY_DIR/ref/hwsku-qos" ]; then
+    rssh "mkdir -p $REMOTE_DIR/hwsku-qos"
+    for qf in "$DEPLOY_DIR"/ref/hwsku-qos/*; do
+        [ -f "$qf" ] && rscp_to "$qf" "$REMOTE_DIR/hwsku-qos/$(basename "$qf")"
+    done
+    QOS_FLAGS=(--qos-dir "$REMOTE_DIR/hwsku-qos")
+fi
+
 log "running install steps on the switch"
 rssh_script "$DEPLOY_DIR/remote_install.sh" \
     "$REMOTE_DIR/libsaivs.so" "$REMOTE_DIR/sai.profile.td2p.extra" "$REMOTE_DIR/gen_lanemap.py" "${FLAGS[@]}" \
-    --plugin "$REMOTE_DIR/warm-reboot_plugin"
+    --plugin "$REMOTE_DIR/warm-reboot_plugin" "${QOS_FLAGS[@]}"
 
 print_start_howto
 echo "Rollback at any time:  deploy/rollback.sh [--stop]"

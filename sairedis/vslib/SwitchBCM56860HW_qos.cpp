@@ -795,6 +795,65 @@ bool SwitchBCM56860HW::qosIsSwitchAttr(
     return qosSlotOfSwitchAttr(id) >= 0 || id == SAI_SWITCH_ATTR_QOS_DEFAULT_TC;
 }
 
+bool SwitchBCM56860HW::qosGetSwitchAttr(
+        _Inout_ sai_attribute_t &attr) const
+{
+    SWSS_LOG_ENTER();
+
+    if (attr.id != SAI_SWITCH_ATTR_TOTAL_BUFFER_SIZE)
+    {
+        return false;
+    }
+
+    uint64_t kb = 0;
+
+    if (hwbcm_qos_total_buffer_kb_get(&kb) < 0)
+    {
+        return false;
+    }
+
+    attr.value.u64 = kb;
+    return true;
+}
+
+bool SwitchBCM56860HW::qosGetBufferPoolAttr(
+        _In_ sai_object_id_t pool_id,
+        _Inout_ sai_attribute_t &attr) const
+{
+    SWSS_LOG_ENTER();
+
+    if (attr.id != SAI_BUFFER_POOL_ATTR_SHARED_SIZE)
+    {
+        return false;
+    }
+
+    auto it = m_qosPools.find(pool_id);
+
+    if (it == m_qosPools.end())
+    {
+        return false;
+    }
+
+    const QosPool &p = it->second;
+    bool ingress = (p.type == SAI_BUFFER_POOL_TYPE_INGRESS || p.type == SAI_BUFFER_POOL_TYPE_BOTH);
+    int sp = ingress ? p.ingressSp : p.egressSp;
+
+    if (sp < 0)
+    {
+        return false;
+    }
+
+    uint32_t ing = 0, egr = 0;
+
+    if (hwbcm_qos_pool_shared_get(sp, &ing, &egr) < 0)
+    {
+        return false;
+    }
+
+    attr.value.u64 = ingress ? (uint64_t)ing : (uint64_t)egr;
+    return true;
+}
+
 SwitchBCM56860HW::QosPortState &SwitchBCM56860HW::qosPortState(
         _In_ sai_object_id_t port_id)
 {
@@ -1586,7 +1645,7 @@ sai_status_t SwitchBCM56860HW::qosApplyPortDefaultTc(
     return SAI_STATUS_SUCCESS;
 }
 
-sai_status_t SwitchBCM56860HW::qosApplyPortShaper(
+sai_status_t SwitchBCM56860HW::qosApplyPortEffectiveShaper(
         _In_ sai_object_id_t port_id)
 {
     SWSS_LOG_ENTER();
@@ -1599,6 +1658,24 @@ sai_status_t SwitchBCM56860HW::qosApplyPortShaper(
     }
 
     auto &ps = qosPortState(port_id);
+    sai_object_id_t sched = ps.scheduler;
+
+    if (sched == SAI_NULL_OBJECT_ID)
+    {
+        // Fall back to any scheduler bound on the port's root SG (level 0).
+        for (const auto &kv: m_qosSgHw)
+        {
+            if (kv.second.port == port_id && kv.second.level == 0)
+            {
+                auto sit = m_qosSgSched.find(kv.first);
+                if (sit != m_qosSgSched.end() && sit->second != SAI_NULL_OBJECT_ID)
+                {
+                    sched = sit->second;
+                    break;
+                }
+            }
+        }
+    }
 
     QosSched s;
 
@@ -1606,7 +1683,7 @@ sai_status_t SwitchBCM56860HW::qosApplyPortShaper(
 
     memset(&hw, 0, sizeof(hw));
 
-    bool have = ps.scheduler != SAI_NULL_OBJECT_ID && qosDecodeScheduler(ps.scheduler, s);
+    bool have = sched != SAI_NULL_OBJECT_ID && qosDecodeScheduler(sched, s);
 
     if (have)
     {
@@ -1631,6 +1708,14 @@ sai_status_t SwitchBCM56860HW::qosApplyPortShaper(
     }
 
     return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::qosApplyPortShaper(
+        _In_ sai_object_id_t port_id)
+{
+    SWSS_LOG_ENTER();
+
+    return qosApplyPortEffectiveShaper(port_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1845,7 +1930,54 @@ sai_status_t SwitchBCM56860HW::hwRemoveScheduler(
 {
     SWSS_LOG_ENTER();
 
+    std::vector<sai_object_id_t> sgs, queues, ports;
+
+    for (auto it = m_qosSgSched.begin(); it != m_qosSgSched.end();)
+    {
+        if (it->second == sched_id)
+        {
+            sgs.push_back(it->first);
+            it = m_qosSgSched.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (auto it = m_qosQueueSched.begin(); it != m_qosQueueSched.end();)
+    {
+        if (it->second == sched_id)
+        {
+            queues.push_back(it->first);
+            it = m_qosQueueSched.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (auto &kv: m_qosPort)
+    {
+        if (kv.second.scheduler == sched_id)
+        {
+            kv.second.scheduler = SAI_NULL_OBJECT_ID;
+            ports.push_back(kv.first);
+        }
+    }
+
     m_qosSchedulers.erase(sched_id);
+
+    if (!sgs.empty() || !queues.empty() || !ports.empty())
+    {
+        SWSS_LOG_WARN("qos: scheduler %s removed while still bound (sgs=%zu queues=%zu ports=%zu); restoring defaults",
+                sai_serialize_object_id(sched_id).c_str(), sgs.size(), queues.size(), ports.size());
+
+        for (auto sg: sgs) (void)qosApplySgScheduler(sg);
+        for (auto q: queues) (void)qosApplyQueueScheduler(q);
+        for (auto p: ports) (void)qosApplyPortShaper(p);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1863,6 +1995,89 @@ sai_status_t SwitchBCM56860HW::hwRemoveScheduler(
         (hw).max_burst = (q).maxBurst;             \
     } while (0)
 
+sai_status_t SwitchBCM56860HW::qosApplyCosScheduler(
+        _In_ sai_object_id_t port_id,
+        _In_ int cos)
+{
+    SWSS_LOG_ENTER();
+
+    int bcm = bcmPortOf(port_id);
+
+    if (bcm < 0)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (cos < 0 || cos >= HWBCM_QOS_NUM_COS)
+    {
+        SWSS_LOG_WARN("qos: scheduler on cos %d of bcm port %d not reachable in non-ETS mode, ignored",
+                cos, bcm);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // Effective scheduler for L1 node (port, cos): queue-level binding takes
+    // precedence (UC over MC if both are set), else L1 SG binding, else NULL.
+    sai_object_id_t sched = SAI_NULL_OBJECT_ID;
+    bool haveUc = false;
+
+    for (const auto &kv: m_qosQueueHw)
+    {
+        if (kv.second.port != port_id || kv.second.cpu || kv.second.cos != cos)
+        {
+            continue;
+        }
+        auto sit = m_qosQueueSched.find(kv.first);
+        if (sit == m_qosQueueSched.end() || sit->second == SAI_NULL_OBJECT_ID)
+        {
+            continue;
+        }
+        if (!kv.second.mcast || !haveUc)
+        {
+            sched = sit->second;
+            if (!kv.second.mcast)
+            {
+                haveUc = true;
+            }
+        }
+    }
+
+    if (sched == SAI_NULL_OBJECT_ID)
+    {
+        for (const auto &kv: m_qosSgHw)
+        {
+            if (kv.second.port == port_id && kv.second.level == 2 && kv.second.index == cos)
+            {
+                auto sit = m_qosSgSched.find(kv.first);
+                if (sit != m_qosSgSched.end() && sit->second != SAI_NULL_OBJECT_ID)
+                {
+                    sched = sit->second;
+                    break;
+                }
+            }
+        }
+    }
+
+    QosSched s;
+
+    bool have = qosDecodeScheduler(sched, s);
+
+    hwbcm_qos_sched_t hw;
+
+    QOS_TO_HW_SCHED(s, hw);
+
+    int rv = hwbcm_qos_cos_sched_set(bcm, cos, have ? &hw : NULL);
+
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("qos: scheduler %s on bcm port %d cos %d failed: %d",
+                sai_serialize_object_id(sched).c_str(), bcm, cos, rv);
+
+        return SAI_STATUS_FAILURE;
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
 sai_status_t SwitchBCM56860HW::qosApplySgScheduler(
         _In_ sai_object_id_t sg_id)
 {
@@ -1877,59 +2092,23 @@ sai_status_t SwitchBCM56860HW::qosApplySgScheduler(
 
     const QosSgHw &h = it->second;
 
-    auto sit = m_qosSgSched.find(sg_id);
-
-    sai_object_id_t sched = (sit == m_qosSgSched.end()) ? SAI_NULL_OBJECT_ID : sit->second;
-
-    QosSched s;
-
-    bool have = qosDecodeScheduler(sched, s);
-
-    hwbcm_qos_sched_t hw;
-
-    QOS_TO_HW_SCHED(s, hw);
-
-    int rv = 0;
-
     switch (h.level)
     {
         case 2:
-
-            if (h.index >= HWBCM_QOS_NUM_COS)
-            {
-                SWSS_LOG_WARN("qos: scheduler on L1 node %d of bcm port %d not reachable in non-ETS mode, ignored",
-                        h.index, h.bcmPort);
-                return SAI_STATUS_SUCCESS;
-            }
-
-            rv = hwbcm_qos_cos_sched_set(h.bcmPort, h.index, have ? &hw : NULL);
-            break;
+            return qosApplyCosScheduler(h.port, h.index);
 
         case 0:
-
             // root of the port tree: only a max shaper means something
-            rv = hwbcm_qos_port_shaper_set(h.bcmPort, have ? &hw : NULL);
-            break;
+            return qosApplyPortEffectiveShaper(h.port);
 
         default:
-
-            if (have)
+            if (m_qosSgSched.find(sg_id) != m_qosSgSched.end())
             {
                 SWSS_LOG_WARN("qos: scheduler on L0 group %d of bcm port %d has no HW node in non-ETS mode, ignored",
                         h.index, h.bcmPort);
             }
             return SAI_STATUS_SUCCESS;
     }
-
-    if (rv < 0)
-    {
-        SWSS_LOG_ERROR("qos: scheduler %s on bcm port %d level %d index %d failed: %d",
-                sai_serialize_object_id(sched).c_str(), h.bcmPort, h.level, h.index, rv);
-
-        return SAI_STATUS_FAILURE;
-    }
-
-    return SAI_STATUS_SUCCESS;
 }
 
 sai_status_t SwitchBCM56860HW::qosApplyQueueScheduler(
@@ -1944,39 +2123,8 @@ sai_status_t SwitchBCM56860HW::qosApplyQueueScheduler(
         return SAI_STATUS_SUCCESS;
     }
 
-    const QosQueueHw &h = it->second;
-
-    if (h.cos < 0 || h.cos >= HWBCM_QOS_NUM_COS)
-    {
-        SWSS_LOG_WARN("qos: scheduler on queue %d of bcm port %d not reachable in non-ETS mode, ignored",
-                h.cos, h.bcmPort);
-        return SAI_STATUS_SUCCESS;
-    }
-
-    auto sit = m_qosQueueSched.find(queue_id);
-
-    sai_object_id_t sched = (sit == m_qosQueueSched.end()) ? SAI_NULL_OBJECT_ID : sit->second;
-
-    QosSched s;
-
-    bool have = qosDecodeScheduler(sched, s);
-
-    hwbcm_qos_sched_t hw;
-
-    QOS_TO_HW_SCHED(s, hw);
-
-    // UC and MC queue of a cos share the L1 node: the queue's scheduler is
-    // applied to that node.
-    int rv = hwbcm_qos_cos_sched_set(h.bcmPort, h.cos, have ? &hw : NULL);
-
-    if (rv < 0)
-    {
-        SWSS_LOG_ERROR("qos: scheduler on queue %d of bcm port %d failed: %d", h.cos, h.bcmPort, rv);
-
-        return SAI_STATUS_FAILURE;
-    }
-
-    return SAI_STATUS_SUCCESS;
+    // UC and MC queue of a cos share the L1 node: resolve effective scheduler.
+    return qosApplyCosScheduler(it->second.port, it->second.cos);
 }
 
 sai_status_t SwitchBCM56860HW::hwSetSchedulerGroup(
@@ -2045,7 +2193,30 @@ sai_status_t SwitchBCM56860HW::hwRemoveWred(
 {
     SWSS_LOG_ENTER();
 
+    std::vector<sai_object_id_t> queues;
+
+    for (auto it = m_qosQueueWred.begin(); it != m_qosQueueWred.end();)
+    {
+        if (it->second == wred_id)
+        {
+            queues.push_back(it->first);
+            it = m_qosQueueWred.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     m_qosWreds.erase(wred_id);
+
+    if (!queues.empty())
+    {
+        SWSS_LOG_WARN("qos: WRED %s removed while still bound to %zu queue(s); disabling WRED",
+                sai_serialize_object_id(wred_id).c_str(), queues.size());
+
+        for (auto q: queues) (void)qosApplyQueueWred(q);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
@@ -2090,6 +2261,9 @@ sai_status_t SwitchBCM56860HW::qosApplyQueueWred(
         static const sai_attr_id_t mn[3] = { SAI_WRED_ATTR_GREEN_MIN_THRESHOLD, SAI_WRED_ATTR_YELLOW_MIN_THRESHOLD, SAI_WRED_ATTR_RED_MIN_THRESHOLD };
         static const sai_attr_id_t mx[3] = { SAI_WRED_ATTR_GREEN_MAX_THRESHOLD, SAI_WRED_ATTR_YELLOW_MAX_THRESHOLD, SAI_WRED_ATTR_RED_MAX_THRESHOLD };
         static const sai_attr_id_t pr[3] = { SAI_WRED_ATTR_GREEN_DROP_PROBABILITY, SAI_WRED_ATTR_YELLOW_DROP_PROBABILITY, SAI_WRED_ATTR_RED_DROP_PROBABILITY };
+        static const sai_attr_id_t emn[3] = { SAI_WRED_ATTR_ECN_GREEN_MIN_THRESHOLD, SAI_WRED_ATTR_ECN_YELLOW_MIN_THRESHOLD, SAI_WRED_ATTR_ECN_RED_MIN_THRESHOLD };
+        static const sai_attr_id_t emx[3] = { SAI_WRED_ATTR_ECN_GREEN_MAX_THRESHOLD, SAI_WRED_ATTR_ECN_YELLOW_MAX_THRESHOLD, SAI_WRED_ATTR_ECN_RED_MAX_THRESHOLD };
+        static const sai_attr_id_t epr[3] = { SAI_WRED_ATTR_ECN_GREEN_MARK_PROBABILITY, SAI_WRED_ATTR_ECN_YELLOW_MARK_PROBABILITY, SAI_WRED_ATTR_ECN_RED_MARK_PROBABILITY };
 
         sai_attribute_t a;
 
@@ -2114,11 +2288,37 @@ sai_status_t SwitchBCM56860HW::qosApplyQueueWred(
             bool on = getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, en[c], a) && a.value.booldata;
 
             // ECN marking on TD2+ rides on the WRED curve of the color, so a
-            // color that only marks still needs its curve
+            // color that only marks still needs its curve; fall back to the
+            // ECN_* threshold/probability attributes when drop attributes are absent.
             w.enable[c] = (on || ecnColor[c]) ? 1 : 0;
-            w.min_bytes[c] = getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mn[c], a) ? a.value.u32 : 0;
-            w.max_bytes[c] = getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mx[c], a) ? a.value.u32 : 0;
-            w.drop_pct[c] = getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, pr[c], a) ? (int)a.value.u32 : 100;
+
+            bool preferEcn = (!on && ecnColor[c]);
+            sai_attr_id_t mn1 = preferEcn ? emn[c] : mn[c];
+            sai_attr_id_t mn2 = preferEcn ? mn[c] : emn[c];
+            sai_attr_id_t mx1 = preferEcn ? emx[c] : mx[c];
+            sai_attr_id_t mx2 = preferEcn ? mx[c] : emx[c];
+            sai_attr_id_t pr1 = preferEcn ? epr[c] : pr[c];
+            sai_attr_id_t pr2 = preferEcn ? pr[c] : epr[c];
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mn1, a) ||
+                    (ecnColor[c] && getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mn2, a)))
+            {
+                w.min_bytes[c] = a.value.u32;
+            }
+            if (getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mx1, a) ||
+                    (ecnColor[c] && getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, mx2, a)))
+            {
+                w.max_bytes[c] = a.value.u32;
+            }
+            if (getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, pr1, a) ||
+                    (ecnColor[c] && getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, pr2, a)))
+            {
+                w.drop_pct[c] = (int)a.value.u32;
+            }
+            else
+            {
+                w.drop_pct[c] = 100;
+            }
         }
 
         w.ecn = (ecnMode != SAI_ECN_MARK_MODE_NONE) ? 1 : 0;
@@ -2432,7 +2632,44 @@ sai_status_t SwitchBCM56860HW::hwRemoveBufferProfile(
 {
     SWSS_LOG_ENTER();
 
+    std::vector<sai_object_id_t> pgs, queues;
+
+    for (auto it = m_qosPgProfile.begin(); it != m_qosPgProfile.end();)
+    {
+        if (it->second == profile_id)
+        {
+            pgs.push_back(it->first);
+            it = m_qosPgProfile.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    for (auto it = m_qosQueueProfile.begin(); it != m_qosQueueProfile.end();)
+    {
+        if (it->second == profile_id)
+        {
+            queues.push_back(it->first);
+            it = m_qosQueueProfile.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
     m_qosProfiles.erase(profile_id);
+
+    if (!pgs.empty() || !queues.empty())
+    {
+        SWSS_LOG_WARN("qos: buffer profile %s removed while still bound (pgs=%zu queues=%zu); restoring defaults",
+                sai_serialize_object_id(profile_id).c_str(), pgs.size(), queues.size());
+
+        for (auto pg: pgs) (void)qosApplyPgBuffer(pg);
+        for (auto q: queues) (void)qosApplyQueueBuffer(q);
+    }
 
     return SAI_STATUS_SUCCESS;
 }

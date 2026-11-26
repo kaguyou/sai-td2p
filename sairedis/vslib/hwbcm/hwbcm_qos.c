@@ -33,7 +33,9 @@
 
 #include <soc/drv.h>
 #include <soc/mem.h>
+#include <soc/mmu_config.h>
 #include <soc/trident2.h>
+#include <soc/td2_td2p.h>
 
 #include <bcm/types.h>
 #include <bcm/error.h>
@@ -555,6 +557,31 @@ int hwbcm_qos_pg_buffer_set(int port, int pg, const hwbcm_qos_buffer_t *b)
     }
 
     if (pool >= 0 && pool < HWBCM_QOS_NUM_POOL) {
+        int cur_spid = -1;
+        if (qos_pg_spid_get(port, pg, &cur_spid) == 0 && cur_spid != pool) {
+            /* If moving a PG with non-zero min/headroom to another service pool,
+             * return the old min/headroom to the old pool first so both pools'
+             * THDI_BUFFER_CELL_LIMIT_SP stay accurate. */
+            if (qos_pg_entry(port, pg, &mem, &idx, entry) == 0) {
+                uint32 old_min = soc_mem_field32_get(U, mem, entry, PG_MIN_LIMITf);
+                uint32 old_hdrm = soc_mem_field32_get(U, mem, entry, PG_HDRM_LIMITf);
+                if (old_min != 0 || old_hdrm != 0) {
+                    prio = qos_pg_prio(port, pg);
+                    if (prio >= 0) {
+                        if (old_min != 0) {
+                            QCHECK("cosq_control_set(PGMinLimitBytes,0 before pool move)",
+                                   bcm_cosq_control_set(U, port, prio,
+                                                        bcmCosqControlIngressPortPGMinLimitBytes, 0));
+                        }
+                        if (old_hdrm != 0) {
+                            QCHECK("cosq_control_set(PGHeadroomLimitBytes,0 before pool move)",
+                                   bcm_cosq_control_set(U, port, prio,
+                                                        bcmCosqControlIngressPortPGHeadroomLimitBytes, 0));
+                        }
+                    }
+                }
+            }
+        }
         /* THDI_PORT_PG_SPID, keyed by PG (src/bcm/esw/trident2/cosq.c:12000-12030). */
         QCHECK("cosq_control_set(IngressPool)",
                bcm_cosq_control_set(U, port, pg, bcmCosqControlIngressPool, pool));
@@ -604,9 +631,43 @@ typedef struct {
     int have_min, have_dyn, have_shared, have_limit_en, have_pool;
     int min_bytes, dyn, shared_bytes, limit_en, pool;
     uint32 alpha;                    /* soc encoding, valid if dyn */
+    int have_qgrp_min;               /* UC only: boot-time USE_QGROUP_MINf */
+    int qgrp_min_en;
 } qos_q_snap_t;
 
 static qos_q_snap_t s_q_snap[HWBCM_MAX_PORTS][2][HWBCM_QOS_NUM_COS];
+
+/* Clear/set MMU_THDU_{X,Y}PIPE_Q_TO_QGRP_MAP.DISABLE_QUEUINGf for a UC queue.
+ * Workaround for SDK _bcm_td2_cosq_egr_queue_set(): setting Q_MIN=0 when
+ * Q_SHARED_LIMIT_CELL==0 sets DISABLE_QUEUING=1, and subsequent
+ * SharedDynamicEnable(1) or QueueLimitEnable(0) never clears it. */
+static int qos_uc_queue_disable_queuing_set(int port, int cos, int disable)
+{
+    soc_info_t *si = &SOC_INFO(U);
+    uint32 entry[SOC_MAX_MEM_WORDS];
+    soc_mem_t mem;
+    int idx, rv;
+    uint32 want = disable ? 1u : 0u;
+
+    if (cos < 0 || cos >= si->port_num_uc_cosq[port]) {
+        return BCM_E_PARAM;
+    }
+    idx = soc_td2_l2_hw_index(U, si->port_uc_cosq_base[port] + cos, 1);
+    if (idx < 0) {
+        return BCM_E_PARAM;
+    }
+    mem = SOC_TD2_PMEM(U, port, MMU_THDU_XPIPE_Q_TO_QGRP_MAPm,
+                       MMU_THDU_YPIPE_Q_TO_QGRP_MAPm);
+    rv = soc_mem_read(U, mem, MEM_BLOCK_ALL, idx, entry);
+    if (rv < 0) {
+        return rv;
+    }
+    if (soc_mem_field32_get(U, mem, entry, DISABLE_QUEUINGf) == want) {
+        return 0;
+    }
+    soc_mem_field32_set(U, mem, entry, DISABLE_QUEUINGf, want);
+    return soc_mem_write(U, mem, MEM_BLOCK_ALL, idx, entry);
+}
 
 /* Queue alpha: no non-ETS API (the bcm path needs a queue gport,
  * src/bcm/esw/trident2/cosq.c:14666-14717), so mirror its memory writes. */
@@ -698,10 +759,13 @@ static void qos_q_snapshot(int port, int cos, int mcast)
     }
     s->have_limit_en = bcm_cosq_control_get(U, port, cos, t_limit_en, &s->limit_en) == BCM_E_NONE;
     s->have_pool = bcm_cosq_control_get(U, port, cos, t_pool, &s->pool) == BCM_E_NONE;
+    s->have_qgrp_min = (!mcast &&
+        bcm_cosq_control_get(U, port, cos, bcmCosqControlEgressUCQueueGroupMinEnable,
+                             &s->qgrp_min_en) == BCM_E_NONE);
     s->valid = 1;
-    QLOGD("qos: port %d %s cos %d boot: min %d dyn %d shared %d limit_en %d pool %d",
+    QLOGD("qos: port %d %s cos %d boot: min %d dyn %d shared %d limit_en %d pool %d qgrp_min %d",
           port, mcast ? "mc" : "uc", cos, s->min_bytes, s->dyn, s->shared_bytes,
-          s->limit_en, s->pool);
+          s->limit_en, s->pool, s->have_qgrp_min ? s->qgrp_min_en : -1);
 }
 
 static int qos_q_restore(int port, int cos, int mcast)
@@ -711,10 +775,25 @@ static int qos_q_restore(int port, int cos, int mcast)
 
     qos_q_types(mcast, &t_min, &t_shared, &t_dyn, &t_limit_en, &t_pool);
     if (s->have_pool) {
+        int cur_pool = -1, cur_min = 0;
+        if (bcm_cosq_control_get(U, port, cos, t_pool, &cur_pool) == BCM_E_NONE && cur_pool != s->pool) {
+            if (bcm_cosq_control_get(U, port, cos, t_min, &cur_min) == BCM_E_NONE && cur_min > 0) {
+                QCHECK("restore zero min before pool move", bcm_cosq_control_set(U, port, cos, t_min, 0));
+            }
+        }
         QCHECK("restore pool", bcm_cosq_control_set(U, port, cos, t_pool, s->pool));
     }
     if (s->have_min) {
         QCHECK("restore min", bcm_cosq_control_set(U, port, cos, t_min, s->min_bytes));
+    }
+    if (!mcast && s->have_qgrp_min) {
+        int rv = bcm_cosq_control_set(U, port, cos,
+                                      bcmCosqControlEgressUCQueueGroupMinEnable,
+                                      s->qgrp_min_en);
+        if (BCM_FAILURE(rv) && rv != BCM_E_UNAVAIL) {
+            QLOGE("qos: restore qgrp_min: %s (%d)", bcm_errmsg(rv), rv);
+            return rv;
+        }
     }
     if (s->have_dyn) {
         QCHECK("restore dyn", bcm_cosq_control_set(U, port, cos, t_dyn, s->dyn));
@@ -727,6 +806,9 @@ static int qos_q_restore(int port, int cos, int mcast)
     }
     if (s->have_limit_en) {
         QCHECK("restore limit enable", bcm_cosq_control_set(U, port, cos, t_limit_en, s->limit_en));
+    }
+    if (!mcast) {
+        QCHECK("restore disable_queuing", qos_uc_queue_disable_queuing_set(port, cos, 0));
     }
     return 0;
 }
@@ -753,8 +835,30 @@ int hwbcm_qos_queue_buffer_set(int port, int cos, int mcast, const hwbcm_qos_buf
     qos_q_types(mcast, &t_min, &t_shared, &t_dyn, &t_limit_en, &t_pool);
 
     if (b->pool >= 0 && b->pool < HWBCM_QOS_NUM_POOL) {
+        int cur_pool = -1, cur_min = 0;
+        if (bcm_cosq_control_get(U, port, cos, t_pool, &cur_pool) == BCM_E_NONE && cur_pool != b->pool) {
+            /* Return any existing per-queue min cells to the old egress SP
+             * before switching Q_SPIDf so both pools stay balanced. */
+            if (bcm_cosq_control_get(U, port, cos, t_min, &cur_min) == BCM_E_NONE && cur_min > 0) {
+                QCHECK("cosq_control_set(QueueMinLimitBytes,0 before pool move)",
+                       bcm_cosq_control_set(U, port, cos, t_min, 0));
+            }
+        }
         /* Q_SPID of the queue (src/bcm/esw/trident2/cosq.c:12160-12230). */
         QCHECK("cosq_control_set(EgressPool)", bcm_cosq_control_set(U, port, cos, t_pool, b->pool));
+    }
+
+    if (!mcast && b->min_bytes > 0) {
+        /* In TD2+ mmu_lossless=0 mode, init mmu sets USE_QGROUP_MIN=1 on UC
+         * queues; clear it when a profile requests explicit per-queue min so
+         * Q_MIN_LIMIT_CELL takes effect and rebalances the egress pool. */
+        rv = bcm_cosq_control_set(U, port, cos,
+                                  bcmCosqControlEgressUCQueueGroupMinEnable, 0);
+        if (BCM_FAILURE(rv) && rv != BCM_E_UNAVAIL) {
+            QLOGE("qos: cosq_control_set(EgressUCQueueGroupMinEnable,0): %s (%d)",
+                  bcm_errmsg(rv), rv);
+            return rv;
+        }
     }
 
     /* Min goes through the API: it re-balances the egress pool. */
@@ -786,6 +890,10 @@ int hwbcm_qos_queue_buffer_set(int port, int cos, int mcast, const hwbcm_qos_buf
 
     QCHECK("cosq_control_set(QueueLimitEnable)", bcm_cosq_control_set(U, port, cos, t_limit_en, limit_en));
 
+    if (!mcast && (b->dynamic || b->min_bytes > 0 || b->static_bytes > 0 || !limit_en)) {
+        QCHECK("clear uc disable_queuing", qos_uc_queue_disable_queuing_set(port, cos, 0));
+    }
+
     QLOGD("qos: port %d %s cos %d: pool %d min %u %s %d limit_en %d", port, mcast ? "mc" : "uc",
           cos, b->pool, b->min_bytes, b->dynamic ? "alpha_exp" : "static",
           b->dynamic ? qos_alpha_clamp(b->alpha_exp) : (int)b->static_bytes, limit_en);
@@ -810,6 +918,34 @@ int hwbcm_qos_pool_shared_get(int pool, uint32_t *ingress_bytes, uint32_t *egres
                soc_reg32_get(U, MMU_THDM_DB_POOL_SHARED_LIMITr, REG_PORT_ANY, pool, &rval));
         *egress_bytes = soc_reg_field_get(U, MMU_THDM_DB_POOL_SHARED_LIMITr, rval, SHARED_LIMITf) *
                         HWBCM_QOS_CELL_BYTES;
+    }
+    return 0;
+}
+
+int hwbcm_qos_total_buffer_kb_get(uint64_t *kb_out)
+{
+    uint16 dev_id = 0;
+    uint8 rev_id = 0;
+    uint32 *arr = NULL;
+    uint64_t cells = 0;
+
+    if (kb_out == NULL) {
+        return BCM_E_PARAM;
+    }
+    soc_cm_get_id(U, &dev_id, &rev_id);
+#ifdef BCM_TRIDENT2PLUS_SUPPORT
+    if (SOC_IS_TD2P_TT2P(U)) {
+        arr = soc_td2p_mmu_params_arr_get(dev_id, rev_id);
+    } else
+#endif
+    {
+        arr = soc_td2_mmu_params_arr_get(dev_id, rev_id);
+    }
+    if (arr != NULL && arr[_MMU_TOTAL_CELLS] > 0) {
+        cells = (uint64_t)arr[_MMU_TOTAL_CELLS];
+        *kb_out = (cells * (uint64_t)HWBCM_QOS_CELL_BYTES) / 1024ull;
+    } else {
+        *kb_out = SOC_IS_TD2P_TT2P(U) ? 16384ull : 12288ull;
     }
     return 0;
 }
@@ -937,14 +1073,20 @@ int hwbcm_qos_cos_sched_set(int port, int cos, const hwbcm_qos_sched_t *s)
     QCHECK("cosq_gport_bandwidth_set", bcm_cosq_gport_bandwidth_set(U, port, cos, kmin, kmax, flags));
 
     if (s != NULL && s->max_burst != 0 && kmax != 0) {
+        uint32 bmax = qos_kbits(s->max_burst, s->pps);
+        if (bmax > 0x7fffffffu) {
+            bmax = 0x7fffffffu;
+        }
         QCHECK("cosq_control_set(BandwidthBurstMax)",
-               bcm_cosq_control_set(U, port, cos, bcmCosqControlBandwidthBurstMax,
-                                    (int)qos_kbits(s->max_burst, s->pps)));
+               bcm_cosq_control_set(U, port, cos, bcmCosqControlBandwidthBurstMax, (int)bmax));
     }
     if (s != NULL && s->min_burst != 0 && kmin != 0) {
+        uint32 bmin = qos_kbits(s->min_burst, s->pps);
+        if (bmin > 0x7fffffffu) {
+            bmin = 0x7fffffffu;
+        }
         QCHECK("cosq_control_set(BandwidthBurstMin)",
-               bcm_cosq_control_set(U, port, cos, bcmCosqControlBandwidthBurstMin,
-                                    (int)qos_kbits(s->min_burst, s->pps)));
+               bcm_cosq_control_set(U, port, cos, bcmCosqControlBandwidthBurstMin, (int)bmin));
     }
 
     QLOGD("qos: port %d cos %d sched mode %d weight %d min %u max %u%s", port, cos, mode,
@@ -1166,6 +1308,48 @@ void hwbcm_qos_warm_restore(const hwbcm_qos_pg_snap_wb_t *pgs, int npgs,
     }
 
     QLOGI("qos: warm restored %d PG snapshot(s) and %d queue snapshot(s) (zero HW writes)", rpg, rq);
+}
+
+int hwbcm_qos_wb_get_qgrp_snaps(hwbcm_qos_qgrp_wb_t *out, int max)
+{
+    int p, cos, count = 0;
+
+    for (p = 0; p < HWBCM_MAX_PORTS; p++) {
+        for (cos = 0; cos < HWBCM_QOS_NUM_COS; cos++) {
+            const qos_q_snap_t *s = &s_q_snap[p][0][cos];
+            if (!s->valid || !s->have_qgrp_min) {
+                continue;
+            }
+            if (out != NULL && count < max) {
+                out[count].port        = p;
+                out[count].cos         = cos;
+                out[count].qgrp_min_en = s->qgrp_min_en;
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+void hwbcm_qos_warm_restore_qgrp(const hwbcm_qos_qgrp_wb_t *qgrps, int n)
+{
+    int i, rq = 0;
+
+    for (i = 0; i < n && qgrps != NULL; i++) {
+        int p = qgrps[i].port;
+        int cos = qgrps[i].cos;
+        if (p < 0 || p >= HWBCM_MAX_PORTS || cos < 0 || cos >= HWBCM_QOS_NUM_COS) {
+            continue;
+        }
+        if (s_q_snap[p][0][cos].valid) {
+            s_q_snap[p][0][cos].have_qgrp_min = 1;
+            s_q_snap[p][0][cos].qgrp_min_en   = qgrps[i].qgrp_min_en;
+            rq++;
+        }
+    }
+    if (rq > 0) {
+        QLOGI("qos: warm restored %d UC qgroup-min snapshot(s) (zero HW writes)", rq);
+    }
 }
 
 int hwbcm_qos_map_exists(int map_id)
