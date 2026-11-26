@@ -88,3 +88,15 @@ queues are the drop point and equal-weight queues share the port evenly.
 A live `static_th` change on the profile reaches the hardware (PG_SHARED_LIMIT 0xefc0 -> 0x13b14 on 288 PGs).
 Cold swss start and kexec warm-reboot with the new template: ok (true warm boot, QoS restored with zero HW
 writes, MMU tables identical before/after, PC carrier unchanged).
+
+## kexec warm-reboot with the real EVPN peer and loss measurement (lib b7db1af7, final templates)
+
+PC: FRR container (tools/evpn-peer/setup.sh, AS 65200, VTEP 10.1.0.2) + hairpin harness
+(tools/pc-hairpin/pc_hairpin.sh: netns pcB on VLAN 300, ping 192.168.52.2 -> 10.3.0.2 routed by the ASIC).
+BGP l2vpn evpn established, remote VTEP oper_up, tunnel bridge port present before the reboot.
+
+Result: `1771 packets transmitted, 1771 received, 0% packet loss` over 184 s at 0.1 s interval, rtt max
+0.674 ms, no sequence gap; the CPU path (SVI ping) was down 18:48:28 - 18:50:10 (102 s); PC carrier
+unchanged; true warm boot, Case B 66/66, PORT_LIST omitted=1, APPLY_VIEW ok, all daemons reconciled, BGP
+session and remote VTEP back.
+Logs: notes/2026-11-26_wr-real-evpn_syslog.log.gz, notes/2026-11-26_wr-real-evpn_ping_summary.txt.
