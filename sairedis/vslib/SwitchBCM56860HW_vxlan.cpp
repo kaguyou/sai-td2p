@@ -373,7 +373,11 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
     {
         SWSS_LOG_ERROR("remote VTEP %s: network VP creation failed: %d", vtep.ip.c_str(), rc);
 
-        hwbcm_vxlan_egress_destroy(vtep.egr);
+        int drc = hwbcm_vxlan_egress_destroy(vtep.egr);
+        if (drc < 0 && drc != HWBCM_E_NOT_FOUND)
+        {
+            SWSS_LOG_ERROR("remote VTEP %s: rollback egress %d destroy failed: %d", vtep.ip.c_str(), vtep.egr, drc);
+        }
 
         vtep.egr = -1;
         vtep.port = -1;
@@ -404,7 +408,11 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
                     vtep.ip.c_str(), mrc);
             if (egrMc > 0)
             {
-                hwbcm_vxlan_egress_destroy(egrMc);
+                int drc = hwbcm_vxlan_egress_destroy(egrMc);
+                if (drc < 0 && drc != HWBCM_E_NOT_FOUND)
+                {
+                    SWSS_LOG_ERROR("remote VTEP %s: rollback mc egress %d destroy failed: %d", vtep.ip.c_str(), egrMc, drc);
+                }
             }
             egrMc = -1;
             vpMc = -1;
@@ -521,7 +529,11 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
 
             if (vpn >= 0)
             {
-                hwbcm_vxlan_l2_addr_delete(kv.second.mac, vpn);
+                int lrc = hwbcm_vxlan_l2_addr_delete(kv.second.mac, vpn);
+                if (lrc < 0 && lrc != HWBCM_E_NOT_FOUND)
+                {
+                    SWSS_LOG_ERROR("remote VTEP %s: l2 delete in vpn 0x%x failed: %d", vtep.ip.c_str(), vpn, lrc);
+                }
             }
         }
 
@@ -531,7 +543,12 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
             {
                 if (vpn != vtep.vpVpn)
                 {
-                    hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+                    int frc = hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+                    if (frc < 0 && frc != HWBCM_E_NOT_FOUND)
+                    {
+                        SWSS_LOG_ERROR("remote VTEP %s: flood remove vp 0x%x from vpn 0x%x failed: %d",
+                                vtep.ip.c_str(), vtep.vpMc, vpn, frc);
+                    }
                 }
             }
             int mrc = hwbcm_vxlan_port_delete(vtep.vpVpn, vtep.vpMc);
@@ -543,7 +560,11 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
         }
         if (vtep.egrMc > 0)
         {
-            hwbcm_vxlan_egress_destroy(vtep.egrMc);
+            int drc = hwbcm_vxlan_egress_destroy(vtep.egrMc);
+            if (drc < 0 && drc != HWBCM_E_NOT_FOUND)
+            {
+                SWSS_LOG_ERROR("remote VTEP %s: mc egress %d destroy failed: %d", vtep.ip.c_str(), vtep.egrMc, drc);
+            }
             vtep.egrMc = -1;
         }
 
@@ -571,7 +592,11 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
 
     if (vtep.egr > 0)
     {
-        hwbcm_vxlan_egress_destroy(vtep.egr);
+        int drc = hwbcm_vxlan_egress_destroy(vtep.egr);
+        if (drc < 0 && drc != HWBCM_E_NOT_FOUND)
+        {
+            SWSS_LOG_ERROR("remote VTEP %s: egress %d destroy failed: %d", vtep.ip.c_str(), vtep.egr, drc);
+        }
 
         vtep.egr = -1;
         vtep.port = -1;
@@ -1414,11 +1439,20 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
         }
         else if (vtep.floodVpns.count(vpn))
         {
+            int frc = 0;
             if (vtep.vpMc != -1)
             {
-                hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+                frc = hwbcm_vxlan_vpn_flood_set(vpn, vtep.vpMc, 0);
+                if (frc < 0 && frc != HWBCM_E_NOT_FOUND)
+                {
+                    SWSS_LOG_ERROR("remote VTEP %s: flood remove vp 0x%x from vpn 0x%x failed: %d",
+                            vtep.ip.c_str(), vtep.vpMc, vpn, frc);
+                }
             }
-            vtep.floodVpns.erase(vpn);
+            if (frc == 0 || frc == HWBCM_E_NOT_FOUND)
+            {
+                vtep.floodVpns.erase(vpn);
+            }
         }
     }
 

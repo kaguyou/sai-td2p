@@ -124,8 +124,18 @@ int hwbcm_vlan_create(int vid)
         return rv;
     }
     HWBCM_LOGI("vlan %d created", vid);
-    (void)vlan_stg_forward(vid, -1);
-    (void)hwbcm_vlan_cpu_add(vid);
+    rv = vlan_stg_forward(vid, -1);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("vlan %d: vlan_stg_forward failed: %s (%d), rolling back", vid, bcm_errmsg(rv), rv);
+        (void)bcm_vlan_destroy(HWBCM_UNIT, (bcm_vlan_t)vid);
+        return rv;
+    }
+    rv = hwbcm_vlan_cpu_add(vid);
+    if (BCM_FAILURE(rv)) {
+        HWBCM_LOGE("vlan %d: hwbcm_vlan_cpu_add failed: %s (%d), rolling back", vid, bcm_errmsg(rv), rv);
+        (void)bcm_vlan_destroy(HWBCM_UNIT, (bcm_vlan_t)vid);
+        return rv;
+    }
     return 0;
 }
 
@@ -163,8 +173,16 @@ int hwbcm_vlan_port_add(int vid, int port, int tagged)
         BCM_PBMP_PORT_ADD(ubmp, port);
     }
     HWBCM_CHECK("bcm_vlan_port_add", bcm_vlan_port_add(HWBCM_UNIT, (bcm_vlan_t)vid, pbmp, ubmp));
+    {
+        int rv = vlan_stg_forward(vid, port);
+        if (BCM_FAILURE(rv)) {
+            HWBCM_LOGE("vlan %d: vlan_stg_forward(port %d) failed: %s (%d), rolling back",
+                       vid, port, bcm_errmsg(rv), rv);
+            (void)bcm_vlan_port_remove(HWBCM_UNIT, (bcm_vlan_t)vid, pbmp);
+            return rv;
+        }
+    }
     HWBCM_LOGI("vlan %d: port %d added %s", vid, port, tagged ? "tagged" : "untagged");
-    (void)vlan_stg_forward(vid, port);
     return 0;
 }
 

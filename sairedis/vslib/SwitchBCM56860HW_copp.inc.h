@@ -23,8 +23,8 @@
             /* Hostif trap hooks. OnTrapCreate runs after hwCreateHostifTrap
              * (which keeps doing the CPU steering); OnTrapSet re-steers on a
              * PACKET_ACTION / TRAP_GROUP change and re-applies the policing;
-             * OnTrapRemove drops the trap's FP entries. Always SUCCESS (CoPP
-             * failures are logged, orchagent aborts on hostif errors). */
+             * OnTrapRemove drops the trap's FP entries. Propagates real HW
+             * errors while keeping unsupported trap kinds as SUCCESS. */
             sai_status_t hwCoppOnTrapCreate(_In_ sai_object_id_t trap_id);
             sai_status_t hwCoppOnTrapSet(_In_ sai_object_id_t trap_id, _In_ const sai_attribute_t *attr);
             sai_status_t hwCoppOnTrapRemove(_In_ sai_object_id_t trap_id);
@@ -80,12 +80,12 @@
 
             /* (Re)program / forget the FP entries of one trap from its stored
              * attributes. */
-            void coppApplyTrap(_In_ sai_object_id_t trap_id);
+            sai_status_t coppApplyTrap(_In_ sai_object_id_t trap_id);
             void coppForgetTrap(_In_ sai_object_id_t trap_id);
 
             /* Every trap whose group == group_id / whose group uses policer_id. */
-            void coppApplyGroup(_In_ sai_object_id_t group_id);
-            void coppApplyPolicerUsers(_In_ sai_object_id_t policer_id);
+            sai_status_t coppApplyGroup(_In_ sai_object_id_t group_id);
+            sai_status_t coppApplyPolicerUsers(_In_ sai_object_id_t policer_id);
 
             /* All hostif trap oids in the object hash. */
             std::vector<sai_object_id_t> coppAllTraps();

@@ -300,7 +300,11 @@ sai_status_t SwitchBCM56860HW::hwInitialize(
     }
 
     // BST (buffer watermarks) + counter baselines for queue/PG/pool stats
-    (void)hwbcm_stats_init();
+    int srv = hwbcm_stats_init();
+    if (srv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_stats_init failed: %d", srv);
+    }
 
     // link notification thread
 
@@ -348,7 +352,11 @@ sai_status_t SwitchBCM56860HW::initialize_default_objects(
 
     CHECK_STATUS(SwitchBCM56850::initialize_default_objects(attr_count, attr_list));
 
-    (void)qosBuildHwMap();
+    sai_status_t qst = qosBuildHwMap();
+    if (qst != SAI_STATUS_SUCCESS)
+    {
+        SWSS_LOG_ERROR("qosBuildHwMap failed: %d", qst);
+    }
 
     // switch create attributes with a HW effect (e.g. SRC_MAC_ADDRESS)
 

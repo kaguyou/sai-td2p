@@ -293,7 +293,7 @@ void SwitchBCM56860HW::coppForgetTrap(
     m_coppTrapHandle.erase(it);
 }
 
-void SwitchBCM56860HW::coppApplyTrap(
+sai_status_t SwitchBCM56860HW::coppApplyTrap(
         _In_ sai_object_id_t trap_id)
 {
     SWSS_LOG_ENTER();
@@ -305,7 +305,7 @@ void SwitchBCM56860HW::coppApplyTrap(
     if (!getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, trap_id, SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE, a))
     {
         coppForgetTrap(trap_id);
-        return;
+        return SAI_STATUS_SUCCESS;
     }
 
     const int32_t saiType = a.value.s32;
@@ -326,7 +326,7 @@ void SwitchBCM56860HW::coppApplyTrap(
         SWSS_LOG_NOTICE("trap %s type %d: no CoPP classifier on this chip (not policed)", sid.c_str(), saiType);
 
         coppForgetTrap(trap_id);
-        return;
+        return SAI_STATUS_SUCCESS;
     }
 
     if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, trap_id, SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION, a))
@@ -351,7 +351,7 @@ void SwitchBCM56860HW::coppApplyTrap(
     {
         // DROP / FORWARD: nothing reaches the CPU, nothing to police
         coppForgetTrap(trap_id);
-        return;
+        return SAI_STATUS_SUCCESS;
     }
 
     if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, trap_id, SAI_HOSTIF_TRAP_ATTR_TRAP_PRIORITY, a))
@@ -416,7 +416,7 @@ void SwitchBCM56860HW::coppApplyTrap(
     {
         SWSS_LOG_ERROR("trap %s type %d: hwbcm_copp_trap_apply(queue %d prio %u policer %d) failed: %d (steering unchanged)",
                 sid.c_str(), saiType, cfg.queue, cfg.priority, cfg.policer_id, rv);
-        return;
+        return (rv == HWBCM_E_UNAVAIL) ? SAI_STATUS_SUCCESS : bcmRvToSai(rv);
     }
 
     SWSS_LOG_NOTICE("trap %s type %d: group %s queue %d prio %u policer %d, %d FP entries%s",
@@ -425,26 +425,38 @@ void SwitchBCM56860HW::coppApplyTrap(
             cfg.queue, cfg.priority, cfg.policer_id,
             hwbcm_copp_trap_entries(handle),
             hwbcm_copp_trap_entries(handle) == 0 ? " (pending ip2me egress)" : "");
+
+    return SAI_STATUS_SUCCESS;
 }
 
-void SwitchBCM56860HW::coppApplyGroup(
+sai_status_t SwitchBCM56860HW::coppApplyGroup(
         _In_ sai_object_id_t group_id)
 {
     SWSS_LOG_ENTER();
+
+    sai_status_t firstErr = SAI_STATUS_SUCCESS;
 
     for (auto trap: coppAllTraps())
     {
         if (coppTrapGroupOf(trap) == group_id)
         {
-            coppApplyTrap(trap);
+            sai_status_t st = coppApplyTrap(trap);
+            if (st != SAI_STATUS_SUCCESS && firstErr == SAI_STATUS_SUCCESS)
+            {
+                firstErr = st;
+            }
         }
     }
+
+    return firstErr;
 }
 
-void SwitchBCM56860HW::coppApplyPolicerUsers(
+sai_status_t SwitchBCM56860HW::coppApplyPolicerUsers(
         _In_ sai_object_id_t policer_id)
 {
     SWSS_LOG_ENTER();
+
+    sai_status_t firstErr = SAI_STATUS_SUCCESS;
 
     for (auto trap: coppAllTraps())
     {
@@ -456,9 +468,15 @@ void SwitchBCM56860HW::coppApplyPolicerUsers(
                 getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP, group, SAI_HOSTIF_TRAP_GROUP_ATTR_POLICER, a) &&
                 a.value.oid == policer_id)
         {
-            coppApplyTrap(trap);
+            sai_status_t st = coppApplyTrap(trap);
+            if (st != SAI_STATUS_SUCCESS && firstErr == SAI_STATUS_SUCCESS)
+            {
+                firstErr = st;
+            }
         }
     }
+
+    return firstErr;
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +544,7 @@ sai_status_t SwitchBCM56860HW::hwSetPolicer(
                 {
                     SWSS_LOG_ERROR("policer %s: hwbcm_copp_policer_set(%d) failed: %d",
                             sai_serialize_object_id(policer_id).c_str(), it->second, rv);
+                    return bcmRvToSai(rv);
                 }
             }
             break;
@@ -535,8 +554,7 @@ sai_status_t SwitchBCM56860HW::hwSetPolicer(
         case SAI_POLICER_ATTR_RED_PACKET_ACTION:
 
             // colour actions live in the FP entries
-            coppApplyPolicerUsers(policer_id);
-            break;
+            return coppApplyPolicerUsers(policer_id);
 
         default:
             SWSS_LOG_INFO("policer %s attr %d: no HW effect",
@@ -602,9 +620,7 @@ sai_status_t SwitchBCM56860HW::hwCreateHostifTrapGroup(
             sai_serialize_object_id(group_id).c_str(),
             q ? (int)q->value.u32 : 0);
 
-    coppApplyGroup(group_id);
-
-    return SAI_STATUS_SUCCESS;
+    return coppApplyGroup(group_id);
 }
 
 sai_status_t SwitchBCM56860HW::hwSetHostifTrapGroup(
@@ -618,8 +634,7 @@ sai_status_t SwitchBCM56860HW::hwSetHostifTrapGroup(
         case SAI_HOSTIF_TRAP_GROUP_ATTR_QUEUE:
         case SAI_HOSTIF_TRAP_GROUP_ATTR_POLICER:
 
-            coppApplyGroup(group_id);
-            break;
+            return coppApplyGroup(group_id);
 
         default:
             SWSS_LOG_INFO("trap group %s attr %d: no HW effect",
@@ -651,9 +666,7 @@ sai_status_t SwitchBCM56860HW::hwCoppOnTrapCreate(
 {
     SWSS_LOG_ENTER();
 
-    coppApplyTrap(trap_id);
-
-    return SAI_STATUS_SUCCESS;
+    return coppApplyTrap(trap_id);
 }
 
 sai_status_t SwitchBCM56860HW::hwCoppOnTrapSet(
@@ -678,17 +691,21 @@ sai_status_t SwitchBCM56860HW::hwCoppOnTrapSet(
 
                 if (attr->id == SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION)
                 {
-                    (void)hwCreateHostifTrap(trap_id, n, attrs);
+                    sai_status_t st = hwCreateHostifTrap(trap_id, n, attrs);
+                    if (st != SAI_STATUS_SUCCESS)
+                    {
+                        SWSS_LOG_ERROR("trap %s: hwCreateHostifTrap on PACKET_ACTION set failed: %d",
+                                sai_serialize_object_id(trap_id).c_str(), st);
+                        return st;
+                    }
                 }
 
-                coppApplyTrap(trap_id);
+                return coppApplyTrap(trap_id);
             }
-            break;
 
         case SAI_HOSTIF_TRAP_ATTR_TRAP_PRIORITY:
 
-            coppApplyTrap(trap_id);
-            break;
+            return coppApplyTrap(trap_id);
 
         default:
             // EXCLUDE_PORT_LIST, MIRROR_SESSION: not implemented;

@@ -2202,7 +2202,12 @@ void SwitchBCM56860HW::hwAclObjectRemoved(
 
     for (auto t: tables)
     {
-        aclRefreshTable(t);
+        sai_status_t st = aclRefreshTable(t);
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("ACL object %s removed: aclRefreshTable(%s) failed: %d",
+                    sai_serialize_object_id(oid).c_str(), sai_serialize_object_id(t).c_str(), st);
+        }
     }
 }
 
@@ -2234,7 +2239,12 @@ void SwitchBCM56860HW::hwAclLagMembersChanged(
 
     for (auto t: tables)
     {
-        aclRefreshTable(t);
+        sai_status_t st = aclRefreshTable(t);
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("ACL LAG %s changed: aclRefreshTable(%s) failed: %d",
+                    sai_serialize_object_id(lag_oid).c_str(), sai_serialize_object_id(t).c_str(), st);
+        }
     }
 }
 
@@ -2283,7 +2293,13 @@ void SwitchBCM56860HW::hwAclMirrorSessionUpdated(
 
         if (uses)
         {
-            aclProgramEntry(kv.first);
+            sai_status_t st = aclProgramEntry(kv.first);
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("ACL mirror session %s updated: aclProgramEntry(%s) failed: %d",
+                        sai_serialize_object_id(session_oid).c_str(),
+                        sai_serialize_object_id(kv.first).c_str(), st);
+            }
         }
     }
 }

@@ -1955,9 +1955,14 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     {
         ecmps.push_back(kv.second);
     }
-    (void)hwbcm_l3_warm_restore(
+    int l3rv = hwbcm_l3_warm_restore(
             vrfs.empty() ? NULL : vrfs.data(), static_cast<int>(vrfs.size()),
             ecmps.empty() ? NULL : ecmps.data(), static_cast<int>(ecmps.size()));
+    if (l3rv < 0)
+    {
+        SWSS_LOG_ERROR("wb hwstate: hwbcm_l3_warm_restore failed: %d", l3rv);
+        return false;
+    }
 
     hwWarmRebuildLagAndL3FromHash();
 
@@ -1969,11 +1974,16 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
 
     if (haveVxlan)
     {
-        (void)hwbcm_vxlan_warm_restore(
+        int vrv = hwbcm_vxlan_warm_restore(
                 vxlanCInited, vxlanCUdpPort,
                 vxlanVps.empty() ? NULL : vxlanVps.data(), static_cast<int>(vxlanVps.size()),
                 vxlanAccIntfs.empty() ? NULL : vxlanAccIntfs.data(), static_cast<int>(vxlanAccIntfs.size()),
                 vxlanVpnL3.empty() ? NULL : vxlanVpnL3.data(), static_cast<int>(vxlanVpnL3.size()));
+        if (vrv < 0)
+        {
+            SWSS_LOG_ERROR("wb hwstate: hwbcm_vxlan_warm_restore failed: %d", vrv);
+            return false;
+        }
     }
     else
     {
@@ -2000,10 +2010,15 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
 
     if (haveCopp)
     {
-        (void)hwbcm_copp_warm_restore(
+        int crv = hwbcm_copp_warm_restore(
                 &coppGlobals,
                 coppPols.empty() ? NULL : coppPols.data(), static_cast<int>(coppPols.size()),
                 coppSlots.empty() ? NULL : coppSlots.data(), static_cast<int>(coppSlots.size()));
+        if (crv < 0)
+        {
+            SWSS_LOG_ERROR("wb hwstate: hwbcm_copp_warm_restore failed: %d", crv);
+            return false;
+        }
     }
     else
     {

@@ -3128,9 +3128,10 @@ int hwbcm_port_pvid_set(int port, int vid)
     HWBCM_LOGD("port %d: pvid %d", port, vid);
 
     /* Rebuild the tag-stripping KNET filter of any netif bound to this port. */
-    pthread_mutex_lock(&g_knet_lock);
     {
-        int i;
+        int i, filter_rv = 0;
+
+        pthread_mutex_lock(&g_knet_lock);
         for (i = 0; i < HWBCM_KNET_MAX; i++) {
             hwbcm_knet_slot_t *slot = &g_knet[i];
             if (slot->netif_id == 0 || slot->port != port || slot->pvid == vid) {
@@ -3140,12 +3141,23 @@ int hwbcm_port_pvid_set(int port, int vid)
             slot->pvid = vid;
             {
                 char name[BCM_KNET_NETIF_NAME_MAX];
+                int frv;
                 snprintf(name, sizeof(name), "netif%d", slot->netif_id);
-                (void)knet_pvid_filter_create(slot, name);
+                frv = knet_pvid_filter_create(slot, name);
+                if (BCM_FAILURE(frv)) {
+                    HWBCM_LOGE("port %d: knet_pvid_filter_create(netif %d, vid %d) failed: %s (%d)",
+                               port, slot->netif_id, vid, bcm_errmsg(frv), frv);
+                    if (filter_rv == 0) {
+                        filter_rv = frv;
+                    }
+                }
             }
         }
+        pthread_mutex_unlock(&g_knet_lock);
+        if (BCM_FAILURE(filter_rv)) {
+            return filter_rv;
+        }
     }
-    pthread_mutex_unlock(&g_knet_lock);
     return 0;
 }
 
@@ -3544,7 +3556,11 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
         return rv;
     }
     if (hwbcm_riot_enabled()) {
-        (void)knet_vfi_filter_create(slot, netif.name);   /* not fatal */
+        int vrv = knet_vfi_filter_create(slot, netif.name);
+        if (BCM_FAILURE(vrv)) {
+            HWBCM_LOGW("knet: netif %d (%s) port %d VFI tag-strip filter failed (%s); continuing without it",
+                       netif.id, netif.name, port, bcm_errmsg(vrv));
+        }
     }
 
     /* Filter (b): everything else that ingressed on this port, tag kept

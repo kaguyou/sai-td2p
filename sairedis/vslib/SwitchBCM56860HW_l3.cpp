@@ -610,6 +610,38 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
         }
 
         dedicatedVlan = true;
+        int defVid = vidOf(m_default_vlan_id);
+        if (defVid < 0)
+        {
+            defVid = 1;
+        }
+        std::vector<int> addedPorts;
+        std::vector<int> pvidPorts;
+
+        auto rollbackVlan = [&]()
+        {
+            for (int rp: pvidPorts)
+            {
+                int rrv = hwbcm_port_pvid_set(rp, defVid);
+                if (rrv < 0)
+                {
+                    SWSS_LOG_ERROR("rif %s: rollback hwbcm_port_pvid_set(%d, %d) failed: %d", srif.c_str(), rp, defVid, rrv);
+                }
+            }
+            for (int rp: addedPorts)
+            {
+                int rrv = hwbcm_vlan_port_remove(vid, rp);
+                if (rrv < 0)
+                {
+                    SWSS_LOG_ERROR("rif %s: rollback hwbcm_vlan_port_remove(%d, %d) failed: %d", srif.c_str(), vid, rp, rrv);
+                }
+            }
+            int drv = hwbcm_vlan_destroy(vid);
+            if (drv < 0)
+            {
+                SWSS_LOG_ERROR("rif %s: rollback hwbcm_vlan_destroy(%d) failed: %d", srif.c_str(), vid, drv);
+            }
+        };
 
         for (int p: memberPorts)
         {
@@ -618,18 +650,20 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("rif %s: hwbcm_vlan_port_add(%d, %d) failed: %d", srif.c_str(), vid, p, rv);
-                hwbcm_vlan_destroy(vid);
+                rollbackVlan();
                 return bcmRvToSai(rv);
             }
+            addedPorts.push_back(p);
 
             rv = hwbcm_port_pvid_set(p, vid);
 
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("rif %s: hwbcm_port_pvid_set(%d, %d) failed: %d", srif.c_str(), p, vid, rv);
-                hwbcm_vlan_destroy(vid);
+                rollbackVlan();
                 return bcmRvToSai(rv);
             }
+            pvidPorts.push_back(p);
         }
     }
 
@@ -643,7 +677,29 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
 
         if (dedicatedVlan)
         {
-            hwbcm_vlan_destroy(vid);
+            int defVid = vidOf(m_default_vlan_id);
+            if (defVid < 0)
+            {
+                defVid = 1;
+            }
+            for (int p: memberPorts)
+            {
+                int rrv = hwbcm_port_pvid_set(p, defVid);
+                if (rrv < 0)
+                {
+                    SWSS_LOG_ERROR("rif %s: rollback hwbcm_port_pvid_set(%d, %d) failed: %d", srif.c_str(), p, defVid, rrv);
+                }
+                rrv = hwbcm_vlan_port_remove(vid, p);
+                if (rrv < 0)
+                {
+                    SWSS_LOG_ERROR("rif %s: rollback hwbcm_vlan_port_remove(%d, %d) failed: %d", srif.c_str(), vid, p, rrv);
+                }
+            }
+            int drv = hwbcm_vlan_destroy(vid);
+            if (drv < 0)
+            {
+                SWSS_LOG_ERROR("rif %s: rollback hwbcm_vlan_destroy(%d) failed: %d", srif.c_str(), vid, drv);
+            }
         }
 
         return bcmRvToSai(rv);
@@ -807,8 +863,16 @@ sai_status_t SwitchBCM56860HW::hwRemoveRouterInterface(
 
                 for (int p: ports)
                 {
-                    hwbcm_port_pvid_set(p, defVid);
-                    hwbcm_vlan_port_remove(vid, p);
+                    int prv = hwbcm_port_pvid_set(p, defVid);
+                    if (prv < 0)
+                    {
+                        SWSS_LOG_ERROR("rif %s: hwbcm_port_pvid_set(%d, %d) failed: %d", srif.c_str(), p, defVid, prv);
+                    }
+                    int rrv = hwbcm_vlan_port_remove(vid, p);
+                    if (rrv < 0)
+                    {
+                        SWSS_LOG_ERROR("rif %s: hwbcm_vlan_port_remove(%d, %d) failed: %d", srif.c_str(), vid, p, rrv);
+                    }
                 }
             }
 
