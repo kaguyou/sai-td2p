@@ -1,6 +1,20 @@
 --- sdk-6.5.27/src/soc/esw/trident2.c	2026-11-20 18:05:50.764794576 +0900
-+++ sdk-6.5.27-wb/src/soc/esw/trident2.c	2026-11-26 17:49:16.712154651 +0900
-@@ -13437,10 +13437,16 @@
++++ sdk-6.5.27-wb/src/soc/esw/trident2.c	2026-11-27 15:48:10.618837697 +0900
+@@ -13277,7 +13277,12 @@
+             (soc_mem_clear(unit, FP_GLOBAL_MASK_TCAMm, COPYNO_ALL, TRUE));
+     }
+ 
+-    SOC_IF_ERROR_RETURN(_soc_trident2_port_init(unit));
++    /* sai-td2p: on warm boot skip _soc_trident2_port_init (pure HW writes:
++     * soc_td2_port_asf_set with port_speed_max would clobber live 1G ASF
++     * speed settings, and 100G egr_buf_reset would reset live buffers). */
++    if (!SOC_WARM_BOOT(unit)) {
++        SOC_IF_ERROR_RETURN(_soc_trident2_port_init(unit));
++    }
+ 
+     /* Enable QGPORT in XLPORT3 block (if present) */
+     SOC_PBMP_ITER(si->management_pbm, port) {
+@@ -13437,10 +13442,16 @@
          SOC_IF_ERROR_RETURN
              (WRITE_EGR_ENABLEm(unit, MEM_BLOCK_ALL, loopback_port, entry));
      }
@@ -21,7 +35,51 @@
  
  #ifdef BCM_TRIDENT2PLUS_SUPPORT
      if ((SOC_IS_TRIDENT2PLUS(unit) || SOC_IS_TITAN2PLUS(unit))) {
-@@ -16030,15 +16036,19 @@
+@@ -13474,7 +13485,9 @@
+ #endif
+ 
+ #ifdef BCM_TRIDENT2PLUS_SUPPORT
+-    if (SOC_IS_TD2P_TT2P(unit)) {
++    /* sai-td2p: pure HW writes (ING_DEST_PORT_ENABLEm, MODPORT_MAP_SUBPORTm,
++     * MY_MODID_SET_2_64r) - preserve live HW tables on warm boot. */
++    if (SOC_IS_TD2P_TT2P(unit) && !SOC_WARM_BOOT(unit)) {
+         /* enable all ports */
+         ing_dest_port_enable_entry_t ingr_entry;
+         modport_map_subport_entry_t map_entry;
+@@ -13566,7 +13579,10 @@
+     /* The HW defaults for EGR_VLAN_CONTROL_1.VT_MISS_UNTAG == 1, which
+      * causes the outer tag to be removed from packets that don't have
+      * a hit in the egress vlan tranlation table. Set to 0 to disable this.
++     * sai-td2p: on warm boot preserve live per-port EGR_VLAN_CONTROL_1m
++     * (REMARK_OUTER_DSCP, REMARK_OUTER_DOT1P, VT_ENABLE, TPID) set by QoS/port.
+      */
++    if (!SOC_WARM_BOOT(unit)) {
+ #ifdef BCM_TRIDENT2PLUS_SUPPORT
+     if (soc_feature(unit, soc_feature_egr_vlan_control_is_memory)) {
+         egr_vlan_control_1_entry_t entry;
+@@ -13593,6 +13609,7 @@
+             SOC_IF_ERROR_RETURN(WRITE_EGR_VLAN_CONTROL_1r(unit, port, rval));
+         }
+     }
++    }
+ 
+     SOC_PBMP_ASSIGN(pbmp, PBMP_ALL(unit));
+     SOC_PBMP_REMOVE(pbmp, PBMP_LB(unit));
+@@ -13648,8 +13665,11 @@
+     SOC_IF_ERROR_RETURN(soc_reg_fields32_modify(unit,
+                 SW2_FP_DST_ACTION_CONTROLr, REG_PORT_ANY, 2, fields, values));
+ 
+-    /* Populate and enable RTAG7 Macro flow offset table */
+-    if (soc_mem_is_valid(unit, RTAG7_FLOW_BASED_HASHm)) {
++    /* Populate and enable RTAG7 Macro flow offset table.
++     * sai-td2p: on warm boot preserve live RTAG7_HASH_SELr (cold hash_init
++     * sets USE_FLOW_SEL_ECMP=0 for port-based RTAG7; overwriting it with 1
++     * here broke ECMP hashing after warm boot). */
++    if (!SOC_WARM_BOOT(unit) && soc_mem_is_valid(unit, RTAG7_FLOW_BASED_HASHm)) {
+         count = soc_mem_index_max(unit, RTAG7_FLOW_BASED_HASHm);
+         sal_memset(entry, 0, ent_sz);
+         for (index = 0; index < count; ) {
+@@ -16030,15 +16050,19 @@
      _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl_scache_p;
      _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl;
  
@@ -45,7 +103,7 @@
      mmu_traffic_ctrl_scache_p++;
  
      *scache_ptr = (uint8 *)mmu_traffic_ctrl_scache_p;
-@@ -16051,14 +16061,33 @@
+@@ -16051,14 +16075,33 @@
      _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl_scache_p;
      _soc_td2_mmu_traffic_ctrl_t *mmu_traffic_ctrl;
  
@@ -82,7 +140,7 @@
      sal_memcpy(mmu_traffic_ctrl, mmu_traffic_ctrl_scache_p, sizeof(_soc_td2_mmu_traffic_ctrl_t));
      mmu_traffic_ctrl_scache_p++;
  
-@@ -16113,6 +16142,14 @@
+@@ -16113,6 +16156,14 @@
          sal_memset(_soc_td2_mmu_traffic_ctrl[unit], 0, alloc_size);
      }
  

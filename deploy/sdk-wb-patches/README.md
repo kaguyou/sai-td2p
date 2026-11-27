@@ -5,6 +5,9 @@ differs from sdk-6.5.27 only in these files. Apply with `patch -p1` from the SDK
 (paths are sdk-6.5.27/... vs sdk-6.5.27-wb/..., so use `patch -p1 -d sdk-6.5.27-wb`).
 
 - trident2.c: keep EPC_LINK_BMAP on warm in _soc_trident2_misc_init (8593a21);
+  guard _soc_trident2_port_init (ASF speed), ING_DEST_PORT_ENABLEm/MODPORT_MAP_SUBPORTm,
+  EGR_VLAN_CONTROL_1m (egress DSCP/dot1p remarking), and RTAG7_FLOW_BASED_HASHm/RTAG7_HASH_SELr
+  (USE_FLOW_SEL_ECMP=0 from cold hash_init) with !SOC_WARM_BOOT(unit) in _soc_trident2_misc_init;
   soc_td2_mmu_traffic_ctrl_wb_restore fix so cosq reinit reaches NUM_COS (16c9d22, 2026-11-25:
   NUM_COS was 0 after every warm init -> KNET Case B netif_create PARAM, cosq stats failing).
 - link.c: wbtrace syslog in _soc_link_update / soc_link_fwd_set (debug only).
