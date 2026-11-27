@@ -931,45 +931,99 @@ sai_status_t SwitchBCM56860HW::qosHwSetPort(
 
     if (slot >= 0)
     {
+        sai_object_id_t prev = ps.maps[slot];
         ps.maps[slot] = attr->value.oid;
 
-        return qosApplyPortSlot(port_id, slot);
+        sai_status_t st = qosApplyPortSlot(port_id, slot);
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            ps.maps[slot] = prev;
+        }
+        return st;
     }
 
     switch (attr->id)
     {
         case SAI_PORT_ATTR_QOS_DEFAULT_TC:
-
-            ps.defaultTc = (int)attr->value.u8;
-            return qosApplyPortDefaultTc(port_id);
+            {
+                int prev = ps.defaultTc;
+                ps.defaultTc = (int)attr->value.u8;
+                sai_status_t st = qosApplyPortDefaultTc(port_id);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.defaultTc = prev;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_QOS_SCHEDULER_PROFILE_ID:
-
-            ps.scheduler = attr->value.oid;
-            return qosApplyPortShaper(port_id);
+            {
+                sai_object_id_t prev = ps.scheduler;
+                ps.scheduler = attr->value.oid;
+                sai_status_t st = qosApplyPortShaper(port_id);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.scheduler = prev;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL:
-
-            ps.pfcCombined = attr->value.u8;
-            ps.pfcTouched = true;
-            return qosApplyPortPfc(port_id);
+            {
+                uint8_t prev = ps.pfcCombined;
+                bool prevTouched = ps.pfcTouched;
+                ps.pfcCombined = attr->value.u8;
+                ps.pfcTouched = true;
+                sai_status_t st = qosApplyPortPfc(port_id);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.pfcCombined = prev;
+                    ps.pfcTouched = prevTouched;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_MODE:
-
-            ps.pfcSeparate = (attr->value.s32 == SAI_PORT_PRIORITY_FLOW_CONTROL_MODE_SEPARATE);
-            return ps.pfcTouched ? qosApplyPortPfc(port_id) : SAI_STATUS_SUCCESS;
+            {
+                bool prev = ps.pfcSeparate;
+                ps.pfcSeparate = (attr->value.s32 == SAI_PORT_PRIORITY_FLOW_CONTROL_MODE_SEPARATE);
+                sai_status_t st = ps.pfcTouched ? qosApplyPortPfc(port_id) : SAI_STATUS_SUCCESS;
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.pfcSeparate = prev;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_RX:
-
-            ps.pfcRx = attr->value.u8;
-            ps.pfcTouched = true;
-            return qosApplyPortPfc(port_id);
+            {
+                uint8_t prev = ps.pfcRx;
+                bool prevTouched = ps.pfcTouched;
+                ps.pfcRx = attr->value.u8;
+                ps.pfcTouched = true;
+                sai_status_t st = qosApplyPortPfc(port_id);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.pfcRx = prev;
+                    ps.pfcTouched = prevTouched;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_PRIORITY_FLOW_CONTROL_TX:
-
-            ps.pfcTx = attr->value.u8;
-            ps.pfcTouched = true;
-            return qosApplyPortPfc(port_id);
+            {
+                uint8_t prev = ps.pfcTx;
+                bool prevTouched = ps.pfcTouched;
+                ps.pfcTx = attr->value.u8;
+                ps.pfcTouched = true;
+                sai_status_t st = qosApplyPortPfc(port_id);
+                if (st != SAI_STATUS_SUCCESS)
+                {
+                    ps.pfcTx = prev;
+                    ps.pfcTouched = prevTouched;
+                }
+                return st;
+            }
 
         case SAI_PORT_ATTR_QOS_INGRESS_BUFFER_PROFILE_LIST:
         case SAI_PORT_ATTR_QOS_EGRESS_BUFFER_PROFILE_LIST:
@@ -1020,6 +1074,7 @@ sai_status_t SwitchBCM56860HW::qosHwSetSwitch(
 
     if (attr->id == SAI_SWITCH_ATTR_QOS_DEFAULT_TC)
     {
+        int prev = m_qosSwitchDefaultTc;
         m_qosSwitchDefaultTc = (int)attr->value.u8;
 
         for (auto p: ports)
@@ -1028,6 +1083,11 @@ sai_status_t SwitchBCM56860HW::qosHwSetSwitch(
             {
                 status = SAI_STATUS_FAILURE;
             }
+        }
+
+        if (status != SAI_STATUS_SUCCESS)
+        {
+            m_qosSwitchDefaultTc = prev;
         }
 
         return status;
@@ -1040,6 +1100,7 @@ sai_status_t SwitchBCM56860HW::qosHwSetSwitch(
         return SAI_STATUS_SUCCESS;
     }
 
+    sai_object_id_t prevMap = m_qosSwitchMaps[slot];
     m_qosSwitchMaps[slot] = attr->value.oid;
 
     for (auto p: ports)
@@ -1049,6 +1110,11 @@ sai_status_t SwitchBCM56860HW::qosHwSetSwitch(
         {
             status = SAI_STATUS_FAILURE;
         }
+    }
+
+    if (status != SAI_STATUS_SUCCESS)
+    {
+        m_qosSwitchMaps[slot] = prevMap;
     }
 
     return status;
@@ -2138,6 +2204,10 @@ sai_status_t SwitchBCM56860HW::hwSetSchedulerGroup(
         return SAI_STATUS_SUCCESS; // tree bookkeeping (CHILD_LIST etc.)
     }
 
+    auto prevIt = m_qosSgSched.find(sg_id);
+    bool hadPrev = (prevIt != m_qosSgSched.end());
+    sai_object_id_t prevVal = hadPrev ? prevIt->second : SAI_NULL_OBJECT_ID;
+
     if (attr->value.oid == SAI_NULL_OBJECT_ID)
     {
         m_qosSgSched.erase(sg_id);
@@ -2147,7 +2217,15 @@ sai_status_t SwitchBCM56860HW::hwSetSchedulerGroup(
         m_qosSgSched[sg_id] = attr->value.oid;
     }
 
-    return qosApplySgScheduler(sg_id);
+    sai_status_t st = qosApplySgScheduler(sg_id);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        if (hadPrev) m_qosSgSched[sg_id] = prevVal;
+        else m_qosSgSched.erase(sg_id);
+    }
+
+    return st;
 }
 
 // ---------------------------------------------------------------------------
@@ -2837,22 +2915,38 @@ sai_status_t SwitchBCM56860HW::hwSetQueue(
         }
     };
 
+    auto bindAndApply = [&](std::map<sai_object_id_t, sai_object_id_t> &m,
+                            sai_status_t (SwitchBCM56860HW::*applyFn)(sai_object_id_t)) -> sai_status_t
+    {
+        auto prevIt = m.find(queue_id);
+        bool hadPrev = (prevIt != m.end());
+        sai_object_id_t prevVal = hadPrev ? prevIt->second : SAI_NULL_OBJECT_ID;
+
+        bind(m);
+        sai_status_t st = (this->*applyFn)(queue_id);
+
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            if (hadPrev) m[queue_id] = prevVal;
+            else m.erase(queue_id);
+        }
+
+        return st;
+    };
+
     switch (attr->id)
     {
         case SAI_QUEUE_ATTR_SCHEDULER_PROFILE_ID:
 
-            bind(m_qosQueueSched);
-            return qosApplyQueueScheduler(queue_id);
+            return bindAndApply(m_qosQueueSched, &SwitchBCM56860HW::qosApplyQueueScheduler);
 
         case SAI_QUEUE_ATTR_WRED_PROFILE_ID:
 
-            bind(m_qosQueueWred);
-            return qosApplyQueueWred(queue_id);
+            return bindAndApply(m_qosQueueWred, &SwitchBCM56860HW::qosApplyQueueWred);
 
         case SAI_QUEUE_ATTR_BUFFER_PROFILE_ID:
 
-            bind(m_qosQueueProfile);
-            return qosApplyQueueBuffer(queue_id);
+            return bindAndApply(m_qosQueueProfile, &SwitchBCM56860HW::qosApplyQueueBuffer);
 
         case SAI_QUEUE_ATTR_PFC_DLR_INIT:
         case SAI_QUEUE_ATTR_ENABLE_PFC_DLDR:
@@ -2878,6 +2972,10 @@ sai_status_t SwitchBCM56860HW::hwSetIngressPriorityGroup(
         return SAI_STATUS_SUCCESS;
     }
 
+    auto prevIt = m_qosPgProfile.find(pg_id);
+    bool hadPrev = (prevIt != m_qosPgProfile.end());
+    sai_object_id_t prevVal = hadPrev ? prevIt->second : SAI_NULL_OBJECT_ID;
+
     if (attr->value.oid == SAI_NULL_OBJECT_ID)
     {
         m_qosPgProfile.erase(pg_id);
@@ -2887,5 +2985,13 @@ sai_status_t SwitchBCM56860HW::hwSetIngressPriorityGroup(
         m_qosPgProfile[pg_id] = attr->value.oid;
     }
 
-    return qosApplyPgBuffer(pg_id);
+    sai_status_t st = qosApplyPgBuffer(pg_id);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        if (hadPrev) m_qosPgProfile[pg_id] = prevVal;
+        else m_qosPgProfile.erase(pg_id);
+    }
+
+    return st;
 }

@@ -1431,9 +1431,12 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
 
     int rc = hwbcm_vxlan_vpn_destroy(vpn);
 
-    if (rc < 0)
+    if (rc < 0 && rc != HWBCM_E_NOT_FOUND)
     {
-        SWSS_LOG_ERROR("vpn 0x%x (vni %u) destroy failed: %d", vpn, vni, rc);
+        SWSS_LOG_ERROR("vpn 0x%x (vni %u) destroy failed: %d (keeping map state for retry)", vpn, vni, rc);
+        m_mapEntryVidVni[entry_id] = std::make_pair(vid, vni);
+        m_vniRefs[vni] = 1;
+        return bcmRvToSai(rc);
     }
 
     m_vniToVpn.erase(vp);
@@ -1453,7 +1456,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
         }
     }
 
-    return rc < 0 ? bcmRvToSai(rc) : SAI_STATUS_SUCCESS;
+    return SAI_STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,10 +1728,10 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
         memcpy(m.mac, fdb.mac_address, sizeof(sai_mac_t));
         m.vid = vid;
 
-        vtep.macs[key] = m;
-
         if (!vtep.vpReady || vpn < 0)
         {
+            vtep.macs[key] = m;
+
             SWSS_LOG_NOTICE("fdb %s on %s deferred (vp ready %d, vpn %d)", key.c_str(), vtep.ip.c_str(), vtep.vpReady ? 1 : 0, vpn);
 
             return SAI_STATUS_SUCCESS;
@@ -1742,6 +1745,8 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
 
             return bcmRvToSai(rc);
         }
+
+        vtep.macs[key] = m;
 
         SWSS_LOG_INFO("fdb %s -> remote VTEP %s (vpn 0x%x, vp 0x%x)", key.c_str(), vtep.ip.c_str(), vpn, vtep.vp);
 

@@ -913,6 +913,8 @@ sai_status_t SwitchBCM56860HW::hwCreatePort(
 
         if (status != SAI_STATUS_SUCCESS)
         {
+            qosOnPortRemoved(port_id);
+            mirrorOnPortRemoved(port_id);
             unmapPort(port_id);
 
             return status;
@@ -2360,6 +2362,8 @@ sai_status_t SwitchBCM56860HW::hwCreateVlanMember(
         return SAI_STATUS_SUCCESS;
     }
 
+    std::vector<int> addedPorts;
+
     for (int bcm: ports)
     {
         int rv = hwbcm_vlan_port_add(vid, bcm, tagged);
@@ -2368,7 +2372,17 @@ sai_status_t SwitchBCM56860HW::hwCreateVlanMember(
         {
             SWSS_LOG_ERROR("hwbcm_vlan_port_add(%d, %d, %d) failed: %d", vid, bcm, tagged, rv);
 
+            for (int ap: addedPorts)
+            {
+                (void)hwbcm_vlan_port_remove(vid, ap);
+            }
+
             return bcmRvToSai(rv);
+        }
+
+        if (rv >= 0)
+        {
+            addedPorts.push_back(bcm);
         }
 
         SWSS_LOG_NOTICE("vlan %d: bcm port %d added %s", vid, bcm, tagged ? "tagged" : "untagged");
@@ -2376,7 +2390,19 @@ sai_status_t SwitchBCM56860HW::hwCreateVlanMember(
 
     // VXLAN access side (no-op unless the VLAN is mapped to a VNI)
 
-    return hwVxlanVlanMemberChanged(member_id, true);
+    sai_status_t vxlanSt = hwVxlanVlanMemberChanged(member_id, true);
+
+    if (vxlanSt != SAI_STATUS_SUCCESS)
+    {
+        for (int ap: addedPorts)
+        {
+            (void)hwbcm_vlan_port_remove(vid, ap);
+        }
+
+        return vxlanSt;
+    }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 sai_status_t SwitchBCM56860HW::hwRemoveVlanMember(
@@ -2902,18 +2928,32 @@ sai_status_t SwitchBCM56860HW::hwRemoveLagMember(
     sai_object_id_t lag = it->second.first;
     sai_object_id_t port = it->second.second;
 
-    m_lagMemberInfo.erase(it);
+    std::vector<sai_object_id_t> savedMembers;
+    bool hadLagEntry = false;
 
     auto mit = m_lagMembers.find(lag);
 
     if (mit != m_lagMembers.end())
     {
+        hadLagEntry = true;
+        savedMembers = mit->second;
         auto &members = mit->second;
 
         members.erase(std::remove(members.begin(), members.end(), port), members.end());
     }
 
-    CHECK_STATUS(applyTrunkMembers(lag));
+    sai_status_t st = applyTrunkMembers(lag);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        if (hadLagEntry)
+        {
+            m_lagMembers[lag] = std::move(savedMembers);
+        }
+        return st;
+    }
+
+    m_lagMemberInfo.erase(it);
 
     syncLagMemberPort(lag, port, false);
 

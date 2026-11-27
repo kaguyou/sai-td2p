@@ -357,6 +357,7 @@ int hwbcm_l3_egress_destroy(int egr_id);
 int hwbcm_l3_egress_cpu_create(int intf_id, int *egr_id);
 /* Egress that drops (blackhole). */
 int hwbcm_l3_egress_drop_create(int *egr_id);
+int hwbcm_l3_egress_drop_replace(int egr_id);
 
 /* ECMP group of egress objects. Returns ecmp_id (usable where egr_id is). */
 int hwbcm_l3_ecmp_create(const int *egr_ids, int n, int *ecmp_id);

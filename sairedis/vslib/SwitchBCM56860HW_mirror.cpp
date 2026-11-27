@@ -752,11 +752,16 @@ sai_status_t SwitchBCM56860HW::hwRemoveMirrorSession(
 
     const int destGport = it->second.destGport;
 
-    // Defensively detach any ports still pointing at this session.
+    // Defensively detach any ports still pointing at this session; record
+    // them so we can restore bindings if dest_destroy fails.
+    std::vector<sai_object_id_t> detachedIng;
+    std::vector<sai_object_id_t> detachedEgr;
+
     for (auto pit = m_portIngMirrors.begin(); pit != m_portIngMirrors.end(); )
     {
         if (pit->second.erase(session_id) != 0)
         {
+            detachedIng.push_back(pit->first);
             int bcm = bcmPortOf(pit->first);
 
             if (bcm >= 0 && destGport != -1)
@@ -779,6 +784,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveMirrorSession(
     {
         if (pit->second.erase(session_id) != 0)
         {
+            detachedEgr.push_back(pit->first);
             int bcm = bcmPortOf(pit->first);
 
             if (bcm >= 0 && destGport != -1)
@@ -807,8 +813,28 @@ sai_status_t SwitchBCM56860HW::hwRemoveMirrorSession(
 
         if (rv < 0 && rv != HWBCM_MIRROR_E_NOT_FOUND)
         {
-            SWSS_LOG_ERROR("mirror session %s: hwbcm_mirror_dest_destroy(0x%x) failed: %d",
+            SWSS_LOG_ERROR("mirror session %s: hwbcm_mirror_dest_destroy(0x%x) failed: %d (restoring bindings)",
                     sid.c_str(), (unsigned)destGport, rv);
+
+            for (auto poid: detachedIng)
+            {
+                m_portIngMirrors[poid].insert(session_id);
+                int bcm = bcmPortOf(poid);
+                if (bcm >= 0)
+                {
+                    (void)hwbcm_mirror_port_add(bcm, HWBCM_MIRROR_DIR_INGRESS, destGport);
+                }
+            }
+            for (auto poid: detachedEgr)
+            {
+                m_portEgrMirrors[poid].insert(session_id);
+                int bcm = bcmPortOf(poid);
+                if (bcm >= 0)
+                {
+                    (void)hwbcm_mirror_port_add(bcm, HWBCM_MIRROR_DIR_EGRESS, destGport);
+                }
+            }
+            hwAclMirrorSessionUpdated(session_id, destGport);
             return mirrorHwStatus(rv);
         }
     }

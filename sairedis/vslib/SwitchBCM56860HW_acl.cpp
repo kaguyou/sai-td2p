@@ -1174,8 +1174,28 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
 
     if (newCounter == E.counter)
     {
-        /* same counter: rewrite surviving variants in place */
+        /* same counter: install any extra variants first so TCAM full does not
+         * leave a partial rule subset after mutating existing variants */
         size_t keep = std::min(E.hw.size(), rules.size());
+        std::vector<AclHwEntry> addedHw;
+
+        for (size_t i = keep; i < rules.size(); i++)
+        {
+            AclHwEntry h;
+            int rv = hwbcm_acl_entry_add(T.gid, pr.prio, &rules[i], withStat ? 1 : 0, &h.eid, &h.stat);
+
+            if (rv != 0)
+            {
+                SWSS_LOG_ERROR("ACL entry %s variant %zu: install failed: %d (rolling back added variants)",
+                        sid.c_str(), i, rv);
+                for (auto &ah: addedHw)
+                {
+                    aclRetire(E.counter, ah);
+                }
+                return hwStatus(rv);
+            }
+            addedHw.push_back(h);
+        }
 
         for (size_t i = 0; i < keep; i++)
         {
@@ -1202,18 +1222,9 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
             newHw.push_back(h);
         }
 
-        for (size_t i = keep; i < rules.size(); i++)
+        for (auto &ah: addedHw)
         {
-            AclHwEntry h;
-            int rv = hwbcm_acl_entry_add(T.gid, pr.prio, &rules[i], withStat ? 1 : 0, &h.eid, &h.stat);
-
-            if (rv != 0)
-            {
-                SWSS_LOG_ERROR("ACL entry %s variant %zu: install failed: %d", sid.c_str(), i, rv);
-                status = hwStatus(rv);
-                continue;
-            }
-            newHw.push_back(h);
+            newHw.push_back(ah);
         }
 
         for (size_t i = keep; i < E.hw.size(); i++)
@@ -1499,6 +1510,15 @@ sai_status_t SwitchBCM56860HW::hwRemoveAclTable(
         for (auto &h: eit->second.hw)
         {
             aclRetire(eit->second.counter, h);
+        }
+
+        if (eit->second.counter != SAI_NULL_OBJECT_ID)
+        {
+            auto cit = m_aclCounters.find(eit->second.counter);
+            if (cit != m_aclCounters.end())
+            {
+                cit->second.entries.erase(e);
+            }
         }
 
         eit->second.hw.clear();
@@ -1961,7 +1981,17 @@ sai_status_t SwitchBCM56860HW::hwCreateAclTableGroupMember(
     m_aclGroupMembers[member_id] = std::make_pair(gAttr->value.oid, tAttr->value.oid);
 
     // the group may already be bound (portsorch binds before adding members)
-    return aclRefreshTable(tAttr->value.oid);
+    sai_status_t st = aclRefreshTable(tAttr->value.oid);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        git->second.members.erase(member_id);
+        m_aclGroupMembers.erase(member_id);
+        (void)aclRefreshTable(tAttr->value.oid);
+        return st;
+    }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 sai_status_t SwitchBCM56860HW::hwRemoveAclTableGroupMember(
@@ -1976,9 +2006,10 @@ sai_status_t SwitchBCM56860HW::hwRemoveAclTableGroupMember(
         return SAI_STATUS_SUCCESS;
     }
 
+    sai_object_id_t group = mit->second.first;
     sai_object_id_t table = mit->second.second;
 
-    auto git = m_aclGroups.find(mit->second.first);
+    auto git = m_aclGroups.find(group);
 
     if (git != m_aclGroups.end())
     {
@@ -1987,7 +2018,19 @@ sai_status_t SwitchBCM56860HW::hwRemoveAclTableGroupMember(
 
     m_aclGroupMembers.erase(mit);
 
-    return aclRefreshTable(table);
+    sai_status_t st = aclRefreshTable(table);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        if (git != m_aclGroups.end())
+        {
+            git->second.members.insert(member_id);
+        }
+        m_aclGroupMembers[member_id] = std::make_pair(group, table);
+        return st;
+    }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -2082,7 +2125,25 @@ sai_status_t SwitchBCM56860HW::hwAclBind(
             sai_serialize_object_type(ot).c_str(), sai_serialize_object_id(oid).c_str(),
             sai_serialize_object_id(oldAcl).c_str(), sai_serialize_object_id(newAcl).c_str());
 
-    return aclBindChanged(oldAcl, newAcl);
+    sai_status_t st = aclBindChanged(oldAcl, newAcl);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        if (oldAcl == SAI_NULL_OBJECT_ID)
+        {
+            m_aclBindings.erase(key);
+        }
+        else
+        {
+            AclBinding prev;
+            prev.ot = ot;
+            prev.acl = oldAcl;
+            m_aclBindings[key] = prev;
+        }
+        return st;
+    }
+
+    return SAI_STATUS_SUCCESS;
 }
 
 sai_status_t SwitchBCM56860HW::hwAclBindOnCreate(

@@ -309,16 +309,16 @@ int hwbcm_l3_intf_destroy(int intf_id)
     bcm_l3_intf_t_init(&intf);
     intf.l3a_intf_id = (bcm_if_t)intf_id;
 
+    rv = bcm_l3_intf_delete(U, &intf);
+    if (rv < 0) {
+        hwbcm_log(HWBCM_LOG_ERR, "l3: intf_delete(%d): %s", intf_id, bcm_errmsg(rv));
+        return rv;
+    }
     if (s_l3_ingress_mode) {
         rv = bcm_l3_ingress_destroy(U, (bcm_if_t)intf_id);
         if (rv < 0 && rv != BCM_E_NOT_FOUND) {
             hwbcm_log(HWBCM_LOG_WARN, "l3: ingress_destroy(%d): %s", intf_id, bcm_errmsg(rv));
         }
-    }
-    rv = bcm_l3_intf_delete(U, &intf);
-    if (rv < 0) {
-        hwbcm_log(HWBCM_LOG_ERR, "l3: intf_delete(%d): %s", intf_id, bcm_errmsg(rv));
-        return rv;
     }
     hwbcm_log(HWBCM_LOG_INFO, "l3: intf %d destroyed", intf_id);
     return 0;
@@ -455,6 +455,16 @@ int hwbcm_l3_egress_cpu_replace(int egr_id, int intf_id)
         return BCM_E_PARAM;
     }
     return hwbcm_l3_egress_do(BCM_L3_WITH_ID | BCM_L3_REPLACE, intf_id, NULL, 0, -1, 1, 0, &id);
+}
+
+int hwbcm_l3_egress_drop_replace(int egr_id)
+{
+    int id = egr_id;
+
+    if (egr_id < 0) {
+        return BCM_E_PARAM;
+    }
+    return hwbcm_l3_egress_do(BCM_L3_WITH_ID | BCM_L3_REPLACE, -1, NULL, 0, -1, 0, 1, &id);
 }
 
 int hwbcm_l3_egress_destroy(int egr_id)

@@ -906,14 +906,49 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         matchingNh.push_back(kv.first);
     }
 
+    std::vector<int> replacedEgrs;
+
+    auto revertReplaced = [&]()
+    {
+        for (int reEgr: replacedEgrs)
+        {
+            (void)hwbcm_l3_egress_cpu_replace(reEgr, intf);
+        }
+    };
+
     if (action == SAI_PACKET_ACTION_DROP)
     {
-        int rv = hwbcm_l3_egress_drop_create(&egr);
-
-        if (rv < 0)
+        if (!matchingNh.empty())
         {
-            SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_drop_create failed: %d", serialized.c_str(), rv);
-            return bcmRvToSai(rv);
+            for (auto nh: matchingNh)
+            {
+                int e = m_nhToEgr[nh];
+                int rv = hwbcm_l3_egress_drop_replace(e);
+
+                if (rv < 0)
+                {
+                    SWSS_LOG_ERROR("neighbor %s: drop egress %d replace failed: %d", serialized.c_str(), e, rv);
+                    revertReplaced();
+                    return bcmRvToSai(rv);
+                }
+
+                replacedEgrs.push_back(e);
+
+                if (egr < 0)
+                {
+                    egr = e;
+                }
+            }
+        }
+        else
+        {
+            int rv = hwbcm_l3_egress_drop_create(&egr);
+
+            if (rv < 0)
+            {
+                SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_drop_create failed: %d", serialized.c_str(), rv);
+                return bcmRvToSai(rv);
+            }
         }
     }
     else if (!matchingNh.empty())
@@ -939,8 +974,11 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("neighbor %s: egress %d replace failed: %d", serialized.c_str(), e, rv);
+                revertReplaced();
                 return bcmRvToSai(rv);
             }
+
+            replacedEgrs.push_back(e);
 
             SWSS_LOG_NOTICE("neighbor %s: next hop %s egress %d resolved (port %d trunk %d cpu %d)",
                     serialized.c_str(), sai_serialize_object_id(nh).c_str(), e, port, trunk, toCpu ? 1 : 0);
@@ -988,7 +1026,11 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         {
             SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_host_add failed: %d", serialized.c_str(), rv);
 
-            if (matchingNh.empty() && !valueInMap(m_nhToEgr, egr))
+            if (!replacedEgrs.empty())
+            {
+                revertReplaced();
+            }
+            else if (matchingNh.empty() && !valueInMap(m_nhToEgr, egr))
             {
                 hwbcm_l3_egress_destroy(egr);
             }
@@ -1070,12 +1112,44 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         }
     }
 
-    m_neighborEgr.erase(it);
+    // Collect every NEXT_HOP egress matching (rif, ip) so multiple next hops
+    // sharing this neighbor are all reverted to CPU punt on remove.
+    std::set<int> nhEgrs;
+    std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-    if (valueInMap(m_nhToEgr, egr))
+    for (auto &kv: m_nhToEgr)
+    {
+        if (kv.second == egr)
+        {
+            nhEgrs.insert(kv.second);
+            continue;
+        }
+
+        sai_attribute_t nhRif, nhIp;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
+            getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
+            nhRif.value.oid == ne.rif_id &&
+            sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+        {
+            nhEgrs.insert(kv.second);
+        }
+    }
+
+    bool otherNeighborUsesEgr = false;
+
+    for (auto &kv: m_neighborEgr)
+    {
+        if (kv.first != serialized && kv.second == egr)
+        {
+            otherNeighborUsesEgr = true;
+            break;
+        }
+    }
+
+    if (!nhEgrs.empty())
     {
         // next hop(s) still reference it: back to punt-to-cpu
-
         int intf = -1;
 
         auto rit = m_rifToIntf.find(ne.rif_id);
@@ -1085,27 +1159,55 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
             intf = rit->second;
         }
 
-        int rv = hwbcm_l3_egress_cpu_replace(egr, intf);
-
-        if (rv < 0)
+        for (int e: nhEgrs)
         {
-            SWSS_LOG_ERROR("neighbor %s: egress %d cpu replace failed: %d", serialized.c_str(), egr, rv);
-            return bcmRvToSai(rv);
+            int rv = hwbcm_l3_egress_cpu_replace(e, intf);
+
+            if (rv < 0)
+            {
+                SWSS_LOG_ERROR("neighbor %s: egress %d cpu replace failed: %d", serialized.c_str(), e, rv);
+                return bcmRvToSai(rv);
+            }
         }
 
-        SWSS_LOG_NOTICE("neighbor %s removed, egress %d now punts to cpu", serialized.c_str(), egr);
+        if (nhEgrs.find(egr) == nhEgrs.end() && !otherNeighborUsesEgr)
+        {
+            int rv = hwbcm_l3_egress_destroy(egr);
+
+            if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+            {
+                SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_destroy(%d) failed: %d", serialized.c_str(), egr, rv);
+                return bcmRvToSai(rv);
+            }
+        }
+
+        m_neighborEgr.erase(it);
+        SWSS_LOG_NOTICE("neighbor %s removed, %zu next-hop egress(es) now punt to cpu", serialized.c_str(), nhEgrs.size());
     }
-    else if (!valueInMap(m_neighborEgr, egr))
+    else if (!otherNeighborUsesEgr)
     {
         int rv = hwbcm_l3_egress_destroy(egr);
 
-        if (rv < 0)
+        if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
         {
             SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_destroy(%d) failed: %d", serialized.c_str(), egr, rv);
+
+            if (!noHostRoute)
+            {
+                uint8_t addr[16];
+                int af = ipBytes(ne.ip_address, addr);
+                (void)hwbcm_l3_host_add(vrf, af, addr, egr);
+            }
+
             return bcmRvToSai(rv);
         }
 
+        m_neighborEgr.erase(it);
         SWSS_LOG_NOTICE("neighbor %s removed, egress %d destroyed", serialized.c_str(), egr);
+    }
+    else
+    {
+        m_neighborEgr.erase(it);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1231,21 +1333,36 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
 
     int egr = it->second;
 
-    m_nhToEgr.erase(it);
+    bool stillUsed = valueInMap(m_neighborEgr, egr);
 
-    if (valueInMap(m_nhToEgr, egr) || valueInMap(m_neighborEgr, egr))
+    if (!stillUsed)
     {
+        for (auto &kv: m_nhToEgr)
+        {
+            if (kv.first != nh_id && kv.second == egr)
+            {
+                stillUsed = true;
+                break;
+            }
+        }
+    }
+
+    if (stillUsed)
+    {
+        m_nhToEgr.erase(it);
         SWSS_LOG_NOTICE("next hop %s removed, egress %d still in use", sai_serialize_object_id(nh_id).c_str(), egr);
         return SAI_STATUS_SUCCESS;
     }
 
     int rv = hwbcm_l3_egress_destroy(egr);
 
-    if (rv < 0)
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
     {
         SWSS_LOG_ERROR("next hop %s: hwbcm_l3_egress_destroy(%d) failed: %d", sai_serialize_object_id(nh_id).c_str(), egr, rv);
         return bcmRvToSai(rv);
     }
+
+    m_nhToEgr.erase(it);
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1288,38 +1405,36 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroup(
 {
     SWSS_LOG_ENTER();
 
+    auto it = m_nhgToEcmp.find(nhg_id);
+
+    if (it != m_nhgToEcmp.end())
+    {
+        int rv = hwbcm_l3_ecmp_destroy(it->second);
+
+        if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
+        {
+            SWSS_LOG_ERROR("next hop group %s: hwbcm_l3_ecmp_destroy(%d) failed: %d",
+                    sai_serialize_object_id(nhg_id).c_str(), it->second, rv);
+            return bcmRvToSai(rv);
+        }
+
+        m_nhgToEcmp.erase(it);
+    }
+
     // drop stale members (should be gone already)
 
-    for (auto it = m_nhgMemberToNhg.begin(); it != m_nhgMemberToNhg.end();)
+    for (auto mit = m_nhgMemberToNhg.begin(); mit != m_nhgMemberToNhg.end();)
     {
-        if (it->second == nhg_id)
+        if (mit->second == nhg_id)
         {
-            m_nhgMemberToNh.erase(it->first);
-            it = m_nhgMemberToNhg.erase(it);
+            m_nhgMemberToNh.erase(mit->first);
+            mit = m_nhgMemberToNhg.erase(mit);
         }
         else
         {
-            ++it;
+            ++mit;
         }
     }
-
-    auto it = m_nhgToEcmp.find(nhg_id);
-
-    if (it == m_nhgToEcmp.end())
-    {
-        return SAI_STATUS_SUCCESS;
-    }
-
-    int rv = hwbcm_l3_ecmp_destroy(it->second);
-
-    if (rv < 0)
-    {
-        SWSS_LOG_ERROR("next hop group %s: hwbcm_l3_ecmp_destroy(%d) failed: %d",
-                sai_serialize_object_id(nhg_id).c_str(), it->second, rv);
-        return bcmRvToSai(rv);
-    }
-
-    m_nhgToEcmp.erase(it);
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1409,6 +1524,16 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
     }
 
     sai_object_id_t nhg = git->second;
+    bool hadNh = false;
+    sai_object_id_t savedNh = SAI_NULL_OBJECT_ID;
+
+    auto nit = m_nhgMemberToNh.find(member_id);
+
+    if (nit != m_nhgMemberToNh.end())
+    {
+        hadNh = true;
+        savedNh = nit->second;
+    }
 
     m_nhgMemberToNhg.erase(git);
     m_nhgMemberToNh.erase(member_id);
@@ -1432,6 +1557,12 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
             SWSS_LOG_WARN("next hop group %s ecmp %d: empty set failed: %d (ignored)",
                     sai_serialize_object_id(nhg).c_str(), eit->second, rv);
             return SAI_STATUS_SUCCESS;
+        }
+
+        m_nhgMemberToNhg[member_id] = nhg;
+        if (hadNh)
+        {
+            m_nhgMemberToNh[member_id] = savedNh;
         }
 
         SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_set(%d) failed: %d",
@@ -1684,13 +1815,13 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
 
     int rv = hwbcm_l3_route_delete(vrf, af, prefix, len);
 
-    m_routeEgr.erase(it);
-
-    if (rv < 0)
+    if (rv < 0 && rv != HWBCM_E_NOT_FOUND)
     {
         SWSS_LOG_ERROR("route %s: hwbcm_l3_route_delete(vrf=%d) failed: %d", serialized.c_str(), vrf, rv);
         return bcmRvToSai(rv);
     }
+
+    m_routeEgr.erase(it);
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1748,19 +1879,39 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
             continue;
         }
 
-        int rv = hwbcm_l3_egress_replace(kv.second, rit->second, mac, port, trunk);
+        std::set<int> egrs;
+        egrs.insert(kv.second);
+        std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-        if (rv < 0)
+        for (auto &nkv: m_nhToEgr)
         {
-            SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve after fdb learn failed: %d",
-                    kv.first.c_str(), kv.second, rv);
-            continue;
+            sai_attribute_t nhRif, nhIp;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
+                getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
+                nhRif.value.oid == ne.rif_id &&
+                sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+            {
+                egrs.insert(nkv.second);
+            }
         }
 
-        SWSS_LOG_NOTICE("neighbor %s: egress %d re-resolved after fdb learn (port %d trunk %d)",
-                kv.first.c_str(), kv.second, port, trunk);
+        for (int e: egrs)
+        {
+            int rv = hwbcm_l3_egress_replace(e, rit->second, mac, port, trunk);
 
-        changed = true;
+            if (rv < 0)
+            {
+                SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve after fdb learn failed: %d",
+                        kv.first.c_str(), e, rv);
+                continue;
+            }
+
+            SWSS_LOG_NOTICE("neighbor %s: egress %d re-resolved after fdb learn (port %d trunk %d)",
+                    kv.first.c_str(), e, port, trunk);
+
+            changed = true;
+        }
     }
 
     if (changed && m_hwReady)
@@ -1826,19 +1977,39 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
             intf = rit->second;
         }
 
-        int rv = hwbcm_l3_egress_cpu_replace(kv.second, intf);
+        std::set<int> egrs;
+        egrs.insert(kv.second);
+        std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-        if (rv < 0)
+        for (auto &nkv: m_nhToEgr)
         {
-            SWSS_LOG_ERROR("neighbor %s: egress %d punt after fdb age/flush failed: %d",
-                    kv.first.c_str(), kv.second, rv);
-            continue;
+            sai_attribute_t nhRif, nhIp;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
+                getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
+                nhRif.value.oid == ne.rif_id &&
+                sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+            {
+                egrs.insert(nkv.second);
+            }
         }
 
-        SWSS_LOG_NOTICE("neighbor %s: mac %s left the fdb, egress %d punts to cpu until re-learned",
-                kv.first.c_str(), sai_serialize_mac(mac).c_str(), kv.second);
+        for (int e: egrs)
+        {
+            int rv = hwbcm_l3_egress_cpu_replace(e, intf);
 
-        changed = true;
+            if (rv < 0)
+            {
+                SWSS_LOG_ERROR("neighbor %s: egress %d punt after fdb age/flush failed: %d",
+                        kv.first.c_str(), e, rv);
+                continue;
+            }
+
+            SWSS_LOG_NOTICE("neighbor %s: mac %s left the fdb, egress %d punts to cpu until re-learned",
+                    kv.first.c_str(), sai_serialize_mac(mac).c_str(), e);
+
+            changed = true;
+        }
     }
 
     if (changed)
