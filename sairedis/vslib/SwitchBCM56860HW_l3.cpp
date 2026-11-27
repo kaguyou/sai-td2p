@@ -183,13 +183,15 @@ namespace
     /* Resolve a virtual router oid to a bcm vrf. The default VR is created by
      * the base class in initialize_default_objects before any hw dispatch, so
      * it is mapped here on first use (-> vrf 0). Any other VR seen for the
-     * first time gets a fresh vrf id (allocate) or falls back to 0 with a WARN. */
-    int resolveVrf(
+     * first time gets a fresh vrf id (allocate), or fails if !allocate or
+     * VRF creation fails (never silently falling back to VRF 0). */
+    sai_status_t resolveVrf(
             _In_ std::map<sai_object_id_t, int> &vrToVrf,
             _In_ sai_object_id_t defaultVr,
             _In_ sai_object_id_t vr,
             _In_ bool allocate,
-            _In_ const char *ctx)
+            _In_ const char *ctx,
+            _Out_ int &vrfOut)
     {
         SWSS_LOG_ENTER();
 
@@ -197,13 +199,14 @@ namespace
 
         if (it != vrToVrf.end())
         {
-            return it->second;
+            vrfOut = it->second;
+            return SAI_STATUS_SUCCESS;
         }
 
         if (vr == SAI_NULL_OBJECT_ID)
         {
-            SWSS_LOG_WARN("%s: null virtual router, using vrf 0", ctx);
-            return 0;
+            SWSS_LOG_ERROR("%s: null virtual router", ctx);
+            return SAI_STATUS_INVALID_PARAMETER;
         }
 
         if (vr == defaultVr || defaultVr == SAI_NULL_OBJECT_ID)
@@ -211,14 +214,15 @@ namespace
             // default VR (or default not yet published by the base: treat the
             // first VR we meet as the default one)
             vrToVrf[vr] = 0;
+            vrfOut = 0;
             SWSS_LOG_NOTICE("%s: virtual router %s -> vrf 0 (default)", ctx, sai_serialize_object_id(vr).c_str());
-            return 0;
+            return SAI_STATUS_SUCCESS;
         }
 
         if (!allocate)
         {
-            SWSS_LOG_WARN("%s: virtual router %s unknown, using vrf 0", ctx, sai_serialize_object_id(vr).c_str());
-            return 0;
+            SWSS_LOG_ERROR("%s: virtual router %s unknown", ctx, sai_serialize_object_id(vr).c_str());
+            return SAI_STATUS_ITEM_NOT_FOUND;
         }
 
         int vrf = 0;
@@ -226,13 +230,14 @@ namespace
 
         if (rv < 0)
         {
-            SWSS_LOG_ERROR("%s: hwbcm_l3_vrf_create failed: %d, using vrf 0", ctx, rv);
-            return 0;
+            SWSS_LOG_ERROR("%s: hwbcm_l3_vrf_create failed: %d", ctx, rv);
+            return SwitchBCM56860HW::bcmRvToSai(rv);
         }
 
         vrToVrf[vr] = vrf;
+        vrfOut = vrf;
         SWSS_LOG_NOTICE("%s: virtual router %s -> vrf %d (late)", ctx, sai_serialize_object_id(vr).c_str(), vrf);
-        return vrf;
+        return SAI_STATUS_SUCCESS;
     }
 
     /* Egress ids of all members of a next hop group, in member creation
@@ -416,7 +421,12 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             }
         }
 
-        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr->value.oid, true, srif.c_str());
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr->value.oid, true, srif.c_str(), vrf);
+
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            return st;
+        }
     }
 
     // mac: RIF attribute, else switch mac
@@ -886,7 +896,12 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
             }
         }
 
-        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str());
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str(), vrf);
+
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            return st;
+        }
     }
 
     // where does the neighbor live: port / trunk / VXLAN VP, or unknown (-> CPU)
@@ -1129,7 +1144,12 @@ sai_status_t SwitchBCM56860HW::hwSetNeighbor(
             {
                 defaultVr = sw.value.oid;
             }
-            vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, false, serialized.c_str());
+            sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, false, serialized.c_str(), vrf);
+
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                return st;
+            }
         }
 
         uint8_t addr[16];
@@ -1292,7 +1312,12 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
             }
         }
 
-        vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str());
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, false, serialized.c_str(), vrf);
+
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            return st;
+        }
     }
 
     if (!noHostRoute)
@@ -1738,19 +1763,32 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
     }
 
     std::vector<int> egrs = groupEgressList(nhg, m_nhgMemberToNhg, m_nhgMemberToNh, m_nhToEgr);
+    bool empty = egrs.empty();
+
+    if (empty)
+    {
+        int dropEgr = sharedDropEgress();
+
+        if (dropEgr < 0)
+        {
+            m_nhgMemberToNhg[member_id] = nhg;
+            if (hadNh)
+            {
+                m_nhgMemberToNh[member_id] = savedNh;
+            }
+
+            SWSS_LOG_ERROR("nhg member %s: failed to allocate drop egress for empty ecmp %d",
+                    sai_serialize_object_id(member_id).c_str(), eit->second);
+            return SAI_STATUS_FAILURE;
+        }
+
+        egrs.push_back(dropEgr);
+    }
 
     int rv = hwbcm_l3_ecmp_set(eit->second, egrs.data(), (int)egrs.size());
 
     if (rv < 0)
     {
-        if (egrs.empty())
-        {
-            // chip may refuse an empty group; the group is about to be removed anyway
-            SWSS_LOG_WARN("next hop group %s ecmp %d: empty set failed: %d (ignored)",
-                    sai_serialize_object_id(nhg).c_str(), eit->second, rv);
-            return SAI_STATUS_SUCCESS;
-        }
-
         m_nhgMemberToNhg[member_id] = nhg;
         if (hadNh)
         {
@@ -1762,7 +1800,10 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
         return bcmRvToSai(rv);
     }
 
-    SWSS_LOG_NOTICE("next hop group %s ecmp %d now %zu members", sai_serialize_object_id(nhg).c_str(), eit->second, egrs.size());
+    SWSS_LOG_NOTICE("next hop group %s ecmp %d now %zu members%s",
+            sai_serialize_object_id(nhg).c_str(), eit->second,
+            empty ? (size_t)0 : egrs.size(),
+            empty ? " (drop)" : "");
 
     return SAI_STATUS_SUCCESS;
 }
@@ -1792,7 +1833,13 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
         }
     }
 
-    int vrf = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, true, serialized.c_str());
+    int vrf = 0;
+    sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, true, serialized.c_str(), vrf);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        return st;
+    }
 
     // action + next hop
 
@@ -1868,8 +1915,23 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
 
                         if (it == m_nhgToEcmp.end())
                         {
-                            // group without members yet: create the ecmp now
+                            // group without members yet: create the ecmp now (drop egress when empty)
                             std::vector<int> egrs = groupEgressList(nhOid, m_nhgMemberToNhg, m_nhgMemberToNh, m_nhToEgr);
+
+                            if (egrs.empty())
+                            {
+                                int dropEgr = sharedDropEgress();
+
+                                if (dropEgr < 0)
+                                {
+                                    SWSS_LOG_ERROR("route %s: next hop group %s empty and drop egress unavailable",
+                                            serialized.c_str(), sai_serialize_object_id(nhOid).c_str());
+                                    return SAI_STATUS_FAILURE;
+                                }
+
+                                egrs.push_back(dropEgr);
+                            }
+
                             int ecmp = -1;
 
                             int rv = hwbcm_l3_ecmp_create(egrs.data(), (int)egrs.size(), &ecmp);
@@ -1999,7 +2061,13 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
         }
     }
 
-    int vrf = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, false, serialized.c_str());
+    int vrf = 0;
+    sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, false, serialized.c_str(), vrf);
+
+    if (st != SAI_STATUS_SUCCESS)
+    {
+        return st;
+    }
 
     uint8_t prefix[16];
     int len = 0;
@@ -2498,7 +2566,13 @@ void SwitchBCM56860HW::vxlanSviSync(
             defaultVr = sw.value.oid;
         }
 
-        vrf = resolveVrf(m_vrToVrf, defaultVr, a.value.oid, true, "svi");
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, a.value.oid, true, "svi", vrf);
+
+        if (st != SAI_STATUS_SUCCESS)
+        {
+            SWSS_LOG_ERROR("vlan %d (vpn 0x%x): resolveVrf failed: %d", vid, vpn, st);
+            return;
+        }
     }
 
     int ovl = -1;
