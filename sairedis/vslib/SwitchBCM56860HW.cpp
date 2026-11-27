@@ -394,6 +394,7 @@ sai_status_t SwitchBCM56860HW::warm_boot_initialize_objects()
     CHECK_STATUS(SwitchBCM56850::warm_boot_initialize_objects());
     hwWarmScrubStaleCallbacks();
     hwWarmRestoreSwitchOids();
+    hwWarmRebuildFdbInfoFromHash();
 
     std::string scachePath = warmBootScachePath(false);
     std::string hwStatePath = warmBootHwStatePath(false);

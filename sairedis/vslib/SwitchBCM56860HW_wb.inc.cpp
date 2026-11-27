@@ -2330,6 +2330,80 @@ void SwitchBCM56860HW::hwWarmRestoreSwitchOids()
             sai_serialize_object_id(m_lag_hash_id).c_str());
 }
 
+void SwitchBCM56860HW::hwWarmRebuildFdbInfoFromHash()
+{
+    SWSS_LOG_ENTER();
+
+    // SwitchStateBase only persists m_fdb_info_set when m_useTapDevice is true
+    // (always false for HW). Rebuild m_fdb_info_set from m_objectHash with zero
+    // HW writes so dynamic MAC aging (onFdbAged -> hwPuntNeighborsOnAge +
+    // SAI_FDB_EVENT_AGED) and MAC moves keep working across warm boot.
+    m_fdb_info_set.clear();
+
+    auto fdbit = m_objectHash.find(SAI_OBJECT_TYPE_FDB_ENTRY);
+    if (fdbit == m_objectHash.end())
+    {
+        return;
+    }
+
+    uint32_t now = static_cast<uint32_t>(time(NULL));
+    size_t restored = 0;
+
+    for (const auto &kv : fdbit->second)
+    {
+        sai_attribute_t typeAttr, bpAttr;
+        if (!getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, kv.first, SAI_FDB_ENTRY_ATTR_TYPE, typeAttr) ||
+            typeAttr.value.s32 != SAI_FDB_ENTRY_TYPE_DYNAMIC)
+        {
+            continue;
+        }
+
+        if (!getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, kv.first, SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID, bpAttr) ||
+            bpAttr.value.oid == SAI_NULL_OBJECT_ID)
+        {
+            continue;
+        }
+
+        sai_fdb_entry_t fdb;
+        memset(&fdb, 0, sizeof(fdb));
+        try
+        {
+            sai_deserialize_fdb_entry(kv.first, fdb);
+        }
+        catch (const std::exception &)
+        {
+            continue;
+        }
+
+        int vid = vidOf(fdb.bv_id);
+        if (vid < 0)
+        {
+            continue;
+        }
+
+        sai_object_id_t targetOid = bridgePortTarget(bpAttr.value.oid);
+        if (targetOid == SAI_NULL_OBJECT_ID)
+        {
+            continue;
+        }
+
+        FdbInfo fi;
+        fi.setFdbEntry(fdb);
+        fi.setVlanId(static_cast<sai_vlan_id_t>(vid));
+        fi.setBridgePortId(bpAttr.value.oid);
+        fi.setPortId(targetOid);
+        fi.setTimestamp(now);
+
+        m_fdb_info_set.insert(fi);
+        restored++;
+    }
+
+    if (restored > 0)
+    {
+        SWSS_LOG_NOTICE("wb: rebuilt %zu dynamic FDB entry(ies) into m_fdb_info_set from m_objectHash", restored);
+    }
+}
+
 void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
 {
     SWSS_LOG_ENTER();

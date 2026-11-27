@@ -45,6 +45,7 @@
             void hwWarmRebuildVxlanFromHash();
             void hwWarmRebuildAclFromHash();
             void hwWarmRebuildMirrorFromHash();
+            void hwWarmRebuildFdbInfoFromHash();
 
             /* SAI_OBJECT_TYPE_BRIDGE_PORT set handler (FDB learning mode freeze/unfreeze). */
             sai_status_t hwSetBridgePort(_In_ sai_object_id_t bp_id, _In_ const sai_attribute_t *attr);
