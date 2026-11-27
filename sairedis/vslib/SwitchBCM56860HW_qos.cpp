@@ -2365,10 +2365,10 @@ sai_status_t SwitchBCM56860HW::qosApplyQueueWred(
         {
             bool on = getStoredAttr(SAI_OBJECT_TYPE_WRED, wred, en[c], a) && a.value.booldata;
 
-            // ECN marking on TD2+ rides on the WRED curve of the color, so a
-            // color that only marks still needs its curve; fall back to the
-            // ECN_* threshold/probability attributes when drop attributes are absent.
-            w.enable[c] = (on || ecnColor[c]) ? 1 : 0;
+            // Keep WRED drop enable separate from ECN mark enable so ECN-only
+            // profiles program only the responsive/ECT curve and leave WRED_EN=0.
+            w.enable[c] = on ? 1 : 0;
+            w.ecn_enable[c] = ecnColor[c] ? 1 : 0;
 
             bool preferEcn = (!on && ecnColor[c]);
             sai_attr_id_t mn1 = preferEcn ? emn[c] : mn[c];
@@ -2951,8 +2951,8 @@ sai_status_t SwitchBCM56860HW::hwSetQueue(
         case SAI_QUEUE_ATTR_PFC_DLR_INIT:
         case SAI_QUEUE_ATTR_ENABLE_PFC_DLDR:
 
-            SWSS_LOG_WARN("qos: PFC deadlock detection/recovery attribute %d not programmed to hardware", attr->id);
-            return SAI_STATUS_SUCCESS;
+            SWSS_LOG_WARN("qos: PFC deadlock detection/recovery attribute %d not supported on TD2+", attr->id);
+            return SAI_STATUS_NOT_SUPPORTED;
 
         default:
 
@@ -2994,4 +2994,30 @@ sai_status_t SwitchBCM56860HW::hwSetIngressPriorityGroup(
     }
 
     return st;
+}
+
+sai_status_t SwitchBCM56860HW::queryAttributeCapability(
+        _In_ sai_object_id_t switch_id,
+        _In_ sai_object_type_t object_type,
+        _In_ sai_attr_id_t attr_id,
+        _Out_ sai_attr_capability_t *attr_capability)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr_capability == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    if (object_type == SAI_OBJECT_TYPE_QUEUE &&
+            (attr_id == SAI_QUEUE_ATTR_PFC_DLR_INIT ||
+             attr_id == SAI_QUEUE_ATTR_ENABLE_PFC_DLDR))
+    {
+        attr_capability->create_implemented = false;
+        attr_capability->set_implemented = false;
+        attr_capability->get_implemented = false;
+        return SAI_STATUS_SUCCESS;
+    }
+
+    return SwitchBCM56850::queryAttributeCapability(switch_id, object_type, attr_id, attr_capability);
 }

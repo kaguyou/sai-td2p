@@ -125,7 +125,8 @@ int hwbcm_qos_port_shaper_set(int port, const hwbcm_qos_sched_t *s);
 /* ------------------------------------------------------------------------ */
 
 typedef struct {
-    int enable[HWBCM_QOS_NUM_COLOR];        /* drop curve on for this color */
+    int enable[HWBCM_QOS_NUM_COLOR];        /* WRED drop curve on for this color */
+    int ecn_enable[HWBCM_QOS_NUM_COLOR];    /* ECN mark curve on for this color */
     uint32_t min_bytes[HWBCM_QOS_NUM_COLOR];
     uint32_t max_bytes[HWBCM_QOS_NUM_COLOR];
     int drop_pct[HWBCM_QOS_NUM_COLOR];      /* 0..100 at max threshold */
@@ -133,8 +134,10 @@ typedef struct {
     int gain;                               /* 0..15 (SAI_WRED_ATTR_WEIGHT) */
 } hwbcm_qos_wred_t;
 
-/* NULL disables WRED and ECN marking on the queue. TCP and non-TCP curves
- * get the same thresholds. */
+/* NULL disables WRED and ECN marking on the queue. Colors with enable[c] set
+ * program both TCP and non-TCP drop curves with WRED_EN=1; colors with only
+ * ecn_enable[c] set program only the TCP/responsive curve (non-TCP left off)
+ * and leave WRED_EN=0 when no color enables dropping. */
 int hwbcm_qos_cos_wred_set(int port, int cos, const hwbcm_qos_wred_t *w);
 
 /* ------------------------------------------------------------------------ */

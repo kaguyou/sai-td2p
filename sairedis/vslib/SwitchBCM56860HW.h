@@ -90,6 +90,12 @@ namespace saivs
                     _In_ uint32_t attr_count,
                     _In_ const sai_attribute_t *attr_list) override;
 
+            virtual sai_status_t queryAttributeCapability(
+                    _In_ sai_object_id_t switch_id,
+                    _In_ sai_object_type_t object_type,
+                    _In_ sai_attr_id_t attr_id,
+                    _Out_ sai_attr_capability_t *attr_capability) override;
+
         protected:
 
             // --- core / ports (A2) -------------------------------------------

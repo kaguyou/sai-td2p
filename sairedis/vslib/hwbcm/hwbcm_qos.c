@@ -1146,7 +1146,7 @@ int hwbcm_qos_cos_wred_set(int port, int cos, const hwbcm_qos_wred_t *w)
     const uint32 max_bytes = (uint32)off;
     bcm_cosq_gport_discard_t d;
     uint32 base;
-    int c, any = 0;
+    int c, any_drop = 0, any_ecn = 0;
 
     if (!qos_port_ok(port)) {
         return BCM_E_PORT;
@@ -1157,45 +1157,88 @@ int hwbcm_qos_cos_wred_set(int port, int cos, const hwbcm_qos_wred_t *w)
 
     if (w != NULL) {
         for (c = 0; c < HWBCM_QOS_NUM_COLOR; c++) {
-            any |= w->enable[c];
+            if (w->enable[c]) {
+                any_drop = 1;
+            }
+            if (w->ecn_enable[c]) {
+                any_ecn = 1;
+            }
         }
-        any |= w->ecn;
+        if (w->ecn) {
+            any_ecn = 1;
+        }
     }
 
-    /* One call per color. WRED_EN / ECN_MARKING_EN / WEIGHT are per queue and
-     * rewritten by every call (src/bcm/esw/trident2/cosq.c:6132-6141). */
-    base = BCM_COSQ_DISCARD_BYTES | BCM_COSQ_DISCARD_TCP | BCM_COSQ_DISCARD_NONTCP;
-    if (any) {
+    /* WRED_EN / ECN_MARKING_EN / WEIGHT are per queue and rewritten by every
+     * call (src/bcm/esw/trident2/cosq.c:6132-6141). Only set WRED_EN when at
+     * least one color enables dropping so an ECN-only profile never WRED-drops
+     * non-ECT packets. */
+    base = BCM_COSQ_DISCARD_BYTES;
+    if (any_drop) {
         base |= BCM_COSQ_DISCARD_ENABLE;
-        if (w->ecn) {
-            base |= BCM_COSQ_DISCARD_MARK_CONGESTION;
-        }
+    }
+    if (w != NULL && w->ecn && any_ecn) {
+        base |= BCM_COSQ_DISCARD_MARK_CONGESTION;
     }
 
     for (c = 0; c < HWBCM_QOS_NUM_COLOR; c++) {
-        bcm_cosq_gport_discard_t_init(&d);
-        d.flags = base | color_flag[c];
-        d.refresh_time = QOS_WRED_REFRESH_TIME;
-        d.gain = (w != NULL) ? (w->gain < 0 ? 0 : (w->gain > 15 ? 15 : w->gain)) : 0;
-        if (w != NULL && w->enable[c]) {
+        int gain = (w != NULL) ? (w->gain < 0 ? 0 : (w->gain > 15 ? 15 : w->gain)) : 0;
+        int drop_on = (w != NULL && w->enable[c]);
+        int ecn_only = (w != NULL && !drop_on && w->ecn && w->ecn_enable[c]);
+
+        if (drop_on) {
             uint32 mn = w->min_bytes[c] > max_bytes ? max_bytes : w->min_bytes[c];
             uint32 mx = w->max_bytes[c] > max_bytes ? max_bytes : w->max_bytes[c];
             if (mn > mx) {
                 mn = mx;
             }
+            bcm_cosq_gport_discard_t_init(&d);
+            d.flags = base | BCM_COSQ_DISCARD_TCP | BCM_COSQ_DISCARD_NONTCP | color_flag[c];
+            d.refresh_time = QOS_WRED_REFRESH_TIME;
+            d.gain = gain;
             d.min_thresh = (int)mn;
             d.max_thresh = (int)mx;
             d.drop_probability = w->drop_pct[c] < 0 ? 0 : (w->drop_pct[c] > 100 ? 100 : w->drop_pct[c]);
-        } else {
-            /* curve off: both thresholds at the "unused" sentinel */
+            QCHECK("cosq_gport_discard_set", bcm_cosq_gport_discard_set(U, port, cos, &d));
+        } else if (ecn_only) {
+            uint32 mn = w->min_bytes[c] > max_bytes ? max_bytes : w->min_bytes[c];
+            uint32 mx = w->max_bytes[c] > max_bytes ? max_bytes : w->max_bytes[c];
+            if (mn > mx) {
+                mn = mx;
+            }
+            /* Explicitly disable the non-TCP/non-ECT drop curve for this color. */
+            bcm_cosq_gport_discard_t_init(&d);
+            d.flags = base | BCM_COSQ_DISCARD_NONTCP | color_flag[c];
+            d.refresh_time = QOS_WRED_REFRESH_TIME;
+            d.gain = gain;
             d.min_thresh = off;
             d.max_thresh = off;
             d.drop_probability = 0;
+            QCHECK("cosq_gport_discard_set(nontcp off)", bcm_cosq_gport_discard_set(U, port, cos, &d));
+
+            /* Program only the TCP/responsive (ECT) curve for ECN marking. */
+            bcm_cosq_gport_discard_t_init(&d);
+            d.flags = base | BCM_COSQ_DISCARD_TCP | color_flag[c];
+            d.refresh_time = QOS_WRED_REFRESH_TIME;
+            d.gain = gain;
+            d.min_thresh = (int)mn;
+            d.max_thresh = (int)mx;
+            d.drop_probability = w->drop_pct[c] < 0 ? 0 : (w->drop_pct[c] > 100 ? 100 : w->drop_pct[c]);
+            QCHECK("cosq_gport_discard_set(tcp ecn)", bcm_cosq_gport_discard_set(U, port, cos, &d));
+        } else {
+            /* curve off: both thresholds at the "unused" sentinel */
+            bcm_cosq_gport_discard_t_init(&d);
+            d.flags = base | BCM_COSQ_DISCARD_TCP | BCM_COSQ_DISCARD_NONTCP | color_flag[c];
+            d.refresh_time = QOS_WRED_REFRESH_TIME;
+            d.gain = gain;
+            d.min_thresh = off;
+            d.max_thresh = off;
+            d.drop_probability = 0;
+            QCHECK("cosq_gport_discard_set", bcm_cosq_gport_discard_set(U, port, cos, &d));
         }
-        QCHECK("cosq_gport_discard_set", bcm_cosq_gport_discard_set(U, port, cos, &d));
     }
 
-    QLOGD("qos: port %d cos %d wred %s ecn %d", port, cos, any ? "on" : "off", w ? w->ecn : 0);
+    QLOGD("qos: port %d cos %d wred_drop %s ecn %d", port, cos, any_drop ? "on" : "off", (w && w->ecn && any_ecn) ? 1 : 0);
     return 0;
 }
 
