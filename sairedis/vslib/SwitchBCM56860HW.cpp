@@ -2869,9 +2869,11 @@ void SwitchBCM56860HW::syncLagMemberPort(
 
     for (const auto &kvp: m_rifToVid)
     {
-        sai_attribute_t rifPort;
+        sai_attribute_t rifType, rifPort;
 
-        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kvp.first, SAI_ROUTER_INTERFACE_ATTR_PORT_ID, rifPort) ||
+        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kvp.first, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
+                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_PORT ||
+                !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, kvp.first, SAI_ROUTER_INTERFACE_ATTR_PORT_ID, rifPort) ||
                 rifPort.value.oid != lag_id)
         {
             continue;

@@ -546,13 +546,34 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             return SAI_STATUS_FAILURE;
         }
 
-        // pick a free vid from the pool
+        // pick a free vid from the pool, excluding both existing RIF VLANs
+        // and any user-created L2 VLANs in m_objectHash[SAI_OBJECT_TYPE_VLAN]
 
         std::set<int> used;
 
         for (auto &kv: m_rifToVid)
         {
             used.insert(kv.second);
+        }
+
+        auto vhash = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
+
+        if (vhash != m_objectHash.end())
+        {
+            auto *vmeta = sai_metadata_get_attr_metadata(SAI_OBJECT_TYPE_VLAN, SAI_VLAN_ATTR_VLAN_ID);
+
+            if (vmeta != nullptr)
+            {
+                for (const auto &vkv: vhash->second)
+                {
+                    auto ait = vkv.second.find(vmeta->attridname);
+
+                    if (ait != vkv.second.end() && ait->second != nullptr && ait->second->getAttr() != nullptr)
+                    {
+                        used.insert((int)ait->second->getAttr()->value.u16);
+                    }
+                }
+            }
         }
 
         for (int v = RIF_VID_MIN; v <= RIF_VID_MAX; v++)
@@ -723,9 +744,13 @@ sai_status_t SwitchBCM56860HW::hwRemoveRouterInterface(
     {
         int vid = vit->second;
 
-        if (vid >= RIF_VID_MIN && vid <= RIF_VID_MAX)
+        sai_attribute_t rifType;
+        bool isPortRif = getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) &&
+                         (rifType.value.s32 == SAI_ROUTER_INTERFACE_TYPE_PORT);
+
+        if (isPortRif && vid >= RIF_VID_MIN && vid <= RIF_VID_MAX)
         {
-            // port RIF: move the port(s) back to the default vlan, drop the vlan
+            // port RIF: move the port(s) back to the default vlan, drop the dedicated vlan
 
             int defVid = vidOf(m_default_vlan_id);
 
