@@ -73,10 +73,6 @@ enum { QB_PKT = 0, QB_BYTE, QB_DPKT, QB_DBYTE, QB_COUNT };
 static uint64_t g_qbase[HWBCM_MAX_PORTS][2][HWBCM_STATS_MAX_CPU_QUEUES][QB_COUNT];
 static uint64_t g_xbase[HWBCM_MAX_PORTS][HWBCM_XPSTAT_COUNT];
 
-/* Egress pool -> one (port, mc cos) whose EGR_POOL-style index resolves to
- * that service pool; bcmBstStatIdEgrPool is addressed that way. */
-static struct { int port; int cos; int valid; } g_egr_rep[NUM_SP];
-
 static uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -480,61 +476,57 @@ int hwbcm_pg_stat_multi_get(int port, int pg, int n, const int *ids,
 /* buffer pools                                                             */
 /* ------------------------------------------------------------------------ */
 
-static int egr_pool_of(int port, int cos, int *sp)
-{
-    int rv = bcm_cosq_control_get(U, port, cos, bcmCosqControlEgressPool, sp);
-
-    return BCM_SUCCESS(rv) ? 0 : rv;
-}
-
-/* Find (port, cos) whose EGR_POOL-style resolution is service pool sp: this is
- * how bcmBstStatIdEgrPool is indexed for a plain port (trident2/cosq.c:7472-
- * 7478 -> _bcm_td2_cosq_egress_sp_get (cosq.c:7331) -> STYLE_EGR_POOL, cosq.c:2329-2359).
+/* Read (and optionally clear) TD2+ egress service pool watermark directly from
+ * MMU_THDM_DB_POOL_MCUC_BST_STATr[sp] (sdk esw/bst.c:1553, 3530-3559).
+ * Avoids bcm_cosq_bst_stat_get(bcmBstStatIdEgrPool) which in non-ETS mode only
+ * resolves sp via multicast queue MMU_THDM_MCQE_QUEUE_CONFIG (cosq.c:2343-2358)
+ * and therefore fails for UC-only egress service pools (SP1..SP3).
  * Caller holds g_lock. */
-static int egr_pool_rep(int sp, int hint_port, int *rport, int *rcos)
+static int bst_read_egr_pool(int sp, int clear, uint64_t *cells)
 {
-    bcm_port_config_t cfg;
-    bcm_port_t p;
-    int c, got, found = 0;
+    uint32 rval = 0, en_rval = 0, prev_thdo = 0;
+    int rv;
 
+    *cells = 0;
+    if (!g_bst_on) {
+        return 0;
+    }
     if (sp < 0 || sp >= NUM_SP) {
         return BCM_E_PARAM;
     }
-    if (g_egr_rep[sp].valid &&
-        egr_pool_of(g_egr_rep[sp].port, g_egr_rep[sp].cos, &got) == 0 && got == sp) {
-        *rport = g_egr_rep[sp].port;
-        *rcos = g_egr_rep[sp].cos;
+    if (!SOC_REG_IS_VALID(U, MMU_THDM_DB_POOL_MCUC_BST_STATr)) {
         return 0;
     }
-    g_egr_rep[sp].valid = 0;
 
-    for (c = 0; c < g_num_cos && !found; c++) {
-        if (egr_pool_of(hint_port, c, &got) == 0 && got == sp) {
-            *rport = hint_port;
-            *rcos = c;
-            found = 1;
+    rv = soc_reg32_get(U, BST_TRACKING_ENABLEr, REG_PORT_ANY, 0, &en_rval);
+    if (SOC_FAILURE(rv)) {
+        return soft_rv(rv, "BST_TRACKING_ENABLEr get", -1, sp);
+    }
+    prev_thdo = soc_reg_field_get(U, BST_TRACKING_ENABLEr, en_rval, BST_TRACK_EN_THDOf);
+    if (prev_thdo) {
+        uint32 dis = en_rval;
+        soc_reg_field_set(U, BST_TRACKING_ENABLEr, &dis, BST_TRACK_EN_THDOf, 0);
+        rv = soc_reg32_set(U, BST_TRACKING_ENABLEr, REG_PORT_ANY, 0, dis);
+        if (SOC_FAILURE(rv)) {
+            return soft_rv(rv, "BST_TRACKING_ENABLEr disable", -1, sp);
         }
     }
-    if (!found && BCM_SUCCESS(bcm_port_config_get(U, &cfg))) {
-        BCM_PBMP_ITER(cfg.e, p) {
-            for (c = 0; c < g_num_cos && !found; c++) {
-                if (egr_pool_of(p, c, &got) == 0 && got == sp) {
-                    *rport = p;
-                    *rcos = c;
-                    found = 1;
-                }
-            }
-            if (found) {
-                break;
-            }
+
+    rv = soc_reg32_get(U, MMU_THDM_DB_POOL_MCUC_BST_STATr, REG_PORT_ANY, sp, &rval);
+    if (SOC_SUCCESS(rv)) {
+        *cells = (uint64_t)soc_reg_field_get(U, MMU_THDM_DB_POOL_MCUC_BST_STATr, rval, BST_STATf);
+        if (clear) {
+            soc_reg_field_set(U, MMU_THDM_DB_POOL_MCUC_BST_STATr, &rval, BST_STATf, 0);
+            rv = soc_reg32_set(U, MMU_THDM_DB_POOL_MCUC_BST_STATr, REG_PORT_ANY, sp, rval);
         }
     }
-    if (!found) {
-        return BCM_E_NOT_FOUND;
+
+    if (prev_thdo) {
+        (void)soc_reg32_set(U, BST_TRACKING_ENABLEr, REG_PORT_ANY, 0, en_rval);
     }
-    g_egr_rep[sp].port = *rport;
-    g_egr_rep[sp].cos = *rcos;
-    g_egr_rep[sp].valid = 1;
+    if (SOC_FAILURE(rv)) {
+        return soft_rv(rv, "MMU_THDM_DB_POOL_MCUC_BST_STATr", -1, sp);
+    }
     return 0;
 }
 
@@ -543,7 +535,7 @@ int hwbcm_pool_stat_multi_get(int egress, int port, int cosq, int is_mc,
                               uint64_t *out, int *sp_out)
 {
     uint64_t wm = 0;
-    int i, rv = 0, sp = -1, rport = port, rcos = cosq, have_wm = 0;
+    int i, rv = 0, sp = -1, have_wm = 0;
 
     if (!port_ok(port) || n < 0 || (n > 0 && (ids == NULL || out == NULL))) {
         return BCM_E_PARAM;
@@ -558,9 +550,6 @@ int hwbcm_pool_stat_multi_get(int egress, int port, int cosq, int is_mc,
         rv = bcm_cosq_control_get(U, port, cosq,
                                   is_mc ? bcmCosqControlMCEgressPool : bcmCosqControlUCEgressPool,
                                   &sp);
-        if (BCM_SUCCESS(rv)) {
-            rv = egr_pool_rep(sp, port, &rport, &rcos);
-        }
     } else {
         rv = bcm_cosq_control_get(U, port, cosq, bcmCosqControlIngressPool, &sp);
     }
@@ -579,11 +568,14 @@ int hwbcm_pool_stat_multi_get(int egress, int port, int cosq, int is_mc,
     for (i = 0; i < n && rv == 0; i++) {
         if (ids[i] == HWBCM_POOLSTAT_WATERMARK_CELLS) {
             if (!have_wm) {
-                /* IngPool takes (port, PG) -> THDI_PORT_PG_SPID (cosq.c:7480-
-                 * 7484 -> _bcm_td2_cosq_ingress_sp_get, cosq.c:7352); the resource itself is per service
-                 * pool, not per port (esw/bst.c:1572-1585). */
-                rv = bst_read(rport, rcos, egress ? bcmBstStatIdEgrPool : bcmBstStatIdIngPool,
-                              clear, &wm);
+                if (egress) {
+                    rv = bst_read_egr_pool(sp, clear, &wm);
+                } else {
+                    /* IngPool takes (port, PG) -> THDI_PORT_PG_SPID (cosq.c:7480-
+                     * 7484 -> _bcm_td2_cosq_ingress_sp_get, cosq.c:7352); the resource
+                     * itself is per service pool, not per port (esw/bst.c:1572-1585). */
+                    rv = bst_read(port, cosq, bcmBstStatIdIngPool, clear, &wm);
+                }
                 have_wm = 1;
             }
             out[i] = wm;
@@ -707,7 +699,6 @@ void hwbcm_stats_warm_reset(void)
     memset(g_bst_last_ms, 0, sizeof(g_bst_last_ms));
     memset(g_qbase, 0, sizeof(g_qbase));
     memset(g_xbase, 0, sizeof(g_xbase));
-    memset(g_egr_rep, 0, sizeof(g_egr_rep));
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -771,7 +762,6 @@ void hwbcm_stats_warm_restore(const hwbcm_qbase_wb_t *qbase, int nq,
     pthread_mutex_lock(&g_lock);
     memset(g_qbase, 0, sizeof(g_qbase));
     memset(g_xbase, 0, sizeof(g_xbase));
-    memset(g_egr_rep, 0, sizeof(g_egr_rep));
     memset(g_bst_last_ms, 0, sizeof(g_bst_last_ms));
 
     for (i = 0; i < nq && qbase != NULL; i++) {

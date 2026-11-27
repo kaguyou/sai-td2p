@@ -378,35 +378,83 @@ bool SwitchBCM56860HW::hwGetObjectStats(
 
         case SAI_OBJECT_TYPE_BUFFER_POOL:
         {
+            /* TD2+ has no shared headroom pool (XOFF_ROOM_WATERMARK_*).
+             * SONiC BufferOrch probes watermark clear capability by calling
+             * clear_buffer_pool_stats(pool, {WATERMARK_BYTES,
+             * XOFF_ROOM_WATERMARK_BYTES}) without filtering by
+             * queryStatsCapability. When at least one supported pool watermark
+             * stat is present in the same call, report 0 (no-op clear) for
+             * XOFF_ROOM_WATERMARK_* instead of failing the entire call; a
+             * standalone probe for only XOFF_ROOM_WATERMARK_* still returns
+             * SAI_STATUS_NOT_SUPPORTED. */
+            std::vector<sai_stat_id_t> hwSaiIds;
+            std::vector<uint32_t> hwIdx;
+            std::vector<uint32_t> zeroIdx;
+            hwSaiIds.reserve(n);
+            hwIdx.reserve(n);
+
+            for (uint32_t i = 0; i < n; i++)
+            {
+                if (inTable(g_poolStats, counter_ids[i]))
+                {
+                    hwSaiIds.push_back(counter_ids[i]);
+                    hwIdx.push_back(i);
+                }
+                else if (counter_ids[i] == SAI_BUFFER_POOL_STAT_XOFF_ROOM_WATERMARK_BYTES ||
+                         counter_ids[i] == SAI_BUFFER_POOL_STAT_XOFF_ROOM_WATERMARK_CELLS)
+                {
+                    zeroIdx.push_back(i);
+                }
+                else
+                {
+                    SWSS_LOG_INFO("buffer pool: counter %d not supported by the hardware", counter_ids[i]);
+                    status = SAI_STATUS_NOT_SUPPORTED;
+                    return true;
+                }
+            }
+
+            if (hwSaiIds.empty())
+            {
+                SWSS_LOG_INFO("buffer pool: counter %d not supported by the hardware", counter_ids[0]);
+                status = SAI_STATUS_NOT_SUPPORTED;
+                return true;
+            }
+
+            std::vector<uint64_t> hwOut(hwSaiIds.size(), 0);
             bool egress = false, mc = false;
             int port = -1, cos = -1;
 
             if (!hwStatsPoolRef(object_id, egress, port, cos, mc))
             {
-                /* No PG / queue uses the pool (yet): it holds no buffers.
-                 * Still validate the ids so unsupported ones are rejected. */
-                status = readThrough(g_poolStats, "buffer pool", n, counter_ids, counters,
-                        [&](int cnt, const int *, uint64_t *out) {
-                            for (int i = 0; i < cnt; i++)
-                            {
-                                out[i] = 0;
-                            }
-                            return 0;
+                /* No PG / queue uses the pool (yet): it holds no buffers. */
+                status = SAI_STATUS_SUCCESS;
+            }
+            else
+            {
+                status = readThrough(g_poolStats, "buffer pool",
+                        (uint32_t)hwSaiIds.size(), hwSaiIds.data(), hwOut.data(),
+                        [&](int cnt, const int *ids, uint64_t *out) {
+                            int sp = -1;
+                            int rv = hwbcm_pool_stat_multi_get(egress ? 1 : 0, port, cos, mc ? 1 : 0,
+                                    cnt, ids, clear, out, &sp);
+                            SWSS_LOG_DEBUG("pool %s: %s via port %d cos %d -> service pool %d",
+                                    sai_serialize_object_id(object_id).c_str(),
+                                    egress ? "egress" : "ingress", port, cos, sp);
+                            return rv;
                         });
-
-                return true;
             }
 
-            status = readThrough(g_poolStats, "buffer pool", n, counter_ids, counters,
-                    [&](int cnt, const int *ids, uint64_t *out) {
-                        int sp = -1;
-                        int rv = hwbcm_pool_stat_multi_get(egress ? 1 : 0, port, cos, mc ? 1 : 0,
-                                cnt, ids, clear, out, &sp);
-                        SWSS_LOG_DEBUG("pool %s: %s via port %d cos %d -> service pool %d",
-                                sai_serialize_object_id(object_id).c_str(),
-                                egress ? "egress" : "ingress", port, cos, sp);
-                        return rv;
-                    });
+            if (status == SAI_STATUS_SUCCESS)
+            {
+                for (size_t k = 0; k < hwIdx.size(); k++)
+                {
+                    counters[hwIdx[k]] = hwOut[k];
+                }
+                for (uint32_t idx : zeroIdx)
+                {
+                    counters[idx] = 0;
+                }
+            }
 
             return true;
         }
