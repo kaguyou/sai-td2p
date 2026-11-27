@@ -3426,6 +3426,17 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
                         sai_serialize_status(st).c_str());
             }
         }
+        else if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_AUTO_NEG_MODE, a))
+        {
+            sai_status_t st = hwSetPort(port_oid, &a);
+            if (st != SAI_STATUS_SUCCESS)
+            {
+                errors++;
+                SWSS_LOG_ERROR("wb fallback: port %s autoneg %d failed: %s",
+                        sai_serialize_object_id(port_oid).c_str(), a.value.booldata ? 1 : 0,
+                        sai_serialize_status(st).c_str());
+            }
+        }
 
         if (getStoredAttr(SAI_OBJECT_TYPE_PORT, port_oid, SAI_PORT_ATTR_MTU, a) && a.value.u32 > 0)
         {
@@ -3501,12 +3512,14 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         record(hwCreateVlanMember(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
                 nVlanMembers, "VLAN_MEMBER", key);
     }
+    size_t nBridges = 0, nBpLearn = 0;
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE))
     {
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_BRIDGE, key);
-        (void)hwCreateBridge(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateBridge(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nBridges, "BRIDGE", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE_PORT))
     {
@@ -3520,7 +3533,7 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         }
         if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, oid, SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE, learnAttr))
         {
-            (void)hwSetBridgePort(oid, &learnAttr);
+            record(hwSetBridgePort(oid, &learnAttr), nBpLearn, "BRIDGE_PORT(learn)", key);
         }
     }
 
@@ -3610,12 +3623,14 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
             }
         }
     }
+    size_t nTunnelMaps = 0, nTunnelTerms = 0;
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_TUNNEL_MAP))
     {
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL_MAP, key);
-        (void)hwCreateTunnelMap(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateTunnelMap(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nTunnelMaps, "TUNNEL_MAP", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_TUNNEL_MAP_ENTRY))
     {
@@ -3630,7 +3645,8 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_TUNNEL_TERM_TABLE_ENTRY, key);
-        (void)hwCreateTunnelTermEntry(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateTunnelTermEntry(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nTunnelTerms, "TUNNEL_TERM_TABLE_ENTRY", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_BRIDGE_PORT))
     {
@@ -3655,23 +3671,33 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         record(hwCreateFdbEntry(key, static_cast<uint32_t>(attrs.size()), attrs.data()),
                 nFdb, "FDB_ENTRY", key);
     }
-    (void)hwVxlanRetryPending();
+    {
+        sai_status_t vst = hwVxlanRetryPending();
+        if (vst != SAI_STATUS_SUCCESS)
+        {
+            errors++;
+            SWSS_LOG_ERROR("wb fallback: hwVxlanRetryPending failed: %s",
+                    sai_serialize_status(vst).c_str());
+        }
+    }
 
     // 10. CoPP: POLICER -> HOSTIF_TRAP_GROUP -> HOSTIF_TRAP
-    size_t nTraps = 0;
+    size_t nPolicers = 0, nTrapGroups = 0, nTraps = 0;
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_POLICER))
     {
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_POLICER, key);
-        (void)hwCreatePolicer(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreatePolicer(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nPolicers, "POLICER", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP))
     {
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP, key);
-        (void)hwCreateHostifTrapGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateHostifTrapGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nTrapGroups, "HOSTIF_TRAP_GROUP", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_HOSTIF_TRAP))
     {
@@ -3762,12 +3788,14 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         record(hwCreateAclTable(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
                 nAclTables, "ACL_TABLE", key);
     }
+    size_t nAclGroups = 0, nAclCounters = 0;
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_TABLE_GROUP))
     {
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_TABLE_GROUP, key);
-        (void)hwCreateAclTableGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateAclTableGroup(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nAclGroups, "ACL_TABLE_GROUP", key);
     }
     for (const auto &key : sortedKeys(SAI_OBJECT_TYPE_ACL_TABLE_GROUP_MEMBER))
     {
@@ -3787,7 +3815,8 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         sai_object_id_t oid = SAI_NULL_OBJECT_ID;
         sai_deserialize_object_id(key, oid);
         auto attrs = collectAttrs(SAI_OBJECT_TYPE_ACL_COUNTER, key);
-        (void)hwCreateAclCounter(oid, static_cast<uint32_t>(attrs.size()), attrs.data());
+        record(hwCreateAclCounter(oid, static_cast<uint32_t>(attrs.size()), attrs.data()),
+                nAclCounters, "ACL_COUNTER", key);
     }
     {
         struct BindSpec
@@ -3889,10 +3918,11 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
         }
     }
 
-    // 15. Persist a fresh (.scache, .hwstate, .bootid) snapshot matching the
-    //     newly replayed ASIC so a subsequent warm start (even an unexpected
-    //     syncd restart before a clean warm shutdown) does a true warm boot
-    //     instead of repeating the cold fallback forever.
+    // 15. Persist a fresh (.scache, .hwstate, .bootid) snapshot ONLY if the
+    //     replay completed with zero errors; otherwise do not cement a
+    //     partially-failed snapshot (syncd's APPLY_VIEW will still reconcile,
+    //     and a future clean warm shutdown will save the reconciled state).
+    if (errors == 0)
     {
         std::string readBase = warmBootBasePath(/*forWrite=*/false);
         std::string writeBase = warmBootBasePath(/*forWrite=*/true);
@@ -3926,18 +3956,49 @@ sai_status_t SwitchBCM56860HW::hwColdFallbackReplay()
                     writeBase.c_str());
         }
     }
+    else
+    {
+        SWSS_LOG_ERROR("wb fallback: skipping post-replay warm-boot snapshot due to %zu replay error(s); "
+                "removing stale read-path sidecars so next restart does not warm-attach to stale state",
+                errors);
+        (void)unlink(warmBootHwStatePath(/*forWrite=*/false).c_str());
+        (void)unlink(warmBootScachePath(/*forWrite=*/false).c_str());
+    }
 
     long elapsedMs = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count());
 
-    SWSS_LOG_NOTICE("wb fallback: cold hardware replay complete in %ld ms "
-            "(ports=%zu admin_up=%zu hostif=%zu vlans=%zu vlan_mem=%zu lags=%zu lag_mem=%zu "
-            "vrs=%zu rifs=%zu neigh=%zu nh=%zu nhg=%zu/%zu routes=%zu "
-            "tunnels=%zu vnis=%zu tun_bp=%zu fdb=%zu traps=%zu mirrors=%zu acl=%zu/%zu errors=%zu)",
-            elapsedMs, nPortsCfg, nPortsUp, nHostif, nVlans, nVlanMembers, nLags, nLagMembers,
-            nVrs, nRifs, nNeigh, nNh, nNhg, nNhgMem, nRoutes,
-            nTunnels, nTunnelMapEntries, nTunnelBps, nFdb, nTraps, nMirrors,
-            nAclTables, nAclEntries, errors);
+    (void)nBridges;
+    (void)nBpLearn;
+    (void)nTunnelMaps;
+    (void)nTunnelTerms;
+    (void)nPolicers;
+    (void)nTrapGroups;
+    (void)nAclGroups;
+    (void)nAclCounters;
+
+    if (errors > 0)
+    {
+        SWSS_LOG_ERROR("wb fallback: cold hardware replay finished with %zu error(s) in %ld ms "
+                "(ports=%zu admin_up=%zu hostif=%zu vlans=%zu vlan_mem=%zu lags=%zu lag_mem=%zu "
+                "vrs=%zu rifs=%zu neigh=%zu nh=%zu nhg=%zu/%zu routes=%zu "
+                "tunnels=%zu vnis=%zu tun_bp=%zu fdb=%zu traps=%zu mirrors=%zu acl=%zu/%zu)",
+                errors, elapsedMs, nPortsCfg, nPortsUp, nHostif, nVlans, nVlanMembers, nLags, nLagMembers,
+                nVrs, nRifs, nNeigh, nNh, nNhg, nNhgMem, nRoutes,
+                nTunnels, nTunnelMapEntries, nTunnelBps, nFdb, nTraps, nMirrors,
+                nAclTables, nAclEntries);
+    }
+    else
+    {
+        SWSS_LOG_NOTICE("wb fallback: cold hardware replay complete in %ld ms "
+                "(ports=%zu admin_up=%zu hostif=%zu vlans=%zu vlan_mem=%zu lags=%zu lag_mem=%zu "
+                "vrs=%zu rifs=%zu neigh=%zu nh=%zu nhg=%zu/%zu routes=%zu "
+                "tunnels=%zu vnis=%zu tun_bp=%zu fdb=%zu traps=%zu mirrors=%zu acl=%zu/%zu errors=%zu)",
+                elapsedMs, nPortsCfg, nPortsUp, nHostif, nVlans, nVlanMembers, nLags, nLagMembers,
+                nVrs, nRifs, nNeigh, nNh, nNhg, nNhgMem, nRoutes,
+                nTunnels, nTunnelMapEntries, nTunnelBps, nFdb, nTraps, nMirrors,
+                nAclTables, nAclEntries, errors);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
