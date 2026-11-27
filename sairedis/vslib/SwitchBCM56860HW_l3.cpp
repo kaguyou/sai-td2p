@@ -517,19 +517,19 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
                 return SAI_STATUS_FAILURE;
             }
 
-            std::lock_guard<std::mutex> lock(m_mapMutex);
-
             auto lm = m_lagMembers.find(target);
 
             if (lm != m_lagMembers.end())
             {
+                std::lock_guard<std::mutex> lock(m_mapMutex);
+
                 for (auto poid: lm->second)
                 {
-                    int p = bcmPortOf(poid);
+                    auto pit = m_portToBcm.find(poid);
 
-                    if (p >= 0)
+                    if (pit != m_portToBcm.end())
                     {
-                        memberPorts.push_back(p);
+                        memberPorts.push_back(pit->second);
                     }
                 }
             }
@@ -743,19 +743,19 @@ sai_status_t SwitchBCM56860HW::hwRemoveRouterInterface(
 
                 if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
                 {
-                    std::lock_guard<std::mutex> lock(m_mapMutex);
-
                     auto lm = m_lagMembers.find(target);
 
                     if (lm != m_lagMembers.end())
                     {
+                        std::lock_guard<std::mutex> lock(m_mapMutex);
+
                         for (auto poid: lm->second)
                         {
-                            int p = bcmPortOf(poid);
+                            auto pit = m_portToBcm.find(poid);
 
-                            if (p >= 0)
+                            if (pit != m_portToBcm.end())
                             {
-                                ports.push_back(p);
+                                ports.push_back(pit->second);
                             }
                         }
                     }
