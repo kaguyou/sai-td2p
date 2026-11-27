@@ -277,8 +277,6 @@
                  U closedir@GLIBC_2.2.5
                  U connect@GLIBC_2.2.5
                  U dirname@GLIBC_2.2.5
-                 U dup@GLIBC_2.2.5
-                 U dup2@GLIBC_2.2.5
                  U eventfd@GLIBC_2.7
                  U exit@GLIBC_2.2.5
                  U exp@GLIBC_2.29
@@ -334,9 +332,7 @@
                  U pow@GLIBC_2.29
                  U prctl@GLIBC_2.2.5
                  U printf@GLIBC_2.2.5
-                 U pthread_attr_destroy@GLIBC_2.2.5
                  U pthread_attr_init@GLIBC_2.2.5
-                 U pthread_attr_setdetachstate@GLIBC_2.2.5
                  U pthread_attr_setinheritsched@GLIBC_2.2.5
                  U pthread_attr_setschedparam@GLIBC_2.2.5
                  U pthread_attr_setschedpolicy@GLIBC_2.2.5
@@ -355,8 +351,10 @@
                  U pthread_mutex_lock@GLIBC_2.2.5
                  U pthread_mutex_timedlock@GLIBC_2.34
                  U pthread_mutex_unlock@GLIBC_2.2.5
+                 U pthread_mutexattr_destroy@GLIBC_2.34
                  U pthread_mutexattr_init@GLIBC_2.34
                  U pthread_mutexattr_settype@GLIBC_2.34
+                 U pthread_once@GLIBC_2.34
                  U pthread_self@GLIBC_2.2.5
                  U pthread_setcancelstate@GLIBC_2.2.5
                  U pthread_setcanceltype@GLIBC_2.2.5
