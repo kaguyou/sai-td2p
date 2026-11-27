@@ -3164,6 +3164,39 @@ sai_status_t SwitchBCM56860HW::set(
 {
     SWSS_LOG_ENTER();
 
+    bool snapshotted = false;
+    bool hadPrev = false;
+    std::string attrKey;
+    std::shared_ptr<SaiAttrWrap> prevAttr;
+
+    if (m_hwReady && attr != NULL)
+    {
+        auto meta = sai_metadata_get_attr_metadata(objectType, attr->id);
+
+        if (meta != NULL)
+        {
+            attrKey = meta->attridname;
+            auto otIt = m_objectHash.find(objectType);
+
+            if (otIt != m_objectHash.end())
+            {
+                auto objIt = otIt->second.find(serializedObjectId);
+
+                if (objIt != otIt->second.end())
+                {
+                    snapshotted = true;
+                    auto ait = objIt->second.find(attrKey);
+
+                    if (ait != objIt->second.end())
+                    {
+                        hadPrev = true;
+                        prevAttr = ait->second;
+                    }
+                }
+            }
+        }
+    }
+
     CHECK_STATUS(SwitchBCM56850::set(objectType, serializedObjectId, attr));
 
     if (!m_hwReady || attr == NULL)
@@ -3222,7 +3255,29 @@ sai_status_t SwitchBCM56860HW::set(
 
     if (hw != SAI_STATUS_SUCCESS)
     {
-        SWSS_LOG_ERROR("hardware set of %s %s attr %d failed: %s (virtual state already updated)",
+        if (snapshotted)
+        {
+            auto otIt = m_objectHash.find(objectType);
+
+            if (otIt != m_objectHash.end())
+            {
+                auto objIt = otIt->second.find(serializedObjectId);
+
+                if (objIt != otIt->second.end())
+                {
+                    if (hadPrev)
+                    {
+                        objIt->second[attrKey] = prevAttr;
+                    }
+                    else
+                    {
+                        objIt->second.erase(attrKey);
+                    }
+                }
+            }
+        }
+
+        SWSS_LOG_ERROR("hardware set of %s %s attr %d failed: %s (virtual state rolled back)",
                 sai_serialize_object_type(objectType).c_str(),
                 serializedObjectId.c_str(),
                 attr->id,
