@@ -1965,7 +1965,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     if (l3rv < 0)
     {
         SWSS_LOG_ERROR("wb hwstate: hwbcm_l3_warm_restore failed: %d", l3rv);
-        return false;
+        return SAI_STATUS_FAILURE;
     }
 
     hwWarmRebuildLagAndL3FromHash();
@@ -1986,7 +1986,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
         if (vrv < 0)
         {
             SWSS_LOG_ERROR("wb hwstate: hwbcm_vxlan_warm_restore failed: %d", vrv);
-            return false;
+            return SAI_STATUS_FAILURE;
         }
     }
     else
@@ -2021,7 +2021,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
         if (crv < 0)
         {
             SWSS_LOG_ERROR("wb hwstate: hwbcm_copp_warm_restore failed: %d", crv);
-            return false;
+            return SAI_STATUS_FAILURE;
         }
     }
     else
