@@ -354,9 +354,47 @@ namespace saivs
                 }
             };
 
+            /* Derived L3/L2/VXLAN lookup indexes (never saved to .hwstate;
+             * rebuilt from primary maps + m_objectHash on warm restore). */
+            struct VlanMacKey
+            {
+                sai_object_id_t vlanOid = SAI_NULL_OBJECT_ID;
+                uint8_t mac[6] = {};
+
+                bool operator==(const VlanMacKey &o) const noexcept
+                {
+                    return vlanOid == o.vlanOid && memcmp(mac, o.mac, 6) == 0;
+                }
+            };
+
+            struct VlanMacKeyHash
+            {
+                size_t operator()(const VlanMacKey &k) const noexcept
+                {
+                    uint64_t m = 0;
+                    memcpy(&m, k.mac, 6);
+                    size_t h = std::hash<uint64_t>{}(static_cast<uint64_t>(k.vlanOid));
+                    h ^= std::hash<uint64_t>{}(m) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                    return h;
+                }
+            };
+
             static RifIpKey makeRifIpKey(_In_ sai_object_id_t rif, _In_ const sai_ip_address_t &ip);
+            static VlanMacKey makeVlanMacKey(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6]);
             void nhIndexAdd(_In_ sai_object_id_t nh_id, _In_ sai_object_id_t rif, _In_ const sai_ip_address_t &ip);
             void nhIndexRemove(_In_ sai_object_id_t nh_id);
+            void egrNhRefInc(_In_ int egr);
+            void egrNhRefDec(_In_ int egr);
+            void egrNeighborRefInc(_In_ int egr);
+            void egrNeighborRefDec(_In_ int egr);
+            void neighborVlanIndexAdd(_In_ const std::string &serialized, _In_ sai_object_id_t rif_id, _In_ const uint8_t mac[6]);
+            void neighborVlanIndexUpdateMac(_In_ const std::string &serialized, _In_ const uint8_t newMac[6]);
+            void neighborVlanIndexRemove(_In_ const std::string &serialized);
+            void v4NeighborIndexAdd(_In_ int vrf, _In_ uint32_t ip4, _In_ const std::string &serialized, _In_ int egr);
+            void v4NeighborIndexRemove(_In_ int vrf, _In_ uint32_t ip4, _In_ const std::string &serialized);
+            void v4RouteIndexAdd(_In_ int vrf, _In_ uint32_t ip4, _In_ int len, _In_ int egr);
+            void v4RouteIndexRemove(_In_ int vrf, _In_ uint32_t ip4, _In_ int len);
+            sai_object_id_t bridgePortOfTarget(_In_ sai_object_id_t targetOid);
 
             std::map<sai_object_id_t, int> m_vrToVrf;      /* virtual router oid -> bcm vrf */
             std::map<sai_object_id_t, int> m_rifToIntf;    /* rif oid -> bcm l3 intf id */
@@ -364,11 +402,27 @@ namespace saivs
             std::map<sai_object_id_t, int> m_nhToEgr;      /* next hop oid -> bcm egress id */
             std::unordered_map<RifIpKey, std::vector<sai_object_id_t>, RifIpKeyHash> m_nhByRifIp; /* derived: (rif, ip) -> nh oids */
             std::unordered_map<sai_object_id_t, RifIpKey> m_nhKey; /* derived: nh oid -> (rif, ip) */
+            std::unordered_map<int, uint32_t> m_egrNhRefCount;       /* derived: egr -> count in m_nhToEgr */
+            std::unordered_map<int, uint32_t> m_egrNeighborRefCount; /* derived: egr -> count in m_neighborEgr */
             std::map<sai_object_id_t, int> m_nhgToEcmp;    /* next hop group oid -> bcm ecmp id */
+            std::unordered_map<int, sai_object_id_t> m_ecmpToNhg;    /* derived: bcm ecmp id -> nhg oid */
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNh; /* nhg member -> nh */
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNhg;/* nhg member -> nhg */
+            std::unordered_map<sai_object_id_t, std::set<sai_object_id_t>> m_nhgToMembers; /* derived: nhg -> member oids */
             std::map<std::string, int> m_neighborEgr;      /* serialized neighbor -> egress id */
+            std::unordered_map<VlanMacKey, std::vector<std::string>, VlanMacKeyHash> m_vlanNeighborsByMac; /* derived: (vlanOid, mac) -> neighbor keys */
+            std::unordered_map<int, std::vector<std::string>> m_vlanNeighborsByVid; /* derived: vid -> neighbor keys */
+            std::unordered_map<std::string, std::pair<int, VlanMacKey>> m_neighborVlanMac; /* derived: neighbor key -> (vid, (vlanOid, mac)) */
+            std::unordered_map<uint64_t, std::vector<std::pair<std::string, int>>> m_v4NeighborsByVrfIp; /* derived: (vrf, ip4) -> [(ser, egr)] */
+            std::unordered_map<uint64_t, int> m_v4RoutesByVrfLen[33]; /* derived: [len][(vrf, masked_ip4)] -> egr */
+            uint64_t m_v4RouteLenMask = 0;                            /* derived: bit len set if m_v4RoutesByVrfLen[len] non-empty */
             std::map<std::string, int> m_routeEgr;         /* serialized route -> egress/ecmp id */
+            std::unordered_map<int, sai_object_id_t> m_vidToVlanOid;  /* derived: vid -> vlan oid */
+            std::unordered_map<sai_object_id_t, int> m_vlanOidToVid;  /* derived: vlan oid -> vid */
+            std::unordered_map<sai_object_id_t, sai_object_id_t> m_portToLag; /* derived: port oid -> lag oid */
+            std::unordered_map<sai_object_id_t, sai_object_id_t> m_targetToBridgePort; /* derived: port/lag -> 1Q bp */
+            std::unordered_map<sai_object_id_t, sai_object_id_t> m_bridgePortToTarget; /* derived: 1Q bp -> port/lag */
+            std::unordered_map<int, int> m_vpnToVid;                  /* derived: vxlan vpn -> vid */
 
             // VXLAN state (A4)
             std::map<sai_object_id_t, int> m_tunnelInit;   /* tunnel oid -> bcm tunnel init id */
@@ -412,6 +466,9 @@ namespace saivs
              * created, retry remote VTEPs whose underlay next hop could not be
              * resolved yet (their network VP is still pending). */
             sai_status_t hwVxlanRetryPending();
+            sai_status_t hwVxlanRetryPendingForNeighbor(_In_ const sai_ip_address_t &ip, _In_ int egr);
+            sai_status_t hwVxlanRetryPendingForRoute(_In_ const sai_ip_prefix_t &pfx);
+            sai_status_t hwVxlanRetryPendingForNextHop(_In_ int egr);
 
             /* Hook for A2's L2 learn/age callback. MACs learned on a VNI-mapped
              * VLAN come from the SDK as VFI events: vid = VPN id (> 4095) and
@@ -481,6 +538,8 @@ namespace saivs
             /* --- internals (SwitchBCM56860HW_vxlan.cpp) --- */
             sai_status_t vxlanEnsureInit();
             bool vxlanIp4Of(_In_ const sai_ip_address_t &ip, _Out_ uint8_t out[4]) const;
+            bool vxlanEcmpContainsEgress(_In_ int ecmpId, _In_ int egr) const;
+            void vxlanCheckVtepUnderlay(_Inout_ VxlanRemoteVtep &vtep);
             int vxlanResolveUnderlayEgress(_In_ const uint8_t ip4[4]);
             bool vxlanTryBringUpVtep(_Inout_ VxlanRemoteVtep &vtep);
             void vxlanTearDownVtepVp(_Inout_ VxlanRemoteVtep &vtep);

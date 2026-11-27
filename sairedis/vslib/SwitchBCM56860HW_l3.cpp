@@ -26,6 +26,7 @@
 #include <cstring>
 #include <set>
 #include <algorithm>
+#include <arpa/inet.h>
 
 using namespace saivs;
 
@@ -145,39 +146,25 @@ namespace
         return memcmp(a, b, sizeof(sai_mac_t)) == 0;
     }
 
-    bool valueInMap(
-            _In_ const std::map<sai_object_id_t, int> &m,
-            _In_ int value,
-            _In_ sai_object_id_t except = SAI_NULL_OBJECT_ID)
+    uint64_t vrfIp4Key(
+            _In_ int vrf,
+            _In_ uint32_t ip4)
     {
-        SWSS_LOG_ENTER();
-
-        for (auto &kv: m)
-        {
-            if (kv.second == value && kv.first != except)
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(ip4);
     }
 
-    bool valueInMap(
-            _In_ const std::map<std::string, int> &m,
-            _In_ int value)
+    uint32_t ipv4PrefixMaskNet(
+            _In_ int len)
     {
-        SWSS_LOG_ENTER();
-
-        for (auto &kv: m)
+        if (len <= 0)
         {
-            if (kv.second == value)
-            {
-                return true;
-            }
+            return 0u;
         }
-
-        return false;
+        if (len >= 32)
+        {
+            return 0xFFFFFFFFu;
+        }
+        return htonl(0xFFFFFFFFu << (32 - len));
     }
 
     /* Resolve a virtual router oid to a bcm vrf. The default VR is created by
@@ -240,11 +227,11 @@ namespace
         return SAI_STATUS_SUCCESS;
     }
 
-    /* Egress ids of all members of a next hop group, in member creation
-     * order is not preserved (std::map order), duplicates kept out. */
+    /* Egress ids of all members of a next hop group, duplicates kept out.
+     * Iterates only this group's members (O(k_group) via m_nhgToMembers). */
     std::vector<int> groupEgressList(
             _In_ sai_object_id_t nhg,
-            _In_ const std::map<sai_object_id_t, sai_object_id_t> &memberToNhg,
+            _In_ const std::unordered_map<sai_object_id_t, std::set<sai_object_id_t>> &nhgToMembers,
             _In_ const std::map<sai_object_id_t, sai_object_id_t> &memberToNh,
             _In_ const std::map<sai_object_id_t, int> &nhToEgr)
     {
@@ -252,14 +239,15 @@ namespace
 
         std::vector<int> egrs;
 
-        for (auto &kv: memberToNhg)
+        auto git = nhgToMembers.find(nhg);
+        if (git == nhgToMembers.end())
         {
-            if (kv.second != nhg)
-            {
-                continue;
-            }
+            return egrs;
+        }
 
-            auto nhIt = memberToNh.find(kv.first);
+        for (auto memberOid: git->second)
+        {
+            auto nhIt = memberToNh.find(memberOid);
 
             if (nhIt == memberToNh.end())
             {
@@ -271,7 +259,7 @@ namespace
             if (egrIt == nhToEgr.end())
             {
                 SWSS_LOG_WARN("nhg member %s: next hop %s has no egress, skipped",
-                        sai_serialize_object_id(kv.first).c_str(),
+                        sai_serialize_object_id(memberOid).c_str(),
                         sai_serialize_object_id(nhIt->second).c_str());
                 continue;
             }
@@ -340,6 +328,240 @@ void SwitchBCM56860HW::nhIndexRemove(
         }
     }
     m_nhKey.erase(kit);
+}
+
+SwitchBCM56860HW::VlanMacKey SwitchBCM56860HW::makeVlanMacKey(
+        _In_ sai_object_id_t vlanOid,
+        _In_ const uint8_t mac[6])
+{
+    VlanMacKey k;
+    k.vlanOid = vlanOid;
+    memcpy(k.mac, mac, 6);
+    return k;
+}
+
+void SwitchBCM56860HW::egrNhRefInc(_In_ int egr)
+{
+    m_egrNhRefCount[egr]++;
+}
+
+void SwitchBCM56860HW::egrNhRefDec(_In_ int egr)
+{
+    auto it = m_egrNhRefCount.find(egr);
+    if (it != m_egrNhRefCount.end())
+    {
+        if (it->second <= 1)
+        {
+            m_egrNhRefCount.erase(it);
+        }
+        else
+        {
+            it->second--;
+        }
+    }
+}
+
+void SwitchBCM56860HW::egrNeighborRefInc(_In_ int egr)
+{
+    m_egrNeighborRefCount[egr]++;
+}
+
+void SwitchBCM56860HW::egrNeighborRefDec(_In_ int egr)
+{
+    auto it = m_egrNeighborRefCount.find(egr);
+    if (it != m_egrNeighborRefCount.end())
+    {
+        if (it->second <= 1)
+        {
+            m_egrNeighborRefCount.erase(it);
+        }
+        else
+        {
+            it->second--;
+        }
+    }
+}
+
+void SwitchBCM56860HW::neighborVlanIndexAdd(
+        _In_ const std::string &serialized,
+        _In_ sai_object_id_t rif_id,
+        _In_ const uint8_t mac[6])
+{
+    sai_attribute_t rifType, vlanAttr;
+    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
+        rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
+        !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr))
+    {
+        return;
+    }
+
+    auto vit = m_rifToVid.find(rif_id);
+    int vid = (vit != m_rifToVid.end()) ? vit->second : vidOf(vlanAttr.value.oid);
+    if (vid < 0)
+    {
+        return;
+    }
+
+    VlanMacKey mk = makeVlanMacKey(vlanAttr.value.oid, mac);
+
+    auto &mvec = m_vlanNeighborsByMac[mk];
+    if (std::find(mvec.begin(), mvec.end(), serialized) == mvec.end())
+    {
+        mvec.push_back(serialized);
+    }
+
+    auto &vvec = m_vlanNeighborsByVid[vid];
+    if (std::find(vvec.begin(), vvec.end(), serialized) == vvec.end())
+    {
+        vvec.push_back(serialized);
+    }
+
+    m_neighborVlanMac[serialized] = std::make_pair(vid, mk);
+}
+
+void SwitchBCM56860HW::neighborVlanIndexUpdateMac(
+        _In_ const std::string &serialized,
+        _In_ const uint8_t newMac[6])
+{
+    auto it = m_neighborVlanMac.find(serialized);
+    if (it == m_neighborVlanMac.end())
+    {
+        return;
+    }
+
+    VlanMacKey oldKey = it->second.second;
+    VlanMacKey newKey = makeVlanMacKey(oldKey.vlanOid, newMac);
+    if (oldKey == newKey)
+    {
+        return;
+    }
+
+    auto omit = m_vlanNeighborsByMac.find(oldKey);
+    if (omit != m_vlanNeighborsByMac.end())
+    {
+        auto &vec = omit->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), serialized), vec.end());
+        if (vec.empty())
+        {
+            m_vlanNeighborsByMac.erase(omit);
+        }
+    }
+
+    auto &nvec = m_vlanNeighborsByMac[newKey];
+    if (std::find(nvec.begin(), nvec.end(), serialized) == nvec.end())
+    {
+        nvec.push_back(serialized);
+    }
+
+    it->second.second = newKey;
+}
+
+void SwitchBCM56860HW::neighborVlanIndexRemove(
+        _In_ const std::string &serialized)
+{
+    auto it = m_neighborVlanMac.find(serialized);
+    if (it == m_neighborVlanMac.end())
+    {
+        return;
+    }
+
+    int vid = it->second.first;
+    VlanMacKey mk = it->second.second;
+
+    auto mit = m_vlanNeighborsByMac.find(mk);
+    if (mit != m_vlanNeighborsByMac.end())
+    {
+        auto &vec = mit->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), serialized), vec.end());
+        if (vec.empty())
+        {
+            m_vlanNeighborsByMac.erase(mit);
+        }
+    }
+
+    auto vit = m_vlanNeighborsByVid.find(vid);
+    if (vit != m_vlanNeighborsByVid.end())
+    {
+        auto &vec = vit->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), serialized), vec.end());
+        if (vec.empty())
+        {
+            m_vlanNeighborsByVid.erase(vit);
+        }
+    }
+
+    m_neighborVlanMac.erase(it);
+}
+
+void SwitchBCM56860HW::v4NeighborIndexAdd(
+        _In_ int vrf,
+        _In_ uint32_t ip4,
+        _In_ const std::string &serialized,
+        _In_ int egr)
+{
+    auto &vec = m_v4NeighborsByVrfIp[vrfIp4Key(vrf, ip4)];
+    for (auto &p: vec)
+    {
+        if (p.first == serialized)
+        {
+            p.second = egr;
+            return;
+        }
+    }
+    vec.emplace_back(serialized, egr);
+}
+
+void SwitchBCM56860HW::v4NeighborIndexRemove(
+        _In_ int vrf,
+        _In_ uint32_t ip4,
+        _In_ const std::string &serialized)
+{
+    auto it = m_v4NeighborsByVrfIp.find(vrfIp4Key(vrf, ip4));
+    if (it == m_v4NeighborsByVrfIp.end())
+    {
+        return;
+    }
+    auto &vec = it->second;
+    vec.erase(std::remove_if(vec.begin(), vec.end(),
+            [&](const std::pair<std::string, int> &p) { return p.first == serialized; }),
+            vec.end());
+    if (vec.empty())
+    {
+        m_v4NeighborsByVrfIp.erase(it);
+    }
+}
+
+void SwitchBCM56860HW::v4RouteIndexAdd(
+        _In_ int vrf,
+        _In_ uint32_t ip4,
+        _In_ int len,
+        _In_ int egr)
+{
+    if (len < 0 || len > 32)
+    {
+        return;
+    }
+    uint32_t masked = ip4 & ipv4PrefixMaskNet(len);
+    m_v4RoutesByVrfLen[len][vrfIp4Key(vrf, masked)] = egr;
+    m_v4RouteLenMask |= (1ULL << len);
+}
+
+void SwitchBCM56860HW::v4RouteIndexRemove(
+        _In_ int vrf,
+        _In_ uint32_t ip4,
+        _In_ int len)
+{
+    if (len < 0 || len > 32)
+    {
+        return;
+    }
+    uint32_t masked = ip4 & ipv4PrefixMaskNet(len);
+    auto &tbl = m_v4RoutesByVrfLen[len];
+    tbl.erase(vrfIp4Key(vrf, masked));
+    if (tbl.empty())
+    {
+        m_v4RouteLenMask &= ~(1ULL << len);
+    }
 }
 
 // --- VIRTUAL_ROUTER -------------------------------------------------------
@@ -1182,7 +1404,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
             {
                 revertReplaced();
             }
-            else if (matchingNh.empty() && !valueInMap(m_nhToEgr, egr))
+            else if (matchingNh.empty() && m_egrNhRefCount.find(egr) == m_egrNhRefCount.end())
             {
                 hwbcm_l3_egress_destroy(egr);
             }
@@ -1191,14 +1413,25 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         }
     }
 
+    auto existing = m_neighborEgr.find(serialized);
+    if (existing != m_neighborEgr.end())
+    {
+        egrNeighborRefDec(existing->second);
+    }
     m_neighborEgr[serialized] = egr;
+    egrNeighborRefInc(egr);
+    neighborVlanIndexAdd(serialized, ne.rif_id, macAttr->value.mac);
+    if (ne.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+    {
+        v4NeighborIndexAdd(vrf, ne.ip_address.addr.ip4, serialized, egr);
+    }
 
     SWSS_LOG_NOTICE("neighbor %s -> egress %d (intf %d vrf %d port %d trunk %d vp 0x%x/ovl %d cpu %d host %d)",
             serialized.c_str(), egr, intf, vrf, port, trunk, vpGport, ovlIntf, toCpu ? 1 : 0, noHostRoute ? 0 : 1);
 
     if (m_hwReady)
     {
-        hwVxlanRetryPending(); // A4: a remote VTEP may have been waiting for this underlay
+        hwVxlanRetryPendingForNeighbor(ne.ip_address, egr); // A4: a remote VTEP may have been waiting for this underlay
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1372,12 +1605,17 @@ sai_status_t SwitchBCM56860HW::hwSetNeighbor(
         }
     }
 
+    if (attr->id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
+    {
+        neighborVlanIndexUpdateMac(serialized, mac);
+    }
+
     SWSS_LOG_NOTICE("neighbor %s updated (attr %d, %zu egress(es), action %d port %d trunk %d vp 0x%x cpu %d)",
             serialized.c_str(), attr->id, egrs.size(), (int)action, port, trunk, vpGport, toCpu ? 1 : 0);
 
     if (m_hwReady)
     {
-        hwVxlanRetryPending();
+        hwVxlanRetryPendingForNeighbor(ne.ip_address, it->second);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1469,16 +1707,24 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         }
     }
 
-    bool otherNeighborUsesEgr = false;
-
-    for (auto &kv: m_neighborEgr)
+    if (m_egrNhRefCount.find(egr) != m_egrNhRefCount.end())
     {
-        if (kv.first != serialized && kv.second == egr)
-        {
-            otherNeighborUsesEgr = true;
-            break;
-        }
+        nhEgrs.insert(egr);
     }
+
+    auto nRefIt = m_egrNeighborRefCount.find(egr);
+    bool otherNeighborUsesEgr = (nRefIt != m_egrNeighborRefCount.end() && nRefIt->second > 1);
+
+    auto eraseNeighborIndexes = [&]()
+    {
+        m_neighborEgr.erase(it);
+        egrNeighborRefDec(egr);
+        neighborVlanIndexRemove(serialized);
+        if (ne.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            v4NeighborIndexRemove(vrf, ne.ip_address.addr.ip4, serialized);
+        }
+    };
 
     if (!nhEgrs.empty())
     {
@@ -1514,7 +1760,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
             }
         }
 
-        m_neighborEgr.erase(it);
+        eraseNeighborIndexes();
         SWSS_LOG_NOTICE("neighbor %s removed, %zu next-hop egress(es) now punt to cpu", serialized.c_str(), nhEgrs.size());
     }
     else if (!otherNeighborUsesEgr)
@@ -1535,12 +1781,12 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
             return bcmRvToSai(rv);
         }
 
-        m_neighborEgr.erase(it);
+        eraseNeighborIndexes();
         SWSS_LOG_NOTICE("neighbor %s removed, egress %d destroyed", serialized.c_str(), egr);
     }
     else
     {
-        m_neighborEgr.erase(it);
+        eraseNeighborIndexes();
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1600,13 +1846,14 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     if (nit != m_neighborEgr.end())
     {
         m_nhToEgr[nh_id] = nit->second;
+        egrNhRefInc(nit->second);
         nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
         SWSS_LOG_NOTICE("next hop %s -> egress %d (shared with neighbor %s)", snh.c_str(), nit->second, key.c_str());
 
         if (m_hwReady)
         {
-            hwVxlanRetryPending();
+            hwVxlanRetryPendingForNextHop(nit->second);
         }
 
         return SAI_STATUS_SUCCESS;
@@ -1638,13 +1885,14 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     }
 
     m_nhToEgr[nh_id] = egr;
+    egrNhRefInc(egr);
     nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
     SWSS_LOG_NOTICE("next hop %s -> egress %d (cpu, neighbor %s unresolved)", snh.c_str(), egr, key.c_str());
 
     if (m_hwReady)
     {
-        hwVxlanRetryPending();
+        hwVxlanRetryPendingForNextHop(egr);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1664,23 +1912,15 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
 
     int egr = it->second;
 
-    bool stillUsed = valueInMap(m_neighborEgr, egr);
-
-    if (!stillUsed)
-    {
-        for (auto &kv: m_nhToEgr)
-        {
-            if (kv.first != nh_id && kv.second == egr)
-            {
-                stillUsed = true;
-                break;
-            }
-        }
-    }
+    auto nCnt = m_egrNeighborRefCount.find(egr);
+    auto nhCnt = m_egrNhRefCount.find(egr);
+    bool stillUsed = (nCnt != m_egrNeighborRefCount.end() && nCnt->second > 0) ||
+                     (nhCnt != m_egrNhRefCount.end() && nhCnt->second > 1);
 
     if (stillUsed)
     {
         m_nhToEgr.erase(it);
+        egrNhRefDec(egr);
         nhIndexRemove(nh_id);
         SWSS_LOG_NOTICE("next hop %s removed, egress %d still in use", sai_serialize_object_id(nh_id).c_str(), egr);
         return SAI_STATUS_SUCCESS;
@@ -1695,6 +1935,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
     }
 
     m_nhToEgr.erase(it);
+    egrNhRefDec(egr);
     nhIndexRemove(nh_id);
 
     return SAI_STATUS_SUCCESS;
@@ -1751,22 +1992,21 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroup(
             return bcmRvToSai(rv);
         }
 
+        m_ecmpToNhg.erase(it->second);
         m_nhgToEcmp.erase(it);
     }
 
     // drop stale members (should be gone already)
 
-    for (auto mit = m_nhgMemberToNhg.begin(); mit != m_nhgMemberToNhg.end();)
+    auto gmit = m_nhgToMembers.find(nhg_id);
+    if (gmit != m_nhgToMembers.end())
     {
-        if (mit->second == nhg_id)
+        for (auto memberOid: gmit->second)
         {
-            m_nhgMemberToNh.erase(mit->first);
-            mit = m_nhgMemberToNhg.erase(mit);
+            m_nhgMemberToNh.erase(memberOid);
+            m_nhgMemberToNhg.erase(memberOid);
         }
-        else
-        {
-            ++mit;
-        }
+        m_nhgToMembers.erase(gmit);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1801,8 +2041,9 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
 
     m_nhgMemberToNh[member_id] = nh;
     m_nhgMemberToNhg[member_id] = nhg;
+    m_nhgToMembers[nhg].insert(member_id);
 
-    std::vector<int> egrs = groupEgressList(nhg, m_nhgMemberToNhg, m_nhgMemberToNh, m_nhToEgr);
+    std::vector<int> egrs = groupEgressList(nhg, m_nhgToMembers, m_nhgMemberToNh, m_nhToEgr);
 
     auto eit = m_nhgToEcmp.find(nhg);
 
@@ -1819,10 +2060,13 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
             SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_create failed: %d", sm.c_str(), rv);
             m_nhgMemberToNh.erase(member_id);
             m_nhgMemberToNhg.erase(member_id);
+            m_nhgToMembers[nhg].erase(member_id);
+            if (m_nhgToMembers[nhg].empty()) m_nhgToMembers.erase(nhg);
             return bcmRvToSai(rv);
         }
 
         m_nhgToEcmp[nhg] = ecmp;
+        m_ecmpToNhg[ecmp] = nhg;
 
         SWSS_LOG_NOTICE("next hop group %s -> ecmp %d (%zu members)", sai_serialize_object_id(nhg).c_str(), ecmp, egrs.size());
     }
@@ -1835,6 +2079,8 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
             SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_set(%d) failed: %d", sm.c_str(), eit->second, rv);
             m_nhgMemberToNh.erase(member_id);
             m_nhgMemberToNhg.erase(member_id);
+            m_nhgToMembers[nhg].erase(member_id);
+            if (m_nhgToMembers[nhg].empty()) m_nhgToMembers.erase(nhg);
             return bcmRvToSai(rv);
         }
 
@@ -1870,6 +2116,15 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
 
     m_nhgMemberToNhg.erase(git);
     m_nhgMemberToNh.erase(member_id);
+    auto gmit = m_nhgToMembers.find(nhg);
+    if (gmit != m_nhgToMembers.end())
+    {
+        gmit->second.erase(member_id);
+        if (gmit->second.empty())
+        {
+            m_nhgToMembers.erase(gmit);
+        }
+    }
 
     auto eit = m_nhgToEcmp.find(nhg);
 
@@ -1878,7 +2133,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
         return SAI_STATUS_SUCCESS;
     }
 
-    std::vector<int> egrs = groupEgressList(nhg, m_nhgMemberToNhg, m_nhgMemberToNh, m_nhToEgr);
+    std::vector<int> egrs = groupEgressList(nhg, m_nhgToMembers, m_nhgMemberToNh, m_nhToEgr);
     bool empty = egrs.empty();
 
     if (empty)
@@ -1888,6 +2143,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
         if (dropEgr < 0)
         {
             m_nhgMemberToNhg[member_id] = nhg;
+            m_nhgToMembers[nhg].insert(member_id);
             if (hadNh)
             {
                 m_nhgMemberToNh[member_id] = savedNh;
@@ -1906,6 +2162,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
     if (rv < 0)
     {
         m_nhgMemberToNhg[member_id] = nhg;
+        m_nhgToMembers[nhg].insert(member_id);
         if (hadNh)
         {
             m_nhgMemberToNh[member_id] = savedNh;
@@ -2032,7 +2289,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
                         if (it == m_nhgToEcmp.end())
                         {
                             // group without members yet: create the ecmp now (drop egress when empty)
-                            std::vector<int> egrs = groupEgressList(nhOid, m_nhgMemberToNhg, m_nhgMemberToNh, m_nhToEgr);
+                            std::vector<int> egrs = groupEgressList(nhOid, m_nhgToMembers, m_nhgMemberToNh, m_nhToEgr);
 
                             if (egrs.empty())
                             {
@@ -2060,6 +2317,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
                             }
 
                             m_nhgToEcmp[nhOid] = ecmp;
+                            m_ecmpToNhg[ecmp] = nhOid;
                             egr = ecmp;
                         }
                         else
@@ -2107,12 +2365,16 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
     }
 
     m_routeEgr[serialized] = egr;
+    if (af == 4)
+    {
+        v4RouteIndexAdd(vrf, re.destination.addr.ip4, len, egr);
+    }
 
     SWSS_LOG_INFO("route %s -> %d (vrf %d action %d)", serialized.c_str(), egr, vrf, (int)action);
 
     if (m_hwReady)
     {
-        hwVxlanRetryPending();
+        hwVxlanRetryPendingForRoute(re.destination);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2198,6 +2460,10 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
     }
 
     m_routeEgr.erase(it);
+    if (af == 4)
+    {
+        v4RouteIndexRemove(vrf, re.destination.addr.ip4, len);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
@@ -2223,26 +2489,30 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
      * punt egress is stale). Also covers a MAC moving to another port.
      */
 
+    auto idxIt = m_vlanNeighborsByMac.find(makeVlanMacKey(vlanOid, mac));
+
+    if (idxIt == m_vlanNeighborsByMac.end())
+    {
+        return;
+    }
+
     bool changed = false;
 
-    for (auto &kv: m_neighborEgr)
+    for (const auto &neKey: idxIt->second)
     {
-        sai_neighbor_entry_t ne;
-        sai_deserialize_neighbor_entry(kv.first, ne);
+        auto nIt = m_neighborEgr.find(neKey);
 
-        sai_attribute_t rifType, vlanAttr, macAttr, paAttr;
-
-        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
-                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
-                !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr) ||
-                vlanAttr.value.oid != vlanOid ||
-                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr) ||
-                !macEqual(macAttr.value.mac, mac))
+        if (nIt == m_neighborEgr.end())
         {
             continue;
         }
 
-        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(neKey, ne);
+
+        sai_attribute_t paAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, neKey, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
                 paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
         {
             continue;
@@ -2256,7 +2526,7 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
         }
 
         std::set<int> egrs;
-        egrs.insert(kv.second);
+        egrs.insert(nIt->second);
 
         {
             auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
@@ -2282,12 +2552,12 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve after fdb learn failed: %d",
-                        kv.first.c_str(), e, rv);
+                        neKey.c_str(), e, rv);
                 continue;
             }
 
             SWSS_LOG_NOTICE("neighbor %s: egress %d re-resolved after fdb learn (port %d trunk %d)",
-                    kv.first.c_str(), e, port, trunk);
+                    neKey.c_str(), e, port, trunk);
 
             changed = true;
         }
@@ -2322,26 +2592,30 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
         return;
     }
 
+    auto idxIt = m_vlanNeighborsByMac.find(makeVlanMacKey(vlanOid, mac));
+
+    if (idxIt == m_vlanNeighborsByMac.end())
+    {
+        return;
+    }
+
     bool changed = false;
 
-    for (auto &kv: m_neighborEgr)
+    for (const auto &neKey: idxIt->second)
     {
-        sai_neighbor_entry_t ne;
-        sai_deserialize_neighbor_entry(kv.first, ne);
+        auto nIt = m_neighborEgr.find(neKey);
 
-        sai_attribute_t rifType, vlanAttr, macAttr, paAttr;
-
-        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
-                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
-                !getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VLAN_ID, vlanAttr) ||
-                vlanAttr.value.oid != vlanOid ||
-                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr) ||
-                !macEqual(macAttr.value.mac, mac))
+        if (nIt == m_neighborEgr.end())
         {
             continue;
         }
 
-        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(neKey, ne);
+
+        sai_attribute_t paAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, neKey, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
                 paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
         {
             continue; // a drop egress stays a drop egress
@@ -2357,7 +2631,7 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
         }
 
         std::set<int> egrs;
-        egrs.insert(kv.second);
+        egrs.insert(nIt->second);
 
         {
             auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
@@ -2383,12 +2657,12 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("neighbor %s: egress %d punt after fdb age/flush failed: %d",
-                        kv.first.c_str(), e, rv);
+                        neKey.c_str(), e, rv);
                 continue;
             }
 
             SWSS_LOG_NOTICE("neighbor %s: mac %s left the fdb, egress %d punts to cpu until re-learned",
-                    kv.first.c_str(), sai_serialize_mac(mac).c_str(), e);
+                    neKey.c_str(), sai_serialize_mac(mac).c_str(), e);
 
             changed = true;
         }
@@ -2469,60 +2743,60 @@ bool SwitchBCM56860HW::neighborTarget(
         return false;
     }
 
-    for (auto &kv: fdbIt->second)
+    sai_fdb_entry_t fe;
+    memset(&fe, 0, sizeof(fe));
+    fe.switch_id = m_switch_id;
+    fe.bv_id = vlanOid;
+    memcpy(fe.mac_address, mac, sizeof(fe.mac_address));
+
+    auto kv = fdbIt->second.find(sai_serialize_fdb_entry(fe));
+
+    if (kv == fdbIt->second.end())
     {
-        sai_fdb_entry_t fe;
-        sai_deserialize_fdb_entry(kv.first, fe);
-
-        if (fe.bv_id != vlanOid || !macEqual(fe.mac_address, mac))
-        {
-            continue;
-        }
-
-        auto bp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
-
-        if (bp == kv.second.end() || bp->second == nullptr || bp->second->getAttr() == nullptr)
-        {
-            continue;
-        }
-
-        sai_object_id_t bridgePort = bp->second->getAttr()->value.oid;
-
-        // RIOT: MAC behind a remote VTEP -> routed into the VPN over the
-        // VTEP's network VP (needs the VPN's SVI binding and a live VP).
-        auto rip = m_bridgePortRemoteIp.find(bridgePort);
-
-        if (rip != m_bridgePortRemoteIp.end())
-        {
-            int vpn = vxlanVpnOfVid(vidOf(vlanOid));
-            int ovl = (vpn >= 0) ? hwbcm_vxlan_vpn_l3_intf(vpn) : -1;
-            auto vt = m_vtepByIp.find(rip->second);
-
-            if (ovl >= 0 && vt != m_vtepByIp.end() && vt->second.vpReady)
-            {
-                vpGport = vt->second.vp;
-                ovlIntf = ovl;
-                return true;
-            }
-
-            return false;
-        }
-
-        sai_object_id_t target = bridgePortTarget(bridgePort);
-
-        if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
-        {
-            trunk = trunkOf(target);
-        }
-        else
-        {
-            port = bcmPortOf(target);
-        }
-
-        return port >= 0 || trunk >= 0;
+        return false;
     }
 
-    return false;
+    auto bp = kv->second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
+
+    if (bp == kv->second.end() || bp->second == nullptr || bp->second->getAttr() == nullptr)
+    {
+        return false;
+    }
+
+    sai_object_id_t bridgePort = bp->second->getAttr()->value.oid;
+
+    // RIOT: MAC behind a remote VTEP -> routed into the VPN over the
+    // VTEP's network VP (needs the VPN's SVI binding and a live VP).
+    auto rip = m_bridgePortRemoteIp.find(bridgePort);
+
+    if (rip != m_bridgePortRemoteIp.end())
+    {
+        int vpn = vxlanVpnOfVid(vidOf(vlanOid));
+        int ovl = (vpn >= 0) ? hwbcm_vxlan_vpn_l3_intf(vpn) : -1;
+        auto vt = m_vtepByIp.find(rip->second);
+
+        if (ovl >= 0 && vt != m_vtepByIp.end() && vt->second.vpReady)
+        {
+            vpGport = vt->second.vp;
+            ovlIntf = ovl;
+            return true;
+        }
+
+        return false;
+    }
+
+    sai_object_id_t target = bridgePortTarget(bridgePort);
+
+    if (objectTypeQuery(target) == SAI_OBJECT_TYPE_LAG)
+    {
+        trunk = trunkOf(target);
+    }
+    else
+    {
+        port = bcmPortOf(target);
+    }
+
+    return port >= 0 || trunk >= 0;
 }
 
 void SwitchBCM56860HW::hwReresolveNeighborsOnVlan(
@@ -2531,31 +2805,42 @@ void SwitchBCM56860HW::hwReresolveNeighborsOnVlan(
 {
     SWSS_LOG_ENTER();
 
+    auto vIt = m_vlanNeighborsByVid.find(vid);
+
+    if (vIt == m_vlanNeighborsByVid.end())
+    {
+        return;
+    }
+
     bool changed = false;
 
-    for (auto &kv: m_neighborEgr)
+    for (const auto &neKey: vIt->second)
     {
-        sai_neighbor_entry_t ne;
-        sai_deserialize_neighbor_entry(kv.first, ne);
+        auto nIt = m_neighborEgr.find(neKey);
 
-        auto vit = m_rifToVid.find(ne.rif_id);
+        if (nIt == m_neighborEgr.end())
+        {
+            continue;
+        }
+
+        sai_neighbor_entry_t ne;
+        sai_deserialize_neighbor_entry(neKey, ne);
+
         auto rit = m_rifToIntf.find(ne.rif_id);
 
-        if (vit == m_rifToVid.end() || vit->second != vid || rit == m_rifToIntf.end())
+        if (rit == m_rifToIntf.end())
         {
             continue;
         }
 
-        sai_attribute_t rifType, macAttr, paAttr;
+        sai_attribute_t macAttr, paAttr;
 
-        if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_TYPE, rifType) ||
-                rifType.value.s32 != SAI_ROUTER_INTERFACE_TYPE_VLAN ||
-                !getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr))
+        if (!getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, neKey, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr))
         {
             continue;
         }
 
-        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, neKey, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr) &&
                 paAttr.value.s32 == SAI_PACKET_ACTION_DROP)
         {
             continue;
@@ -2567,25 +2852,25 @@ void SwitchBCM56860HW::hwReresolveNeighborsOnVlan(
         if (punt || !neighborTarget(ne.rif_id, macAttr.value.mac, port, trunk, vpGport, ovlIntf))
         {
             port = trunk = vpGport = ovlIntf = -1;
-            rv = hwbcm_l3_egress_cpu_replace(kv.second, rit->second);
+            rv = hwbcm_l3_egress_cpu_replace(nIt->second, rit->second);
         }
         else if (vpGport != -1)
         {
-            rv = hwbcm_vxlan_overlay_egress_replace(kv.second, ovlIntf, macAttr.value.mac, vpGport);
+            rv = hwbcm_vxlan_overlay_egress_replace(nIt->second, ovlIntf, macAttr.value.mac, vpGport);
         }
         else
         {
-            rv = hwbcm_l3_egress_replace(kv.second, rit->second, macAttr.value.mac, port, trunk);
+            rv = hwbcm_l3_egress_replace(nIt->second, rit->second, macAttr.value.mac, port, trunk);
         }
 
         if (rv < 0)
         {
-            SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve failed: %d", kv.first.c_str(), kv.second, rv);
+            SWSS_LOG_ERROR("neighbor %s: egress %d re-resolve failed: %d", neKey.c_str(), nIt->second, rv);
             continue;
         }
 
         SWSS_LOG_INFO("neighbor %s: egress %d re-resolved (port %d trunk %d vp 0x%x ovl %d)",
-                kv.first.c_str(), kv.second, port, trunk, vpGport, ovlIntf);
+                neKey.c_str(), nIt->second, port, trunk, vpGport, ovlIntf);
         changed = true;
     }
 

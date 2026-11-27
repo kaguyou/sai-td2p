@@ -113,19 +113,32 @@ int hwbcm_l3_enable_set(int enable)
 /* helpers                                                                  */
 /* ------------------------------------------------------------------------ */
 
-/* ECMP id bookkeeping (needed for BCM_L3_MULTIPATH on routes/hosts). */
+/* ECMP id bookkeeping (sorted array for O(log E) lookup in hwbcm_l3_is_ecmp). */
 static int *s_ecmp_ids = NULL;
 static int s_ecmp_count = 0;
 static int s_ecmp_cap = 0;
 
+static int hwbcm_l3_ecmp_lower_bound(int ecmp_id)
+{
+    int lo = 0, hi = s_ecmp_count;
+
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (s_ecmp_ids[mid] < ecmp_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
 static int hwbcm_l3_ecmp_remember(int ecmp_id)
 {
-    int i;
+    int pos = hwbcm_l3_ecmp_lower_bound(ecmp_id);
 
-    for (i = 0; i < s_ecmp_count; i++) {
-        if (s_ecmp_ids[i] == ecmp_id) {
-            return 0;
-        }
+    if (pos < s_ecmp_count && s_ecmp_ids[pos] == ecmp_id) {
+        return 0;
     }
     if (s_ecmp_count == s_ecmp_cap) {
         int ncap = s_ecmp_cap ? s_ecmp_cap * 2 : 64;
@@ -137,33 +150,37 @@ static int hwbcm_l3_ecmp_remember(int ecmp_id)
         s_ecmp_ids = n;
         s_ecmp_cap = ncap;
     }
-    s_ecmp_ids[s_ecmp_count++] = ecmp_id;
+    if (pos < s_ecmp_count) {
+        memmove(&s_ecmp_ids[pos + 1], &s_ecmp_ids[pos],
+                (size_t)(s_ecmp_count - pos) * sizeof(int));
+    }
+    s_ecmp_ids[pos] = ecmp_id;
+    s_ecmp_count++;
     return 0;
 }
 
 static void hwbcm_l3_ecmp_forget(int ecmp_id)
 {
-    int i;
+    int pos = hwbcm_l3_ecmp_lower_bound(ecmp_id);
 
-    for (i = 0; i < s_ecmp_count; i++) {
-        if (s_ecmp_ids[i] == ecmp_id) {
-            s_ecmp_ids[i] = s_ecmp_ids[s_ecmp_count - 1];
-            s_ecmp_count--;
-            return;
+    if (pos < s_ecmp_count && s_ecmp_ids[pos] == ecmp_id) {
+        if (pos + 1 < s_ecmp_count) {
+            memmove(&s_ecmp_ids[pos], &s_ecmp_ids[pos + 1],
+                    (size_t)(s_ecmp_count - pos - 1) * sizeof(int));
         }
+        s_ecmp_count--;
     }
 }
 
 int hwbcm_l3_is_ecmp(int id)
 {
-    int i;
+    int pos;
 
-    for (i = 0; i < s_ecmp_count; i++) {
-        if (s_ecmp_ids[i] == id) {
-            return 1;
-        }
+    if (s_ecmp_count == 0) {
+        return 0;
     }
-    return 0;
+    pos = hwbcm_l3_ecmp_lower_bound(id);
+    return (pos < s_ecmp_count && s_ecmp_ids[pos] == id) ? 1 : 0;
 }
 
 /* network-order 4 bytes -> bcm_ip_t (host order) */

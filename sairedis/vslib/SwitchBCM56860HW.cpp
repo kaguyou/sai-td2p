@@ -1764,33 +1764,15 @@ void SwitchBCM56860HW::process_packet_for_fdb_event(
 
         sai_object_id_t targetOid = port_oid;
 
-        for (const auto &mkv: m_lagMemberInfo)
         {
-            if (mkv.second.second == port_oid)
+            auto lagIt = m_portToLag.find(port_oid);
+            if (lagIt != m_portToLag.end())
             {
-                targetOid = mkv.second.first;
-                break;
+                targetOid = lagIt->second;
             }
         }
 
-        sai_object_id_t newBp = SAI_NULL_OBJECT_ID;
-
-        for (const auto &bkv: m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT))
-        {
-            sai_object_id_t bpOid = SAI_NULL_OBJECT_ID;
-            sai_deserialize_object_id(bkv.first, bpOid);
-
-            sai_attribute_t typeA, portA;
-
-            if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_TYPE, typeA) &&
-                typeA.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT &&
-                getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_PORT_ID, portA) &&
-                portA.value.oid == targetOid)
-            {
-                newBp = bpOid;
-                break;
-            }
-        }
+        sai_object_id_t newBp = bridgePortOfTarget(targetOid);
 
         sai_attribute_t oldBpAttr;
         bool haveOldBp = getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, sid, SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID, oldBpAttr);
@@ -1954,6 +1936,13 @@ sai_object_id_t SwitchBCM56860HW::vlanOidOf(
 {
     SWSS_LOG_ENTER();
 
+    auto cit = m_vidToVlanOid.find(vid);
+
+    if (cit != m_vidToVlanOid.end())
+    {
+        return cit->second;
+    }
+
     auto oit = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
 
     if (oit == m_objectHash.end())
@@ -1965,18 +1954,63 @@ sai_object_id_t SwitchBCM56860HW::vlanOidOf(
     {
         sai_attribute_t attr;
 
-        if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, kvp.first, SAI_VLAN_ATTR_VLAN_ID, attr) &&
-                (int)attr.value.u16 == vid)
+        if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, kvp.first, SAI_VLAN_ATTR_VLAN_ID, attr))
         {
-            sai_object_id_t oid;
-
+            int curVid = (int)attr.value.u16;
+            sai_object_id_t oid = SAI_NULL_OBJECT_ID;
             sai_deserialize_object_id(kvp.first, oid);
 
-            return oid;
+            m_vidToVlanOid[curVid] = oid;
+            m_vlanOidToVid[oid] = curVid;
+
+            if (curVid == vid)
+            {
+                return oid;
+            }
         }
     }
 
     return SAI_NULL_OBJECT_ID;
+}
+
+sai_object_id_t SwitchBCM56860HW::bridgePortOfTarget(
+        _In_ sai_object_id_t targetOid)
+{
+    SWSS_LOG_ENTER();
+
+    auto cit = m_targetToBridgePort.find(targetOid);
+    if (cit != m_targetToBridgePort.end())
+    {
+        return cit->second;
+    }
+
+    auto bpit = m_objectHash.find(SAI_OBJECT_TYPE_BRIDGE_PORT);
+    if (bpit == m_objectHash.end())
+    {
+        return SAI_NULL_OBJECT_ID;
+    }
+
+    sai_object_id_t found = SAI_NULL_OBJECT_ID;
+    for (const auto &bkv: bpit->second)
+    {
+        sai_object_id_t bpOid = SAI_NULL_OBJECT_ID;
+        sai_deserialize_object_id(bkv.first, bpOid);
+
+        sai_attribute_t typeA, portA;
+        if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_TYPE, typeA) &&
+            typeA.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT &&
+            getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_PORT_ID, portA))
+        {
+            m_targetToBridgePort[portA.value.oid] = bpOid;
+            m_bridgePortToTarget[bpOid] = portA.value.oid;
+            if (portA.value.oid == targetOid)
+            {
+                found = bpOid;
+            }
+        }
+    }
+
+    return found;
 }
 
 void SwitchBCM56860HW::onLinkChange(
@@ -2350,6 +2384,9 @@ sai_status_t SwitchBCM56860HW::hwCreateVlan(
         return bcmRvToSai(rv);
     }
 
+    m_vidToVlanOid[(int)vid->value.u16] = vlan_id;
+    m_vlanOidToVid[vlan_id] = (int)vid->value.u16;
+
     SWSS_LOG_NOTICE("vlan %u created on hardware (%s)", vid->value.u16, sai_serialize_object_id(vlan_id).c_str());
 
     return SAI_STATUS_SUCCESS;
@@ -2383,6 +2420,13 @@ sai_status_t SwitchBCM56860HW::hwRemoveVlan(
         SWSS_LOG_ERROR("hwbcm_vlan_destroy(%d) failed: %d", vid, rv);
 
         return bcmRvToSai(rv);
+    }
+
+    m_vlanOidToVid.erase(vlan_id);
+    auto vit = m_vidToVlanOid.find(vid);
+    if (vit != m_vidToVlanOid.end() && vit->second == vlan_id)
+    {
+        m_vidToVlanOid.erase(vit);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2894,6 +2938,7 @@ sai_status_t SwitchBCM56860HW::hwCreateLagMember(
 
     m_lagMembers[lag->value.oid].push_back(port->value.oid);
     m_lagMemberInfo[member_id] = std::make_pair(lag->value.oid, port->value.oid);
+    m_portToLag[port->value.oid] = lag->value.oid;
 
     sai_status_t status = applyTrunkMembers(lag->value.oid);
 
@@ -2904,6 +2949,7 @@ sai_status_t SwitchBCM56860HW::hwCreateLagMember(
         members.erase(std::remove(members.begin(), members.end(), port->value.oid), members.end());
 
         m_lagMemberInfo.erase(member_id);
+        m_portToLag.erase(port->value.oid);
 
         return status;
     }
@@ -3062,6 +3108,11 @@ sai_status_t SwitchBCM56860HW::hwRemoveLagMember(
     }
 
     m_lagMemberInfo.erase(it);
+    auto pl = m_portToLag.find(port);
+    if (pl != m_portToLag.end() && pl->second == lag)
+    {
+        m_portToLag.erase(pl);
+    }
 
     syncLagMemberPort(lag, port, false);
 
@@ -3702,6 +3753,12 @@ int SwitchBCM56860HW::vidOf(
         return -1;
     }
 
+    auto cit = m_vlanOidToVid.find(vlan_oid);
+    if (cit != m_vlanOidToVid.end())
+    {
+        return cit->second;
+    }
+
     sai_attribute_t attr;
 
     if (!getStoredAttr(SAI_OBJECT_TYPE_VLAN, vlan_oid, SAI_VLAN_ATTR_VLAN_ID, attr))
@@ -3709,7 +3766,10 @@ int SwitchBCM56860HW::vidOf(
         return -1;
     }
 
-    return (int)attr.value.u16;
+    int vid = (int)attr.value.u16;
+    m_vlanOidToVid[vlan_oid] = vid;
+    m_vidToVlanOid[vid] = vlan_oid;
+    return vid;
 }
 
 int SwitchBCM56860HW::trunkOf(

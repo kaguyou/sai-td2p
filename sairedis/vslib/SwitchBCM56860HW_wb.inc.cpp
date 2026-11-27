@@ -2069,6 +2069,7 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
     // LAG members from m_objectHash (zero HW writes)
     m_lagMembers.clear();
     m_lagMemberInfo.clear();
+    m_portToLag.clear();
     for (const auto &kv : m_lagToTrunk)
     {
         m_lagMembers[kv.first] = {};
@@ -2086,15 +2087,58 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
             {
                 m_lagMembers[lagAttr.value.oid].push_back(portAttr.value.oid);
                 m_lagMemberInfo[memberOid] = std::make_pair(lagAttr.value.oid, portAttr.value.oid);
+                m_portToLag[portAttr.value.oid] = lagAttr.value.oid;
             }
         }
     }
 
-    // Derived (rif, ip) -> NEXT_HOP index from m_nhToEgr + m_objectHash (zero HW writes)
+    // Derived VLAN & 1Q bridge-port caches from m_objectHash (zero HW writes)
+    m_vidToVlanOid.clear();
+    m_vlanOidToVid.clear();
+    auto vlit = m_objectHash.find(SAI_OBJECT_TYPE_VLAN);
+    if (vlit != m_objectHash.end())
+    {
+        for (const auto &kv : vlit->second)
+        {
+            sai_object_id_t vlanOid = SAI_NULL_OBJECT_ID;
+            sai_deserialize_object_id(kv.first, vlanOid);
+            sai_attribute_t vidAttr;
+            if (getStoredAttr(SAI_OBJECT_TYPE_VLAN, vlanOid, SAI_VLAN_ATTR_VLAN_ID, vidAttr))
+            {
+                int vid = (int)vidAttr.value.u16;
+                m_vidToVlanOid[vid] = vlanOid;
+                m_vlanOidToVid[vlanOid] = vid;
+            }
+        }
+    }
+
+    m_targetToBridgePort.clear();
+    m_bridgePortToTarget.clear();
+    auto bphIt = m_objectHash.find(SAI_OBJECT_TYPE_BRIDGE_PORT);
+    if (bphIt != m_objectHash.end())
+    {
+        for (const auto &kv : bphIt->second)
+        {
+            sai_object_id_t bpOid = SAI_NULL_OBJECT_ID;
+            sai_deserialize_object_id(kv.first, bpOid);
+            sai_attribute_t typeA, portA;
+            if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_TYPE, typeA) &&
+                typeA.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT &&
+                getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_PORT_ID, portA))
+            {
+                m_targetToBridgePort[portA.value.oid] = bpOid;
+                m_bridgePortToTarget[bpOid] = portA.value.oid;
+            }
+        }
+    }
+
+    // Derived (rif, ip) -> NEXT_HOP index + egress NH refcounts (zero HW writes)
     m_nhByRifIp.clear();
     m_nhKey.clear();
+    m_egrNhRefCount.clear();
     for (const auto &kv : m_nhToEgr)
     {
+        egrNhRefInc(kv.second);
         sai_attribute_t nhRif, nhIp;
         if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
             getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp))
@@ -2103,9 +2147,17 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
         }
     }
 
+    // Derived ECMP -> NHG and NHG -> members indexes (zero HW writes)
+    m_ecmpToNhg.clear();
+    for (const auto &kv : m_nhgToEcmp)
+    {
+        m_ecmpToNhg[kv.second] = kv.first;
+    }
+
     // NHG members from m_objectHash (zero HW writes)
     m_nhgMemberToNh.clear();
     m_nhgMemberToNhg.clear();
+    m_nhgToMembers.clear();
     auto nmit = m_objectHash.find(SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER);
     if (nmit != m_objectHash.end())
     {
@@ -2119,7 +2171,79 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
             {
                 m_nhgMemberToNhg[memberOid] = nhgAttr.value.oid;
                 m_nhgMemberToNh[memberOid] = nhAttr.value.oid;
+                m_nhgToMembers[nhgAttr.value.oid].insert(memberOid);
             }
+        }
+    }
+
+    // Derived neighbor egress refcounts, VLAN-RIF neighbor MAC/VID indexes,
+    // and IPv4 neighbor/route underlay lookup indexes (zero HW writes)
+    m_egrNeighborRefCount.clear();
+    m_vlanNeighborsByMac.clear();
+    m_vlanNeighborsByVid.clear();
+    m_neighborVlanMac.clear();
+    m_v4NeighborsByVrfIp.clear();
+    for (const auto &kv : m_neighborEgr)
+    {
+        egrNeighborRefInc(kv.second);
+        sai_neighbor_entry_t ne;
+        memset(&ne, 0, sizeof(ne));
+        try
+        {
+            sai_deserialize_neighbor_entry(kv.first, ne);
+        }
+        catch (const std::exception &)
+        {
+            continue;
+        }
+        sai_attribute_t macAttr;
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, kv.first, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr))
+        {
+            neighborVlanIndexAdd(kv.first, ne.rif_id, macAttr.value.mac);
+        }
+        if (ne.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            int vrf = 0;
+            sai_attribute_t vrAttr;
+            if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
+            {
+                auto vrit = m_vrToVrf.find(vrAttr.value.oid);
+                if (vrit != m_vrToVrf.end())
+                {
+                    vrf = vrit->second;
+                }
+            }
+            v4NeighborIndexAdd(vrf, ne.ip_address.addr.ip4, kv.first, kv.second);
+        }
+    }
+
+    for (int l = 0; l <= 32; l++)
+    {
+        m_v4RoutesByVrfLen[l].clear();
+    }
+    m_v4RouteLenMask = 0;
+    for (const auto &kv : m_routeEgr)
+    {
+        sai_route_entry_t re;
+        memset(&re, 0, sizeof(re));
+        try
+        {
+            sai_deserialize_route_entry(kv.first, re);
+        }
+        catch (const std::exception &)
+        {
+            continue;
+        }
+        if (re.destination.addr_family == SAI_IP_ADDR_FAMILY_IPV4)
+        {
+            int vrf = 0;
+            auto vrit = m_vrToVrf.find(re.vr_id);
+            if (vrit != m_vrToVrf.end())
+            {
+                vrf = vrit->second;
+            }
+            int len = __builtin_popcount(re.destination.mask.ip4);
+            v4RouteIndexAdd(vrf, re.destination.addr.ip4, len, kv.second);
         }
     }
 }
@@ -2213,6 +2337,7 @@ void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
     m_mapEntryVidVni.clear();
     m_vniRefs.clear();
     m_vidToVni.clear();
+    m_vpnToVid.clear();
     m_tunnelRemoteIp.clear();
     m_termEntryTunnel.clear();
     m_bridgeToVpn.clear();
@@ -2284,6 +2409,7 @@ void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
             {
                 m_mapEntryVidVni[oid] = std::make_pair(vid, vni);
                 m_vidToVni[vid] = vni;
+                m_vpnToVid[m_vniToVpn.at(vni)] = vid;
                 m_vniRefs[vni]++;
             }
         }
@@ -2962,11 +3088,27 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     m_nhToEgr.clear();
     m_nhByRifIp.clear();
     m_nhKey.clear();
+    m_egrNhRefCount.clear();
+    m_egrNeighborRefCount.clear();
     m_nhgToEcmp.clear();
+    m_ecmpToNhg.clear();
     m_nhgMemberToNh.clear();
     m_nhgMemberToNhg.clear();
+    m_nhgToMembers.clear();
     m_neighborEgr.clear();
+    m_vlanNeighborsByMac.clear();
+    m_vlanNeighborsByVid.clear();
+    m_neighborVlanMac.clear();
+    m_v4NeighborsByVrfIp.clear();
+    for (int l = 0; l <= 32; l++) m_v4RoutesByVrfLen[l].clear();
+    m_v4RouteLenMask = 0;
     m_routeEgr.clear();
+    m_vidToVlanOid.clear();
+    m_vlanOidToVid.clear();
+    m_portToLag.clear();
+    m_targetToBridgePort.clear();
+    m_bridgePortToTarget.clear();
+    m_vpnToVid.clear();
 
     m_tunnelInit.clear();
     m_tunnelTerm.clear();
@@ -2988,6 +3130,7 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     m_mapEntryVidVni.clear();
     m_vniRefs.clear();
     m_vidToVni.clear();
+    m_vpnToVid.clear();
     m_vpnAccessVps.clear();
 
     m_aclTables.clear();

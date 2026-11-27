@@ -45,6 +45,7 @@
 #include <cstring>
 #include <set>
 #include <stdexcept>
+#include <arpa/inet.h>
 
 using namespace saivs;
 
@@ -148,87 +149,61 @@ int SwitchBCM56860HW::vxlanResolveUnderlayEgress(
 
     memcpy(&ip, ip4, 4); // network byte order, same as sai_ip4_t
 
-    // 1. directly connected neighbor (exact match)
-    for (const auto &kv: m_neighborEgr)
+    // Collect active VRFs (always include default VRF 0; small set).
+    std::vector<int> vrfs;
+    vrfs.push_back(0);
+    for (const auto &kv: m_vrToVrf)
     {
-        sai_neighbor_entry_t ne;
-
-        memset(&ne, 0, sizeof(ne));
-
-        try
+        if (kv.second != 0)
         {
-            sai_deserialize_neighbor_entry(kv.first, ne);
+            vrfs.push_back(kv.second);
         }
-        catch (const std::exception &e)
-        {
-            SWSS_LOG_WARN("cannot deserialize neighbor %s: %s", kv.first.c_str(), e.what());
+    }
 
-            continue;
-        }
-
-        if (ne.ip_address.addr_family == SAI_IP_ADDR_FAMILY_IPV4 && ne.ip_address.addr.ip4 == ip)
+    // 1. directly connected neighbor (O(1) exact match via m_v4NeighborsByVrfIp)
+    for (int vrf: vrfs)
+    {
+        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(ip);
+        auto it = m_v4NeighborsByVrfIp.find(key);
+        if (it != m_v4NeighborsByVrfIp.end() && !it->second.empty())
         {
+            int egr = it->second.front().second;
             SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u is a direct neighbor, egress %d",
-                    ip4[0], ip4[1], ip4[2], ip4[3], kv.second);
-
-            return kv.second;
+                    ip4[0], ip4[1], ip4[2], ip4[3], egr);
+            return egr;
         }
     }
 
-    // 2. longest prefix match in the routes A3 programmed
-    int best = -1;
-    int bestLen = -1;
-
-    for (const auto &kv: m_routeEgr)
+    // 2. longest prefix match via m_v4RoutesByVrfLen (O(1): at most 33 lookups,
+    //    skipping empty prefix lengths using m_v4RouteLenMask)
+    for (int len = 32; len >= 0; len--)
     {
-        sai_route_entry_t re;
-
-        memset(&re, 0, sizeof(re));
-
-        try
-        {
-            sai_deserialize_route_entry(kv.first, re);
-        }
-        catch (const std::exception &e)
-        {
-            SWSS_LOG_WARN("cannot deserialize route %s: %s", kv.first.c_str(), e.what());
-
-            continue;
-        }
-
-        if (re.destination.addr_family != SAI_IP_ADDR_FAMILY_IPV4)
+        if (!(m_v4RouteLenMask & (1ULL << len)))
         {
             continue;
         }
 
-        uint32_t mask = re.destination.mask.ip4;
+        uint32_t mask = (len == 0) ? 0u : ((len == 32) ? 0xFFFFFFFFu : htonl(0xFFFFFFFFu << (32 - len)));
+        uint32_t masked = ip & mask;
+        const auto &tbl = m_v4RoutesByVrfLen[len];
 
-        if ((ip & mask) != (re.destination.addr.ip4 & mask))
+        for (int vrf: vrfs)
         {
-            continue;
+            uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(masked);
+            auto it = tbl.find(key);
+            if (it != tbl.end())
+            {
+                SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u reached via route (/%d), egress/ecmp %d",
+                        ip4[0], ip4[1], ip4[2], ip4[3], len, it->second);
+                return it->second;
+            }
         }
-
-        int len = __builtin_popcount(mask);
-
-        if (len > bestLen)
-        {
-            bestLen = len;
-            best = kv.second;
-        }
     }
 
-    if (best >= 0)
-    {
-        SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u reached via route (/%d), egress/ecmp %d",
-                ip4[0], ip4[1], ip4[2], ip4[3], bestLen, best);
-    }
-    else
-    {
-        SWSS_LOG_NOTICE("no neighbor or route toward remote VTEP %u.%u.%u.%u yet",
-                ip4[0], ip4[1], ip4[2], ip4[3]);
-    }
+    SWSS_LOG_NOTICE("no neighbor or route toward remote VTEP %u.%u.%u.%u yet",
+            ip4[0], ip4[1], ip4[2], ip4[3]);
 
-    return best;
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -604,11 +579,180 @@ void SwitchBCM56860HW::vxlanTearDownVtepVp(
     }
 }
 
+bool SwitchBCM56860HW::vxlanEcmpContainsEgress(
+        _In_ int ecmpId,
+        _In_ int egr) const
+{
+    auto ecIt = m_ecmpToNhg.find(ecmpId);
+    if (ecIt == m_ecmpToNhg.end())
+    {
+        return false;
+    }
+    auto gIt = m_nhgToMembers.find(ecIt->second);
+    if (gIt == m_nhgToMembers.end())
+    {
+        return false;
+    }
+    for (auto memberOid: gIt->second)
+    {
+        auto nhIt = m_nhgMemberToNh.find(memberOid);
+        if (nhIt == m_nhgMemberToNh.end())
+        {
+            continue;
+        }
+        auto eIt = m_nhToEgr.find(nhIt->second);
+        if (eIt != m_nhToEgr.end() && eIt->second == egr)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SwitchBCM56860HW::vxlanCheckVtepUnderlay(
+        _Inout_ VxlanRemoteVtep &vtep)
+{
+    if (vtep.bridgePorts.empty())
+    {
+        return;
+    }
+
+    if (!vtep.vpReady)
+    {
+        vxlanTryBringUpVtep(vtep);
+        return;
+    }
+
+    // Already up: the underlay may have changed (A3 rewrites a shared
+    // egress in place when a neighbor disappears/returns, or a better
+    // route appeared). Rebuild the network VP when the clone is stale.
+    int l3 = vxlanResolveUnderlayEgress(vtep.ip4);
+    int stale = 0;
+
+    if (l3 < 0)
+    {
+        return; // nothing better known; keep what we have
+    }
+
+    // Compare contents, not ids: A3 may hand out a different egress/ecmp id
+    // for the same next hop (route flap), which must not churn the VP.
+    if (hwbcm_vxlan_egress_is_stale(l3, vtep.egr, &stale) < 0)
+    {
+        return;
+    }
+
+    if (!stale)
+    {
+        vtep.srcEgr = l3;
+        return;
+    }
+
+    SWSS_LOG_NOTICE("remote VTEP %s: underlay egress %d is stale (resolved %d), rebuilding network VP",
+            vtep.ip.c_str(), vtep.srcEgr, l3);
+
+    vxlanTearDownVtepVp(vtep);
+    vxlanTryBringUpVtep(vtep);
+}
+
 sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
 {
     SWSS_LOG_ENTER();
 
-    if (!m_hwReady)
+    if (!m_hwReady || m_vtepByIp.empty())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    for (auto &kv: m_vtepByIp)
+    {
+        vxlanCheckVtepUnderlay(kv.second);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwVxlanRetryPendingForNeighbor(
+        _In_ const sai_ip_address_t &ip,
+        _In_ int egr)
+{
+    if (!m_hwReady || m_vtepByIp.empty())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    bool isV4 = (ip.addr_family == SAI_IP_ADDR_FAMILY_IPV4);
+
+    for (auto &kv: m_vtepByIp)
+    {
+        VxlanRemoteVtep &vtep = kv.second;
+
+        if (vtep.bridgePorts.empty())
+        {
+            continue;
+        }
+
+        bool affected = !vtep.vpReady || (vtep.srcEgr == egr);
+
+        if (!affected && isV4)
+        {
+            uint32_t vtepIp = 0;
+            memcpy(&vtepIp, vtep.ip4, 4);
+            if (vtepIp == ip.addr.ip4)
+            {
+                affected = true;
+            }
+        }
+
+        if (!affected && vtep.srcEgr >= 0 && vxlanEcmpContainsEgress(vtep.srcEgr, egr))
+        {
+            affected = true;
+        }
+
+        if (affected)
+        {
+            vxlanCheckVtepUnderlay(vtep);
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwVxlanRetryPendingForRoute(
+        _In_ const sai_ip_prefix_t &pfx)
+{
+    if (!m_hwReady || m_vtepByIp.empty() || pfx.addr_family != SAI_IP_ADDR_FAMILY_IPV4)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    uint32_t mask = pfx.mask.ip4;
+    uint32_t net = pfx.addr.ip4 & mask;
+
+    for (auto &kv: m_vtepByIp)
+    {
+        VxlanRemoteVtep &vtep = kv.second;
+
+        if (vtep.bridgePorts.empty())
+        {
+            continue;
+        }
+
+        uint32_t vtepIp = 0;
+        memcpy(&vtepIp, vtep.ip4, 4);
+
+        if ((vtepIp & mask) == net)
+        {
+            vxlanCheckVtepUnderlay(vtep);
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwVxlanRetryPendingForNextHop(
+        _In_ int egr)
+{
+    if (!m_hwReady || m_vtepByIp.empty())
     {
         return SAI_STATUS_SUCCESS;
     }
@@ -622,43 +766,11 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPending()
             continue;
         }
 
-        if (!vtep.vpReady)
+        if (!vtep.vpReady || vtep.srcEgr == egr ||
+            (vtep.srcEgr >= 0 && vxlanEcmpContainsEgress(vtep.srcEgr, egr)))
         {
-            vxlanTryBringUpVtep(vtep);
-
-            continue;
+            vxlanCheckVtepUnderlay(vtep);
         }
-
-        // Already up: the underlay may have changed (A3 rewrites a shared
-        // egress in place when a neighbor disappears/returns, or a better
-        // route appeared). Rebuild the network VP when the clone is stale.
-        int l3 = vxlanResolveUnderlayEgress(vtep.ip4);
-        int stale = 0;
-
-        if (l3 < 0)
-        {
-            continue; // nothing better known; keep what we have
-        }
-
-        // Compare contents, not ids: A3 may hand out a different egress/ecmp id
-        // for the same next hop (route flap), which must not churn the VP.
-        if (hwbcm_vxlan_egress_is_stale(l3, vtep.egr, &stale) < 0)
-        {
-            continue;
-        }
-
-        if (!stale)
-        {
-            vtep.srcEgr = l3;
-
-            continue;
-        }
-
-        SWSS_LOG_NOTICE("remote VTEP %s: underlay egress %d is stale (resolved %d), rebuilding network VP",
-                vtep.ip.c_str(), vtep.srcEgr, l3);
-
-        vxlanTearDownVtepVp(vtep);
-        vxlanTryBringUpVtep(vtep);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -692,24 +804,13 @@ bool SwitchBCM56860HW::hwVxlanTranslateL2Event(
     // VPN id -> VLAN. The event's vid is the VPN; trust the VP's VPN if they differ.
     int lookup = (vid > 4095) ? vid : vpn;
 
-    for (const auto &kv: m_vniToVpn)
+    auto vit = m_vpnToVid.find(lookup);
+    if (vit != m_vpnToVid.end())
     {
-        if (kv.second != lookup)
-        {
-            continue;
-        }
-
-        for (const auto &vv: m_vidToVni)
-        {
-            if (vv.second == kv.first)
-            {
-                vid = vv.first;
-                port = phys;
-                trunk = tid;
-
-                return true;
-            }
-        }
+        vid = vit->second;
+        port = phys;
+        trunk = tid;
+        return true;
     }
 
     SWSS_LOG_WARN("l2 event on access vp 0x%x: vpn 0x%x has no VLAN mapping, dropped", port, lookup);
@@ -1338,6 +1439,7 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnelMapEntry(
 
     m_vniToVpn[vni] = vpn;
     m_vidToVni[vid] = vni;
+    m_vpnToVid[vpn] = vid;
     m_vniRefs[vni] = 1;
     m_mapEntryVidVni[entry_id] = std::make_pair(vid, vni);
 
@@ -1475,6 +1577,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
 
     m_vniToVpn.erase(vp);
     m_vidToVni.erase(vid);
+    m_vpnToVid.erase(vpn);
 
     SWSS_LOG_NOTICE("vni %u <-> vlan %d: vpn 0x%x destroyed", vni, vid, vpn);
 
@@ -1615,6 +1718,15 @@ sai_status_t SwitchBCM56860HW::hwCreateBridgePort(
 
     if (type == nullptr || type->value.s32 != SAI_BRIDGE_PORT_TYPE_TUNNEL)
     {
+        if (type != nullptr && type->value.s32 == SAI_BRIDGE_PORT_TYPE_PORT)
+        {
+            auto *portAttr = findAttr(attr_count, attr_list, SAI_BRIDGE_PORT_ATTR_PORT_ID);
+            if (portAttr != nullptr)
+            {
+                m_targetToBridgePort[portAttr->value.oid] = bp_id;
+                m_bridgePortToTarget[bp_id] = portAttr->value.oid;
+            }
+        }
         // PORT / SUB_PORT / 1Q_ROUTER ... are handled by the core (A2).
         return SAI_STATUS_SUCCESS;
     }
@@ -1670,6 +1782,17 @@ sai_status_t SwitchBCM56860HW::hwRemoveBridgePort(
         _In_ sai_object_id_t bp_id)
 {
     SWSS_LOG_ENTER();
+
+    auto bpt = m_bridgePortToTarget.find(bp_id);
+    if (bpt != m_bridgePortToTarget.end())
+    {
+        auto tbp = m_targetToBridgePort.find(bpt->second);
+        if (tbp != m_targetToBridgePort.end() && tbp->second == bp_id)
+        {
+            m_targetToBridgePort.erase(tbp);
+        }
+        m_bridgePortToTarget.erase(bpt);
+    }
 
     auto it = m_bridgePortRemoteIp.find(bp_id);
 
