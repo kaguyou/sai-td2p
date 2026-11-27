@@ -246,15 +246,7 @@ namespace
     {
         SWSS_LOG_ENTER();
 
-        switch (rv)
-        {
-            case 0:     return SAI_STATUS_SUCCESS;
-            case -7:    return SAI_STATUS_ITEM_NOT_FOUND;              /* BCM_E_NOT_FOUND */
-            case -6:                                                    /* BCM_E_FULL */
-            case -14:   return SAI_STATUS_INSUFFICIENT_RESOURCES;      /* BCM_E_RESOURCE */
-            case -16:   return SAI_STATUS_NOT_SUPPORTED;               /* BCM_E_UNAVAIL */
-            default:    return SAI_STATUS_FAILURE;
-        }
+        return SwitchBCM56860HW::bcmRvToSai(rv);
     }
 }
 
@@ -1518,7 +1510,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveAclTable(
     {
         SWSS_LOG_ERROR("ACL table %s: hwbcm_acl_group_destroy(%d) failed: %d",
                 sai_serialize_object_id(table_id).c_str(), tit->second.gid, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_aclPrioUsed[tit->second.hwStage].erase(tit->second.prio);
@@ -1798,7 +1790,7 @@ sai_status_t SwitchBCM56860HW::hwAclCounterGet(
             if (rv != 0)
             {
                 SWSS_LOG_ERROR("hwbcm_acl_stat_get(%d) failed: %d", h.stat, rv);
-                return SAI_STATUS_FAILURE;
+                return bcmRvToSai(rv);
             }
 
             pkts += p;
@@ -1888,7 +1880,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveAclRange(
     if (rv != 0)
     {
         SWSS_LOG_ERROR("hwbcm_acl_range_destroy(%d) failed: %d", it->second, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_aclRanges.erase(it);

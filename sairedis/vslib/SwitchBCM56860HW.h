@@ -292,6 +292,13 @@ namespace saivs
 
             static const sai_attribute_t *findAttr(_In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list, _In_ sai_attr_id_t id);
 
+        public:
+
+            /* Map negative OpenBCM BCM_E_* return codes to SAI status. */
+            static sai_status_t bcmRvToSai(_In_ int rv);
+
+        protected:
+
         protected:
 
             // --- shared state ---------------------------------------------

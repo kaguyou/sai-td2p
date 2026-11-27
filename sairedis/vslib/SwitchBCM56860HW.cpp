@@ -39,10 +39,27 @@
 
 using namespace saivs;
 
-/* BCM_E_* values we need to recognise (sdk include/shared/error.h). We don't
- * include SDK headers from C++, so the two we care about are repeated here. */
-#define HWBCM_E_NOT_FOUND (-7)
-#define HWBCM_E_EXISTS    (-8)
+sai_status_t SwitchBCM56860HW::bcmRvToSai(_In_ int rv)
+{
+    if (rv >= 0)
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    switch (rv)
+    {
+        case HWBCM_E_FULL:      return SAI_STATUS_TABLE_FULL;
+        case HWBCM_E_RESOURCE:
+        case HWBCM_E_MEMORY:    return SAI_STATUS_INSUFFICIENT_RESOURCES;
+        case HWBCM_E_EXISTS:    return SAI_STATUS_ITEM_ALREADY_EXISTS;
+        case HWBCM_E_NOT_FOUND: return SAI_STATUS_ITEM_NOT_FOUND;
+        case HWBCM_E_PARAM:
+        case HWBCM_E_PORT:      return SAI_STATUS_INVALID_PARAMETER;
+        case HWBCM_E_BUSY:      return SAI_STATUS_OBJECT_IN_USE;
+        case HWBCM_E_UNAVAIL:   return SAI_STATUS_NOT_SUPPORTED;
+        default:                return SAI_STATUS_FAILURE;
+    }
+}
 
 #define SAI_VS_BCM_FALLBACK_PROFILE "/usr/share/sonic/hwsku/sai.profile"
 
@@ -1020,7 +1037,7 @@ sai_status_t SwitchBCM56860HW::hwSetPort(
     {
         SWSS_LOG_ERROR("hardware set of port attribute %d on bcm port %d failed: %d", attr->id, bcm, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1389,7 +1406,7 @@ sai_status_t SwitchBCM56860HW::hwSetSwitch(
     {
         SWSS_LOG_ERROR("hardware set of switch attribute %d failed: %d", attr->id, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2018,7 +2035,7 @@ sai_status_t SwitchBCM56860HW::hwCreateHostif(
     {
         SWSS_LOG_ERROR("hwbcm_knet_netif_create(%d, %s) failed: %d", bcm, ifname, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_hostifToNetif[hostif_id] = netif;
@@ -2047,7 +2064,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveHostif(
     {
         SWSS_LOG_ERROR("hwbcm_knet_netif_destroy(%d) failed: %d", it->second, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_hostifToNetif.erase(it);
@@ -2222,7 +2239,7 @@ sai_status_t SwitchBCM56860HW::hwCreateVlan(
     {
         SWSS_LOG_ERROR("hwbcm_vlan_create(%u) failed: %d", vid->value.u16, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     SWSS_LOG_NOTICE("vlan %u created on hardware (%s)", vid->value.u16, sai_serialize_object_id(vlan_id).c_str());
@@ -2257,7 +2274,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveVlan(
     {
         SWSS_LOG_ERROR("hwbcm_vlan_destroy(%d) failed: %d", vid, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2351,7 +2368,7 @@ sai_status_t SwitchBCM56860HW::hwCreateVlanMember(
         {
             SWSS_LOG_ERROR("hwbcm_vlan_port_add(%d, %d, %d) failed: %d", vid, bcm, tagged, rv);
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         SWSS_LOG_NOTICE("vlan %d: bcm port %d added %s", vid, bcm, tagged ? "tagged" : "untagged");
@@ -2430,7 +2447,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveVlanMember(
         {
             SWSS_LOG_ERROR("hwbcm_vlan_port_remove(%d, %d) failed: %d", vid, bcm, rv);
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         SWSS_LOG_NOTICE("vlan %d: bcm port %d removed", vid, bcm);
@@ -2537,7 +2554,7 @@ sai_status_t SwitchBCM56860HW::hwCreateFdbEntry(
             SWSS_LOG_ERROR("hwbcm_l2_addr_add_trunk(%s vid %d trunk %d) failed: %d",
                     sai_serialize_mac(fdb.mac_address).c_str(), vid, trunk, rv);
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         return SAI_STATUS_SUCCESS;
@@ -2570,7 +2587,7 @@ sai_status_t SwitchBCM56860HW::hwCreateFdbEntry(
         SWSS_LOG_ERROR("hwbcm_l2_addr_add(%s vid %d port %d) failed: %d",
                 sai_serialize_mac(fdb.mac_address).c_str(), vid, bcm, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2615,7 +2632,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveFdbEntry(
     {
         SWSS_LOG_ERROR("l2 addr delete for %s failed: %d", serialized.c_str(), rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2638,7 +2655,7 @@ sai_status_t SwitchBCM56860HW::hwCreateLag(
     {
         SWSS_LOG_ERROR("hwbcm_trunk_create failed: %d", rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_lagToTrunk[lag_id] = trunk;
@@ -2667,7 +2684,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveLag(
     {
         SWSS_LOG_ERROR("hwbcm_trunk_destroy(%d) failed: %d", it->second, rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_lagToTrunk.erase(it);
@@ -2711,7 +2728,7 @@ sai_status_t SwitchBCM56860HW::applyTrunkMembers(
     {
         SWSS_LOG_ERROR("hwbcm_trunk_member_set(%d, %zu ports) failed: %d", trunk, ports.size(), rv);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;

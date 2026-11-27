@@ -28,6 +28,24 @@ extern "C" {
 #define HWBCM_UNIT 0
 #define HWBCM_MAX_PORTS 128
 
+/* OpenBCM _shr_error_t (include/shared/error.h) codes exposed to C++ without
+ * including SDK headers. */
+#define HWBCM_E_NONE       0
+#define HWBCM_E_INTERNAL  (-1)
+#define HWBCM_E_MEMORY    (-2)
+#define HWBCM_E_UNIT      (-3)
+#define HWBCM_E_PARAM     (-4)
+#define HWBCM_E_EMPTY     (-5)
+#define HWBCM_E_FULL      (-6)
+#define HWBCM_E_NOT_FOUND (-7)
+#define HWBCM_E_EXISTS    (-8)
+#define HWBCM_E_TIMEOUT   (-9)
+#define HWBCM_E_BUSY      (-10)
+#define HWBCM_E_FAIL      (-11)
+#define HWBCM_E_RESOURCE  (-14)
+#define HWBCM_E_UNAVAIL   (-16)
+#define HWBCM_E_PORT      (-18)
+
 typedef enum {
     HWBCM_LOG_ERR = 0,
     HWBCM_LOG_WARN = 1,

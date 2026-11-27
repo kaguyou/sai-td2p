@@ -104,7 +104,7 @@ sai_status_t SwitchBCM56860HW::vxlanEnsureInit()
     {
         SWSS_LOG_ERROR("hwbcm_vxlan_init failed: %d", rc);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rc);
     }
 
     // The router MAC must hit MY_STATION on any underlay VLAN so the outer
@@ -754,7 +754,7 @@ sai_status_t SwitchBCM56860HW::vxlanAddAccessPort(
     {
         SWSS_LOG_ERROR("access VP for vlan %d port %d trunk %d in vpn 0x%x failed: %d", vid, port, trunk, vpn, rc);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rc);
     }
 
     VxlanAccessVp a;
@@ -1049,7 +1049,7 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnel(
                 m_vtepByIp.erase(key);
             }
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rc);
         }
 
         vtep.tunnelInit = init;
@@ -1308,7 +1308,7 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnelMapEntry(
     {
         SWSS_LOG_ERROR("VPN for vni %u (vlan %d) failed: %d", vni, vid, rc);
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rc);
     }
 
     m_vniToVpn[vni] = vpn;
@@ -1453,7 +1453,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveTunnelMapEntry(
         }
     }
 
-    return rc < 0 ? SAI_STATUS_FAILURE : SAI_STATUS_SUCCESS;
+    return rc < 0 ? bcmRvToSai(rc) : SAI_STATUS_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,7 +1740,7 @@ sai_status_t SwitchBCM56860HW::hwFdbOnTunnel(
         {
             SWSS_LOG_ERROR("fdb %s on %s: l2 add failed: %d", key.c_str(), vtep.ip.c_str(), rc);
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rc);
         }
 
         SWSS_LOG_INFO("fdb %s -> remote VTEP %s (vpn 0x%x, vp 0x%x)", key.c_str(), vtep.ip.c_str(), vpn, vtep.vp);

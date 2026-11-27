@@ -320,7 +320,7 @@ sai_status_t SwitchBCM56860HW::hwCreateVirtualRouter(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("hwbcm_l3_vrf_create failed: %d", rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
     }
 
@@ -351,7 +351,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveVirtualRouter(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("hwbcm_l3_vrf_destroy(%d) failed: %d", it->second, rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
     }
 
@@ -567,7 +567,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
         if (vid < 0)
         {
             SWSS_LOG_ERROR("rif %s: no free vlan in pool %d-%d", srif.c_str(), RIF_VID_MIN, RIF_VID_MAX);
-            return SAI_STATUS_FAILURE;
+            return SAI_STATUS_TABLE_FULL;
         }
 
         int rv = hwbcm_vlan_create(vid);
@@ -575,7 +575,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("rif %s: hwbcm_vlan_create(%d) failed: %d", srif.c_str(), vid, rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         dedicatedVlan = true;
@@ -588,7 +588,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             {
                 SWSS_LOG_ERROR("rif %s: hwbcm_vlan_port_add(%d, %d) failed: %d", srif.c_str(), vid, p, rv);
                 hwbcm_vlan_destroy(vid);
-                return SAI_STATUS_FAILURE;
+                return bcmRvToSai(rv);
             }
 
             rv = hwbcm_port_pvid_set(p, vid);
@@ -597,7 +597,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             {
                 SWSS_LOG_ERROR("rif %s: hwbcm_port_pvid_set(%d, %d) failed: %d", srif.c_str(), p, vid, rv);
                 hwbcm_vlan_destroy(vid);
-                return SAI_STATUS_FAILURE;
+                return bcmRvToSai(rv);
             }
         }
     }
@@ -615,7 +615,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRouterInterface(
             hwbcm_vlan_destroy(vid);
         }
 
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_rifToIntf[rif_id] = intf;
@@ -656,7 +656,7 @@ sai_status_t SwitchBCM56860HW::hwSetRouterInterface(
                 {
                     SWSS_LOG_ERROR("rif %s: hwbcm_l3_intf_mtu_set(%d, %u) failed: %d",
                             sai_serialize_object_id(rif_id).c_str(), it->second, attr->value.u32, rv);
-                    return SAI_STATUS_FAILURE;
+                    return bcmRvToSai(rv);
                 }
 
                 return SAI_STATUS_SUCCESS;
@@ -712,7 +712,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveRouterInterface(
     if (rv < 0)
     {
         SWSS_LOG_ERROR("rif %s: hwbcm_l3_intf_destroy(%d) failed: %d", srif.c_str(), it->second, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_rifToIntf.erase(it);
@@ -913,7 +913,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_drop_create failed: %d", serialized.c_str(), rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
     }
     else if (!matchingNh.empty())
@@ -939,7 +939,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
             if (rv < 0)
             {
                 SWSS_LOG_ERROR("neighbor %s: egress %d replace failed: %d", serialized.c_str(), e, rv);
-                return SAI_STATUS_FAILURE;
+                return bcmRvToSai(rv);
             }
 
             SWSS_LOG_NOTICE("neighbor %s: next hop %s egress %d resolved (port %d trunk %d cpu %d)",
@@ -971,7 +971,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("neighbor %s: egress create failed: %d", serialized.c_str(), rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
     }
 
@@ -993,7 +993,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
                 hwbcm_l3_egress_destroy(egr);
             }
 
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
     }
 
@@ -1090,7 +1090,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("neighbor %s: egress %d cpu replace failed: %d", serialized.c_str(), egr, rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         SWSS_LOG_NOTICE("neighbor %s removed, egress %d now punts to cpu", serialized.c_str(), egr);
@@ -1102,7 +1102,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         if (rv < 0)
         {
             SWSS_LOG_ERROR("neighbor %s: hwbcm_l3_egress_destroy(%d) failed: %d", serialized.c_str(), egr, rv);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         SWSS_LOG_NOTICE("neighbor %s removed, egress %d destroyed", serialized.c_str(), egr);
@@ -1202,7 +1202,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     if (rv < 0)
     {
         SWSS_LOG_ERROR("next hop %s: hwbcm_l3_egress_cpu_create failed: %d", snh.c_str(), rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_nhToEgr[nh_id] = egr;
@@ -1244,7 +1244,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
     if (rv < 0)
     {
         SWSS_LOG_ERROR("next hop %s: hwbcm_l3_egress_destroy(%d) failed: %d", sai_serialize_object_id(nh_id).c_str(), egr, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
@@ -1316,7 +1316,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroup(
     {
         SWSS_LOG_ERROR("next hop group %s: hwbcm_l3_ecmp_destroy(%d) failed: %d",
                 sai_serialize_object_id(nhg_id).c_str(), it->second, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_nhgToEcmp.erase(it);
@@ -1371,7 +1371,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
             SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_create failed: %d", sm.c_str(), rv);
             m_nhgMemberToNh.erase(member_id);
             m_nhgMemberToNhg.erase(member_id);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         m_nhgToEcmp[nhg] = ecmp;
@@ -1387,7 +1387,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
             SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_set(%d) failed: %d", sm.c_str(), eit->second, rv);
             m_nhgMemberToNh.erase(member_id);
             m_nhgMemberToNhg.erase(member_id);
-            return SAI_STATUS_FAILURE;
+            return bcmRvToSai(rv);
         }
 
         SWSS_LOG_NOTICE("next hop group %s ecmp %d now %zu members", sai_serialize_object_id(nhg).c_str(), eit->second, egrs.size());
@@ -1436,7 +1436,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
 
         SWSS_LOG_ERROR("nhg member %s: hwbcm_l3_ecmp_set(%d) failed: %d",
                 sai_serialize_object_id(member_id).c_str(), eit->second, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     SWSS_LOG_NOTICE("next hop group %s ecmp %d now %zu members", sai_serialize_object_id(nhg).c_str(), eit->second, egrs.size());
@@ -1555,7 +1555,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
                             {
                                 SWSS_LOG_ERROR("route %s: next hop group %s has no ecmp and create failed: %d",
                                         serialized.c_str(), sai_serialize_object_id(nhOid).c_str(), rv);
-                                return SAI_STATUS_FAILURE;
+                                return bcmRvToSai(rv);
                             }
 
                             m_nhgToEcmp[nhOid] = ecmp;
@@ -1602,7 +1602,7 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
     if (rv < 0)
     {
         SWSS_LOG_ERROR("route %s: hwbcm_l3_route_add(vrf=%d) failed: %d", serialized.c_str(), vrf, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     m_routeEgr[serialized] = egr;
@@ -1689,7 +1689,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
     if (rv < 0)
     {
         SWSS_LOG_ERROR("route %s: hwbcm_l3_route_delete(vrf=%d) failed: %d", serialized.c_str(), vrf, rv);
-        return SAI_STATUS_FAILURE;
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
