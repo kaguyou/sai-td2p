@@ -73,7 +73,7 @@
 
             /* bcm policer of a SAI policer, created on first use by a trap
              * group. -1 on failure (with optional hwbcm rv in *rvOut). */
-            int coppBcmPolicer(_In_ sai_object_id_t policer_id, _Out_opt_ int *rvOut = nullptr);
+            int coppBcmPolicer(_In_ sai_object_id_t policer_id, _Out_ int *rvOut = nullptr);
 
             /* Trap group of a trap (SAI default trap group when unset). */
             sai_object_id_t coppTrapGroupOf(_In_ sai_object_id_t trap_id);

@@ -228,7 +228,7 @@ static void coppToC(
 
 int SwitchBCM56860HW::coppBcmPolicer(
         _In_ sai_object_id_t policer_id,
-        _Out_opt_ int *rvOut)
+        _Out_ int *rvOut)
 {
     SWSS_LOG_ENTER();
 
