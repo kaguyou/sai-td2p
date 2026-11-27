@@ -27,6 +27,8 @@
 
 #include "hwbcm_qos.h"
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -85,9 +87,15 @@ static int qos_port_ok(int port)
     return 1;
 }
 
+/* Saturate to INT_MAX / HWBCM_QOS_CELL_BYTES so neither the 32-bit addition
+ * nor (int)(cells * HWBCM_QOS_CELL_BYTES) passed to bcm_cosq_control_set()
+ * can wrap or overflow signed int. */
 static uint32 qos_cells(uint32 bytes)
 {
-    return (bytes + HWBCM_QOS_CELL_BYTES - 1) / HWBCM_QOS_CELL_BYTES;
+    uint64_t max_cells = (uint64_t)INT_MAX / (uint64_t)HWBCM_QOS_CELL_BYTES;
+    uint64_t c = ((uint64_t)bytes + (uint64_t)HWBCM_QOS_CELL_BYTES - 1ull) /
+                 (uint64_t)HWBCM_QOS_CELL_BYTES;
+    return (c > max_cells) ? (uint32)max_cells : (uint32)c;
 }
 
 static bcm_color_t qos_color(uint8_t c)
@@ -1014,7 +1022,10 @@ static uint32 qos_kbits(uint64_t bytes_or_pkts, int pps)
     if (pps) {
         v = bytes_or_pkts;
     } else {
-        v = (bytes_or_pkts * 8 + 999) / 1000;
+        if (bytes_or_pkts > (UINT64_MAX - 999ull) / 8ull) {
+            return 0xffffffffu;
+        }
+        v = (bytes_or_pkts * 8ull + 999ull) / 1000ull;
     }
     return v > 0xffffffffull ? 0xffffffffu : (uint32)v;
 }

@@ -1525,7 +1525,12 @@ int hwbcm_vxlan_station_delete(int station_id)
 
 static int hwbcm_vxlan_vfi_of(int vpn_id)
 {
-    int vfi = vpn_id & 0xfff;
+    int vfi;
+
+    if (vpn_id < 0) {
+        return -1;
+    }
+    vfi = vpn_id & 0xfff;
 
     return (vfi >= 0 && vfi < HWBCM_VXLAN_MAX_VFI) ? vfi : -1;
 }
