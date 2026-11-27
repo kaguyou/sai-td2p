@@ -3307,6 +3307,7 @@ sai_status_t SwitchBCM56860HW::set(
         case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwSetHostifTrapGroup(oid, attr); break;
         case SAI_OBJECT_TYPE_POLICER:          hw = hwSetPolicer(oid, attr); break;
         case SAI_OBJECT_TYPE_ROUTER_INTERFACE: hw = hwSetRouterInterface(oid, attr); break;
+        case SAI_OBJECT_TYPE_NEIGHBOR_ENTRY:   hw = hwSetNeighbor(serializedObjectId, attr); break;
         case SAI_OBJECT_TYPE_ROUTE_ENTRY:
             hw = hwSetRoute(serializedObjectId, attr);
             if (hw == SAI_STATUS_SUCCESS) hwCoppOnRoute(serializedObjectId);

@@ -1052,6 +1052,177 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
     return SAI_STATUS_SUCCESS;
 }
 
+sai_status_t SwitchBCM56860HW::hwSetNeighbor(
+        _In_ const std::string &serialized,
+        _In_ const sai_attribute_t *attr)
+{
+    SWSS_LOG_ENTER();
+
+    if (attr == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    auto it = m_neighborEgr.find(serialized);
+
+    if (it == m_neighborEgr.end())
+    {
+        // loopback / unsupported RIF: nothing in hw
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (attr->id != SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS &&
+        attr->id != SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION &&
+        attr->id != SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE)
+    {
+        SWSS_LOG_INFO("neighbor %s: attr %d ignored by hw", serialized.c_str(), attr->id);
+        return SAI_STATUS_SUCCESS;
+    }
+
+    sai_neighbor_entry_t ne;
+    sai_deserialize_neighbor_entry(serialized, ne);
+
+    auto rit = m_rifToIntf.find(ne.rif_id);
+
+    if (rit == m_rifToIntf.end())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    int intf = rit->second;
+
+    if (attr->id == SAI_NEIGHBOR_ENTRY_ATTR_NO_HOST_ROUTE)
+    {
+        int vrf = 0;
+        sai_attribute_t vrAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
+        {
+            sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
+            sai_attribute_t sw;
+            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+            {
+                defaultVr = sw.value.oid;
+            }
+            vrf = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, false, serialized.c_str());
+        }
+
+        uint8_t addr[16];
+        int af = ipBytes(ne.ip_address, addr);
+
+        int rv = attr->value.booldata
+            ? hwbcm_l3_host_delete(vrf, af, addr)
+            : hwbcm_l3_host_add(vrf, af, addr, it->second);
+
+        if (rv < 0 && !(attr->value.booldata && rv == HWBCM_E_NOT_FOUND))
+        {
+            SWSS_LOG_ERROR("neighbor %s: host route update (no_host_route=%d) failed: %d",
+                    serialized.c_str(), attr->value.booldata ? 1 : 0, rv);
+            return bcmRvToSai(rv);
+        }
+
+        return SAI_STATUS_SUCCESS;
+    }
+
+    // DST_MAC_ADDRESS or PACKET_ACTION: update neighbor egress and any matching NEXT_HOP egresses.
+    sai_attribute_t macAttr, paAttr;
+    sai_mac_t mac = { 0 };
+    bool haveMac = false;
+
+    if (attr->id == SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS)
+    {
+        memcpy(mac, attr->value.mac, sizeof(mac));
+        haveMac = true;
+    }
+    else if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serialized, SAI_NEIGHBOR_ENTRY_ATTR_DST_MAC_ADDRESS, macAttr))
+    {
+        memcpy(mac, macAttr.value.mac, sizeof(mac));
+        haveMac = true;
+    }
+
+    sai_packet_action_t action = SAI_PACKET_ACTION_FORWARD;
+
+    if (attr->id == SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION)
+    {
+        action = (sai_packet_action_t)attr->value.s32;
+    }
+    else if (getStoredAttr(SAI_OBJECT_TYPE_NEIGHBOR_ENTRY, serialized, SAI_NEIGHBOR_ENTRY_ATTR_PACKET_ACTION, paAttr))
+    {
+        action = (sai_packet_action_t)paAttr.value.s32;
+    }
+
+    std::set<int> egrs;
+    egrs.insert(it->second);
+    std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
+
+    for (auto &kv: m_nhToEgr)
+    {
+        sai_attribute_t nhRif, nhIp;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
+            getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
+            nhRif.value.oid == ne.rif_id &&
+            sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+        {
+            egrs.insert(kv.second);
+        }
+    }
+
+    int port = -1, trunk = -1, vpGport = -1, ovlIntf = -1;
+    bool toCpu = false;
+
+    if (action == SAI_PACKET_ACTION_TRAP)
+    {
+        toCpu = true;
+    }
+    else if (action != SAI_PACKET_ACTION_DROP && action != SAI_PACKET_ACTION_DENY)
+    {
+        if (!haveMac || !neighborTarget(ne.rif_id, mac, port, trunk, vpGport, ovlIntf))
+        {
+            toCpu = true;
+        }
+    }
+
+    for (int e: egrs)
+    {
+        int rv;
+
+        if (action == SAI_PACKET_ACTION_DROP || action == SAI_PACKET_ACTION_DENY)
+        {
+            rv = hwbcm_l3_egress_drop_replace(e);
+        }
+        else if (toCpu)
+        {
+            rv = hwbcm_l3_egress_cpu_replace(e, intf);
+        }
+        else if (vpGport != -1)
+        {
+            rv = hwbcm_vxlan_overlay_egress_replace(e, ovlIntf, mac, vpGport);
+        }
+        else
+        {
+            rv = hwbcm_l3_egress_replace(e, intf, mac, port, trunk);
+        }
+
+        if (rv < 0)
+        {
+            SWSS_LOG_ERROR("neighbor %s: set attr %d egress %d replace failed: %d",
+                    serialized.c_str(), attr->id, e, rv);
+            return bcmRvToSai(rv);
+        }
+    }
+
+    SWSS_LOG_NOTICE("neighbor %s updated (attr %d, %zu egress(es), action %d port %d trunk %d vp 0x%x cpu %d)",
+            serialized.c_str(), attr->id, egrs.size(), (int)action, port, trunk, vpGport, toCpu ? 1 : 0);
+
+    if (m_hwReady)
+    {
+        hwVxlanRetryPending();
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
 sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         _In_ const std::string &serialized)
 {

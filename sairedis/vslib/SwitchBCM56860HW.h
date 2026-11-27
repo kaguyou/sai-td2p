@@ -233,6 +233,7 @@ namespace saivs
             sai_status_t hwSetRouterInterface(_In_ sai_object_id_t rif_id, _In_ const sai_attribute_t *attr);
             sai_status_t hwRemoveRouterInterface(_In_ sai_object_id_t rif_id);
             sai_status_t hwCreateNeighbor(_In_ const std::string &serialized, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
+            sai_status_t hwSetNeighbor(_In_ const std::string &serialized, _In_ const sai_attribute_t *attr);
             sai_status_t hwRemoveNeighbor(_In_ const std::string &serialized);
             void hwRefreshNeighborsOnLearn(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6], _In_ int port, _In_ int trunk);
             void hwPuntNeighborsOnAge(_In_ sai_object_id_t vlanOid, _In_ const uint8_t mac[6]);
