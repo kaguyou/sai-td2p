@@ -1434,13 +1434,9 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
         case SAI_NEXT_HOP_TYPE_IP:
             break;
 
-        case SAI_NEXT_HOP_TYPE_TUNNEL_ENCAP:
-            SWSS_LOG_NOTICE("next hop %s: tunnel encap, handled by vxlan side", snh.c_str());
-            return SAI_STATUS_SUCCESS;
-
         default:
-            SWSS_LOG_WARN("next hop %s: type %d not supported in hw, ignored", snh.c_str(), (int)type);
-            return SAI_STATUS_SUCCESS;
+            SWSS_LOG_ERROR("next hop %s: type %d not supported in hardware", snh.c_str(), (int)type);
+            return SAI_STATUS_NOT_SUPPORTED;
     }
 
     auto *ipAttr = findAttr(attr_count, attr_list, SAI_NEXT_HOP_ATTR_IP);
