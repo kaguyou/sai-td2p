@@ -31,6 +31,8 @@ enum {
 #undef LOG_INFO
 #undef LOG_DEBUG
 #include <pthread.h>
+#include <poll.h>
+#include <signal.h>
 #include <time.h>
 #include <errno.h>
 #include <unistd.h>
@@ -545,6 +547,119 @@ static pthread_mutex_t g_shell_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define HWBCM_SHELL_CMD_MAX 4096
 
+static int g_shell_client_fd = -1;
+static int g_shell_client_err = 0;
+static pthread_t g_shell_active_tid;
+static int g_shell_active = 0;
+
+static int shell_send_all(int fd, const char *buf, size_t len)
+{
+    size_t off = 0;
+
+    while (off < len) {
+        ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (w == 0) {
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static void shell_fd_printf(int fd, const char *fmt, ...)
+{
+    char sbuf[4096];
+    va_list ap, ap2;
+    int n;
+
+    va_start(ap, fmt);
+    if (fd < 0) {
+        vprintf(fmt, ap);
+        fflush(stdout);
+        va_end(ap);
+        return;
+    }
+    va_copy(ap2, ap);
+    n = vsnprintf(sbuf, sizeof(sbuf), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        va_end(ap2);
+        return;
+    }
+    if ((size_t)n < sizeof(sbuf)) {
+        va_end(ap2);
+        (void)shell_send_all(fd, sbuf, (size_t)n);
+        return;
+    }
+    {
+        char *heap = (char *)malloc((size_t)n + 1);
+        if (heap != NULL) {
+            vsnprintf(heap, (size_t)n + 1, fmt, ap2);
+            (void)shell_send_all(fd, heap, (size_t)n);
+            free(heap);
+        } else {
+            (void)shell_send_all(fd, sbuf, sizeof(sbuf) - 1);
+        }
+    }
+    va_end(ap2);
+}
+
+/* Per-thread BSL redirect hook: only captures output produced by the diag
+ * shell socket thread while serving a command; every other thread keeps its
+ * normal console sink untouched, and fd 1/2 are never redirected. */
+static int shell_bsl_redir(bsl_meta_t *meta, const char *format, va_list args)
+{
+    char sbuf[4096];
+    va_list args2;
+    int n;
+
+    if (!__atomic_load_n(&g_shell_active, __ATOMIC_ACQUIRE) ||
+        !pthread_equal(pthread_self(), g_shell_active_tid)) {
+        return -1;
+    }
+    if (meta != NULL && meta->source == bslSourceEcho) {
+        return 0;
+    }
+    if (g_shell_client_fd < 0 || g_shell_client_err) {
+        return 0;
+    }
+    va_copy(args2, args);
+    n = vsnprintf(sbuf, sizeof(sbuf), format, args);
+    if (n <= 0) {
+        va_end(args2);
+        return 0;
+    }
+    if ((size_t)n < sizeof(sbuf)) {
+        va_end(args2);
+        if (shell_send_all(g_shell_client_fd, sbuf, (size_t)n) < 0) {
+            g_shell_client_err = 1;
+        }
+        return 0;
+    }
+    {
+        char *heap = (char *)malloc((size_t)n + 1);
+        if (heap != NULL) {
+            vsnprintf(heap, (size_t)n + 1, format, args2);
+            if (shell_send_all(g_shell_client_fd, heap, (size_t)n) < 0) {
+                g_shell_client_err = 1;
+            }
+            free(heap);
+        } else {
+            if (shell_send_all(g_shell_client_fd, sbuf, sizeof(sbuf) - 1) < 0) {
+                g_shell_client_err = 1;
+            }
+        }
+    }
+    va_end(args2);
+    return 0;
+}
+
 /* Caller holds g_shell_lock. */
 /* "hw ..." lines are hwbcm-level test hooks, not SDK diag commands.
  *   hw vxlan cpuaccess <vpn> <vid>   add the CPU port as an access VP of <vpn> for
@@ -552,30 +667,29 @@ static pthread_mutex_t g_shell_lock = PTHREAD_MUTEX_INITIALIZER;
  *                                    TX_CPU_INGRESS netif for <vid> then lands in
  *                                    the VFI and floods to the network VPs)
  *   hw vxlan vpdel <vpn> <vp>        remove a VP created above
- * Output goes to stdout (the shell socket dups it to the client). */
-static int hwbcm_shell_hw_cmd(const char *s)
+ * Output is written directly to client_fd (or stdout if client_fd < 0). */
+static int hwbcm_shell_hw_cmd(const char *s, int client_fd)
 {
     int vpn = 0, vid = 0, vp = 0, rv;
 
     if (sscanf(s, "vxlan cpuaccess %i %i", &vpn, &vid) == 2) {
         rv = hwbcm_vxlan_access_port_add2(vpn, 0 /* cpu0 */, -1, vid, 1, &vp);
-        printf("hw: vxlan cpuaccess vpn 0x%x vid %d -> vp 0x%x rv %d (%s)\n",
-               vpn, vid, vp, rv, bcm_errmsg(rv));
-        fflush(stdout);
+        shell_fd_printf(client_fd, "hw: vxlan cpuaccess vpn 0x%x vid %d -> vp 0x%x rv %d (%s)\n",
+                        vpn, vid, vp, rv, bcm_errmsg(rv));
         return rv < 0 ? BCM_E_FAIL : 0;
     }
     {
         int vlan = 0, flags = 0;
         if (sscanf(s, "vxlan vlanadd %i %i %i", &vlan, &vp, &flags) == 3) {
             rv = bcm_vlan_gport_add(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp, flags);
-            printf("hw: vxlan vlanadd vlan %d vp 0x%x flags 0x%x rv %d (%s)\n", vlan, vp, flags, rv, bcm_errmsg(rv));
-            fflush(stdout);
+            shell_fd_printf(client_fd, "hw: vxlan vlanadd vlan %d vp 0x%x flags 0x%x rv %d (%s)\n",
+                            vlan, vp, flags, rv, bcm_errmsg(rv));
             return rv < 0 ? BCM_E_FAIL : 0;
         }
         if (sscanf(s, "vxlan vpefilter %i %i", &vp, &flags) == 2) {
             rv = bcm_port_vlan_member_set(HWBCM_UNIT, (bcm_gport_t)vp, (uint32)flags);
-            printf("hw: vxlan vpefilter vp 0x%x flags 0x%x rv %d (%s)\n", vp, flags, rv, bcm_errmsg(rv));
-            fflush(stdout);
+            shell_fd_printf(client_fd, "hw: vxlan vpefilter vp 0x%x flags 0x%x rv %d (%s)\n",
+                            vp, flags, rv, bcm_errmsg(rv));
             return rv < 0 ? BCM_E_FAIL : 0;
         }
         if (sscanf(s, "vxlan egrxlate %i %i %i", &vp, &vlan, &flags) == 3) {
@@ -591,41 +705,40 @@ static int hwbcm_shell_hw_cmd(const char *s)
             } else {
                 rv = bcm_vlan_translate_egress_action_delete(HWBCM_UNIT, vp, (bcm_vlan_t)vlan, BCM_VLAN_NONE);
             }
-            printf("hw: vxlan egrxlate class 0x%x vlan %d %s rv %d (%s)\n", vp, vlan, flags ? "delete-outer-tag" : "removed", rv, bcm_errmsg(rv));
-            fflush(stdout);
+            shell_fd_printf(client_fd, "hw: vxlan egrxlate class 0x%x vlan %d %s rv %d (%s)\n",
+                            vp, vlan, flags ? "delete-outer-tag" : "removed", rv, bcm_errmsg(rv));
             return rv < 0 ? BCM_E_FAIL : 0;
         }
         if (sscanf(s, "vxlan egrvt %i %i", &vp, &flags) == 2) {
             rv = bcm_vlan_control_port_set(HWBCM_UNIT, vp, bcmVlanTranslateEgressEnable, flags ? 1 : 0);
-            printf("hw: vxlan egrvt port %d TranslateEgressEnable=%d rv %d (%s)\n", vp, flags ? 1 : 0, rv, bcm_errmsg(rv));
-            fflush(stdout);
+            shell_fd_printf(client_fd, "hw: vxlan egrvt port %d TranslateEgressEnable=%d rv %d (%s)\n",
+                            vp, flags ? 1 : 0, rv, bcm_errmsg(rv));
             return rv < 0 ? BCM_E_FAIL : 0;
         }
         if (sscanf(s, "vxlan vlandel %i %i", &vlan, &vp) == 2) {
             rv = bcm_vlan_gport_delete(HWBCM_UNIT, (bcm_vlan_t)vlan, (bcm_gport_t)vp);
-            printf("hw: vxlan vlandel vlan %d vp 0x%x rv %d (%s)\n", vlan, vp, rv, bcm_errmsg(rv));
-            fflush(stdout);
+            shell_fd_printf(client_fd, "hw: vxlan vlandel vlan %d vp 0x%x rv %d (%s)\n",
+                            vlan, vp, rv, bcm_errmsg(rv));
             return rv < 0 ? BCM_E_FAIL : 0;
         }
     }
     if (sscanf(s, "vxlan vpdel %i %i", &vpn, &vp) == 2) {
         rv = hwbcm_vxlan_port_delete(vpn, vp);
-        printf("hw: vxlan vpdel vpn 0x%x vp 0x%x rv %d (%s)\n", vpn, vp, rv, bcm_errmsg(rv));
-        fflush(stdout);
+        shell_fd_printf(client_fd, "hw: vxlan vpdel vpn 0x%x vp 0x%x rv %d (%s)\n",
+                        vpn, vp, rv, bcm_errmsg(rv));
         return rv < 0 ? BCM_E_FAIL : 0;
     }
-    printf("hw: unknown command \"%s\"\n", s);
-    fflush(stdout);
+    shell_fd_printf(client_fd, "hw: unknown command \"%s\"\n", s);
     return BCM_E_PARAM;
 }
 
-static int hwbcm_shell_cmd(const char *cmd)
+static int hwbcm_shell_cmd(const char *cmd, int client_fd)
 {
     char buf[HWBCM_SHELL_CMD_MAX];
     cmd_result_t cr;
 
     if (strncmp(cmd, "hw ", 3) == 0) {
-        return hwbcm_shell_hw_cmd(cmd + 3);
+        return hwbcm_shell_hw_cmd(cmd + 3, client_fd);
     }
 
     sal_strncpy(buf, cmd, sizeof(buf) - 1);
@@ -641,9 +754,9 @@ static int hwbcm_shell_cmd(const char *cmd)
 /* ------------------------------------------------------------------------ */
 /* debug shell socket                                                       */
 /*                                                                          */
-/* One command per connection on a Unix stream socket. The command's        */
-/* stdout/stderr (diag shell cli_out goes through the console sink on fd 1) */
-/* are redirected to the client for the duration of the command.           */
+/* One command per connection on a Unix stream socket. The command's BSL    */
+/* output (cli_out) on this thread is captured via bslmgmt_redir_hook_set   */
+/* and sent to the client with MSG_NOSIGNAL (never dup2'ing fd 1/2).        */
 /* Host usage: echo "ps xe0" | socat - UNIX-CONNECT:/var/run/hwbcm/shell.sock */
 /* ------------------------------------------------------------------------ */
 
@@ -651,7 +764,7 @@ static int hwbcm_shell_cmd(const char *cmd)
 #define HWBCM_SHELL_SOCK_PATH HWBCM_SHELL_SOCK_DIR "/shell.sock"
 
 static int g_shell_sock_fd = -1;
-static volatile int g_shell_sock_stop = 0;
+static int g_shell_sock_stop = 0;
 static pthread_t g_shell_sock_thread;
 static int g_shell_sock_started = 0;
 
@@ -659,8 +772,13 @@ static void shell_sock_serve(int client)
 {
     char line[HWBCM_SHELL_CMD_MAX];
     size_t n = 0;
-    int saved_out, saved_err;
+    struct timeval tv;
     int rc;
+
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    (void)setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     /* Read one line (or until EOF / buffer full). */
     while (n < sizeof(line) - 1) {
@@ -700,42 +818,33 @@ static void shell_sock_serve(int client)
             size_t l = strlen(interactive[i]);
             if (strncasecmp(p, interactive[i], l) == 0 && p[l] == '\0') {
                 const char msg[] = "refused: interactive command needs an argument (it would block on syncd's stdin)\n[hwbcm rc=-1]\n";
-                ssize_t w = write(client, msg, sizeof(msg) - 1);
-                (void)w;
+                (void)shell_send_all(client, msg, sizeof(msg) - 1);
                 return;
             }
         }
     }
 
     pthread_mutex_lock(&g_shell_lock);
-    if (g_shell_sock_stop || !g_inited || !SOC_UNIT_VALID(HWBCM_UNIT)) {
+    if (__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE) ||
+        !g_inited || !SOC_UNIT_VALID(HWBCM_UNIT)) {
         pthread_mutex_unlock(&g_shell_lock);
         return;
     }
-    fflush(stdout);
-    fflush(stderr);
-    saved_out = dup(1);
-    saved_err = dup(2);
-    if (saved_out < 0 || saved_err < 0) {
-        pthread_mutex_unlock(&g_shell_lock);
-        if (saved_out >= 0) close(saved_out);
-        if (saved_err >= 0) close(saved_err);
-        HWBCM_LOGE("shell socket: dup failed: %s", strerror(errno));
-        return;
-    }
-    dup2(client, 1);
-    dup2(client, 2);
 
-    rc = hwbcm_shell_cmd(line);
-    printf("[hwbcm rc=%d]\n", rc);
+    g_shell_client_fd = client;
+    g_shell_client_err = 0;
+    g_shell_active_tid = pthread_self();
+    __atomic_store_n(&g_shell_active, 1, __ATOMIC_RELEASE);
+    bslmgmt_redir_hook_set(shell_bsl_redir);
 
-    fflush(stdout);
-    fflush(stderr);
-    dup2(saved_out, 1);
-    dup2(saved_err, 2);
-    close(saved_out);
-    close(saved_err);
+    rc = hwbcm_shell_cmd(line, client);
+
+    bslmgmt_redir_hook_set(NULL);
+    __atomic_store_n(&g_shell_active, 0, __ATOMIC_RELEASE);
+    g_shell_client_fd = -1;
     pthread_mutex_unlock(&g_shell_lock);
+
+    shell_fd_printf(client, "[hwbcm rc=%d]\n", rc);
 
     HWBCM_LOGD("shell socket: \"%s\" -> %d", line, rc);
 }
@@ -743,13 +852,43 @@ static void shell_sock_serve(int client)
 static void *shell_sock_main(void *arg)
 {
     (void)arg;
-    while (!g_shell_sock_stop) {
-        int client = accept(g_shell_sock_fd, NULL, NULL);
+    while (!__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE)) {
+        struct pollfd pfd;
+        int pr, client;
+
+        pfd.fd = g_shell_sock_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        pr = poll(&pfd, 1, 200);
+        if (pr == 0) {
+            continue;
+        }
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (!__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE)) {
+                HWBCM_LOGW("shell socket: poll: %s", strerror(errno));
+                usleep(200 * 1000);
+            }
+            continue;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            if (__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            usleep(200 * 1000);
+            continue;
+        }
+        if (__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+        client = accept(g_shell_sock_fd, NULL, NULL);
         if (client < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            if (!g_shell_sock_stop) {
+            if (!__atomic_load_n(&g_shell_sock_stop, __ATOMIC_ACQUIRE)) {
                 HWBCM_LOGW("shell socket: accept: %s", strerror(errno));
                 usleep(200 * 1000);
             }
@@ -765,7 +904,6 @@ static int shell_sock_start(void)
 {
     struct sockaddr_un addr;
     int fd;
-    pthread_attr_t attr;
 
     if (g_shell_sock_started) {
         return 0;
@@ -799,18 +937,14 @@ static int shell_sock_start(void)
     }
 
     g_shell_sock_fd = fd;
-    g_shell_sock_stop = 0;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    if (pthread_create(&g_shell_sock_thread, &attr, shell_sock_main, NULL) != 0) {
+    __atomic_store_n(&g_shell_sock_stop, 0, __ATOMIC_RELEASE);
+    if (pthread_create(&g_shell_sock_thread, NULL, shell_sock_main, NULL) != 0) {
         HWBCM_LOGW("shell socket: pthread_create: %s", strerror(errno));
-        pthread_attr_destroy(&attr);
         close(fd);
         g_shell_sock_fd = -1;
         (void)unlink(HWBCM_SHELL_SOCK_PATH);
         return BCM_E_FAIL;
     }
-    pthread_attr_destroy(&attr);
     g_shell_sock_started = 1;
     HWBCM_LOGI("shell socket ready at %s (one diag command per connection)", HWBCM_SHELL_SOCK_PATH);
     return 0;
@@ -821,18 +955,17 @@ static void shell_sock_stop(void)
     if (!g_shell_sock_started) {
         return;
     }
-    g_shell_sock_stop = 1;
+    __atomic_store_n(&g_shell_sock_stop, 1, __ATOMIC_RELEASE);
     if (g_shell_sock_fd >= 0) {
+        /* Wake poll()/accept() without closing fd while the thread still holds it. */
         shutdown(g_shell_sock_fd, SHUT_RDWR);
+    }
+    (void)pthread_join(g_shell_sock_thread, NULL);
+    if (g_shell_sock_fd >= 0) {
         close(g_shell_sock_fd);
         g_shell_sock_fd = -1;
     }
     (void)unlink(HWBCM_SHELL_SOCK_PATH);
-    /* Wait for any in-flight shell_sock_serve() command to finish before
-     * shutdown tears down SOC_CONTROL(unit). Once g_shell_sock_stop is 1,
-     * no new command will enter hwbcm_shell_cmd(). */
-    pthread_mutex_lock(&g_shell_lock);
-    pthread_mutex_unlock(&g_shell_lock);
     g_shell_sock_started = 0;
 }
 
@@ -1857,6 +1990,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         soc_chip_info_vect_config(&g_chip_info_vect);
 
         /* 4b. Diag shell library bring-up */
+        (void)signal(SIGPIPE, SIG_IGN);
         parse_user_var_get = diag_user_var_get;
         bslmgmt_init();
         diag_init();
@@ -2157,7 +2291,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         static const char *steps[] = { "init soc", "init misc", "init mmu", "init bcm" };
         for (i = 0; i < 4; i++) {
             HWBCM_LOGI("hwbcm_init: %s", steps[i]);
-            rv = hwbcm_shell_cmd(steps[i]);
+            rv = hwbcm_shell_cmd(steps[i], -1);
             if (rv < 0) {
                 pthread_mutex_unlock(&g_lock);
                 return rv;
@@ -3697,7 +3831,7 @@ int hwbcm_shell(const char *cmd)
         pthread_mutex_unlock(&g_shell_lock);
         return BCM_E_INIT;
     }
-    rc = hwbcm_shell_cmd(cmd);
+    rc = hwbcm_shell_cmd(cmd, -1);
     pthread_mutex_unlock(&g_shell_lock);
     return rc;
 }

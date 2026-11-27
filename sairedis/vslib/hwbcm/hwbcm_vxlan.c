@@ -52,6 +52,7 @@
  */
 #include "hwbcm.h"
 
+#include <pthread.h>
 #include <string.h>
 
 #include <bcm/types.h>
@@ -212,11 +213,34 @@ static int hwbcm_vxlan_port_of_gport(bcm_gport_t gport)
     return -1;
 }
 
+static pthread_mutex_t s_vxlan_lock;
+static pthread_once_t s_vxlan_lock_once = PTHREAD_ONCE_INIT;
+
+static void vxlan_lock_init(void)
+{
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&s_vxlan_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+static void vxlan_lock(void)
+{
+    pthread_once(&s_vxlan_lock_once, vxlan_lock_init);
+    pthread_mutex_lock(&s_vxlan_lock);
+}
+
+static void vxlan_unlock(void)
+{
+    pthread_mutex_unlock(&s_vxlan_lock);
+}
+
 /* ------------------------------------------------------------------------ */
 /* init                                                                     */
 /* ------------------------------------------------------------------------ */
 
-int hwbcm_vxlan_init(int udp_dst_port)
+static int hwbcm_vxlan_init_locked(int udp_dst_port)
 {
     int rv;
 
@@ -270,11 +294,20 @@ int hwbcm_vxlan_init(int udp_dst_port)
     return BCM_E_NONE;
 }
 
+int hwbcm_vxlan_init(int udp_dst_port)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_init_locked(udp_dst_port);
+    vxlan_unlock();
+    return rv;
+}
+
 /* ------------------------------------------------------------------------ */
 /* VPN                                                                      */
 /* ------------------------------------------------------------------------ */
 
-int hwbcm_vxlan_vpn_create(uint32_t vni, int vid, int *vpn_id)
+static int hwbcm_vxlan_vpn_create_locked(uint32_t vni, int vid, int *vpn_id)
 {
     bcm_vxlan_vpn_config_t cfg;
     bcm_multicast_t group = 0;
@@ -316,7 +349,16 @@ int hwbcm_vxlan_vpn_create(uint32_t vni, int vid, int *vpn_id)
     return BCM_E_NONE;
 }
 
-int hwbcm_vxlan_vpn_destroy(int vpn_id)
+int hwbcm_vxlan_vpn_create(uint32_t vni, int vid, int *vpn_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_vpn_create_locked(vni, vid, vpn_id);
+    vxlan_unlock();
+    return rv;
+}
+
+static int hwbcm_vxlan_vpn_destroy_locked(int vpn_id)
 {
     bcm_vxlan_vpn_config_t cfg;
     bcm_multicast_t groups[3];
@@ -389,6 +431,15 @@ int hwbcm_vxlan_vpn_destroy(int vpn_id)
 
     hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x destroyed", vpn_id);
     return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_vpn_destroy(int vpn_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_vpn_destroy_locked(vpn_id);
+    vxlan_unlock();
+    return rv;
 }
 
 int hwbcm_vxlan_l2_flush_vpn(int vpn_id)
@@ -1129,16 +1180,24 @@ static void hwbcm_vxlan_acc_intf_put(int vid)
 int hwbcm_vxlan_network_port_add(int vpn_id, int tunnel_init_id, int tunnel_term_id,
                                  int l3_egr_id, int *vp_id)
 {
-    return hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, l3_egr_id, 0, vp_id);
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, l3_egr_id, 0, vp_id);
+    vxlan_unlock();
+    return rv;
 }
 
 int hwbcm_vxlan_network_port_add_mc(int vpn_id, int tunnel_init_id, int tunnel_term_id,
                                     int ipmc_egr_id, int *vp_id)
 {
-    return hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, ipmc_egr_id, 1, vp_id);
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_network_port_add_impl(vpn_id, tunnel_init_id, tunnel_term_id, ipmc_egr_id, 1, vp_id);
+    vxlan_unlock();
+    return rv;
 }
 
-int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, int tagged, int *vp_id)
+static int hwbcm_vxlan_access_port_add2_locked(int vpn_id, int port, int trunk_id, int vid, int tagged, int *vp_id)
 {
     bcm_vxlan_port_t vxp;
     bcm_gport_t gport = 0;
@@ -1242,12 +1301,21 @@ int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, in
     return BCM_E_NONE;
 }
 
+int hwbcm_vxlan_access_port_add2(int vpn_id, int port, int trunk_id, int vid, int tagged, int *vp_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_access_port_add2_locked(vpn_id, port, trunk_id, vid, tagged, vp_id);
+    vxlan_unlock();
+    return rv;
+}
+
 int hwbcm_vxlan_access_port_add(int vpn_id, int port, int vid, int *vp_id)
 {
     return hwbcm_vxlan_access_port_add2(vpn_id, port, -1, vid, 1, vp_id);
 }
 
-int hwbcm_vxlan_port_delete(int vpn_id, int vp_id)
+static int hwbcm_vxlan_port_delete_locked(int vpn_id, int vp_id)
 {
     int rv, vp, rv2 = BCM_E_NONE;
     bcm_vpn_t vpn;
@@ -1304,6 +1372,15 @@ int hwbcm_vxlan_port_delete(int vpn_id, int vp_id)
     return rv2;
 }
 
+int hwbcm_vxlan_port_delete(int vpn_id, int vp_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_port_delete_locked(vpn_id, vp_id);
+    vxlan_unlock();
+    return rv;
+}
+
 /* ------------------------------------------------------------------------ */
 /* L2                                                                       */
 /* ------------------------------------------------------------------------ */
@@ -1349,9 +1426,13 @@ int hwbcm_vxlan_l2_addr_delete(const uint8_t mac[6], int vpn_id)
 
 int hwbcm_vxlan_vp_info(int vp_gport, int *is_network, int *port, int *trunk_id, int *vpn_id)
 {
-    int vp = hwbcm_vxlan_vp_index(vp_gport);
+    int vp;
+
+    vxlan_lock();
+    vp = hwbcm_vxlan_vp_index(vp_gport);
 
     if (vp < 0 || !s_vp[vp].in_use) {
+        vxlan_unlock();
         return BCM_E_NOT_FOUND;
     }
     if (is_network != NULL) {
@@ -1367,6 +1448,7 @@ int hwbcm_vxlan_vp_info(int vp_gport, int *is_network, int *port, int *trunk_id,
     if (vpn_id != NULL) {
         *vpn_id = s_vp[vp].vpn_id;
     }
+    vxlan_unlock();
     return BCM_E_NONE;
 }
 
@@ -1507,7 +1589,7 @@ static int hwbcm_vxlan_vpn_ctrl_set(int vpn_id, int vrf, int ingress_if, int to_
     return BCM_E_NONE;
 }
 
-int hwbcm_vxlan_vpn_l3_bind(int vpn_id, const uint8_t mac[6], int vrf, int mtu, int *ovl_intf_id)
+static int hwbcm_vxlan_vpn_l3_bind_locked(int vpn_id, const uint8_t mac[6], int vrf, int mtu, int *ovl_intf_id)
 {
     bcm_l3_intf_t intf;
     bcm_l2_addr_t l2;
@@ -1565,7 +1647,16 @@ int hwbcm_vxlan_vpn_l3_bind(int vpn_id, const uint8_t mac[6], int vrf, int mtu, 
     return BCM_E_NONE;
 }
 
-int hwbcm_vxlan_vpn_l3_unbind(int vpn_id)
+int hwbcm_vxlan_vpn_l3_bind(int vpn_id, const uint8_t mac[6], int vrf, int mtu, int *ovl_intf_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_vpn_l3_bind_locked(vpn_id, mac, vrf, mtu, ovl_intf_id);
+    vxlan_unlock();
+    return rv;
+}
+
+static int hwbcm_vxlan_vpn_l3_unbind_locked(int vpn_id)
 {
     bcm_l3_intf_t intf;
     int vfi = hwbcm_vxlan_vfi_of(vpn_id);
@@ -1595,11 +1686,24 @@ int hwbcm_vxlan_vpn_l3_unbind(int vpn_id)
     return BCM_E_NONE;
 }
 
+int hwbcm_vxlan_vpn_l3_unbind(int vpn_id)
+{
+    int rv;
+    vxlan_lock();
+    rv = hwbcm_vxlan_vpn_l3_unbind_locked(vpn_id);
+    vxlan_unlock();
+    return rv;
+}
+
 int hwbcm_vxlan_vpn_l3_intf(int vpn_id)
 {
-    int vfi = hwbcm_vxlan_vfi_of(vpn_id);
+    int vfi, ret;
 
-    return (vfi >= 0 && s_vpn_l3[vfi].bound) ? s_vpn_l3[vfi].ovl_intf : -1;
+    vxlan_lock();
+    vfi = hwbcm_vxlan_vfi_of(vpn_id);
+    ret = (vfi >= 0 && s_vpn_l3[vfi].bound) ? s_vpn_l3[vfi].ovl_intf : -1;
+    vxlan_unlock();
+    return ret;
 }
 
 static int hwbcm_vxlan_overlay_egress_do(uint32 flags, int egr_id, int ovl_intf_id, const uint8_t mac[6],
@@ -1650,18 +1754,21 @@ int hwbcm_vxlan_overlay_egress_replace(int egr_id, int ovl_intf_id, const uint8_
 
 void hwbcm_vxlan_wb_get_globals(int *inited, int *udp_port)
 {
+    vxlan_lock();
     if (inited != NULL) {
         *inited = s_vxlan_inited;
     }
     if (udp_port != NULL) {
         *udp_port = s_udp_port;
     }
+    vxlan_unlock();
 }
 
 int hwbcm_vxlan_wb_get_vps(hwbcm_vxlan_vp_wb_t *out, int max)
 {
     int i, count = 0;
 
+    vxlan_lock();
     for (i = 0; i < HWBCM_VXLAN_MAX_VP; i++) {
         if (!s_vp[i].in_use) {
             continue;
@@ -1677,6 +1784,7 @@ int hwbcm_vxlan_wb_get_vps(hwbcm_vxlan_vp_wb_t *out, int max)
         }
         count++;
     }
+    vxlan_unlock();
     return count;
 }
 
@@ -1684,6 +1792,7 @@ int hwbcm_vxlan_wb_get_acc_intfs(hwbcm_vxlan_acc_intf_wb_t *out, int max)
 {
     int vid, count = 0;
 
+    vxlan_lock();
     for (vid = 0; vid <= BCM_VLAN_MAX; vid++) {
         if (s_acc_intf[vid].refcnt <= 0) {
             continue;
@@ -1695,6 +1804,7 @@ int hwbcm_vxlan_wb_get_acc_intfs(hwbcm_vxlan_acc_intf_wb_t *out, int max)
         }
         count++;
     }
+    vxlan_unlock();
     return count;
 }
 
@@ -1702,6 +1812,7 @@ int hwbcm_vxlan_wb_get_vpn_l3(hwbcm_vxlan_vpn_l3_wb_t *out, int max)
 {
     int vfi, count = 0;
 
+    vxlan_lock();
     for (vfi = 0; vfi < HWBCM_VXLAN_MAX_VFI; vfi++) {
         if (!s_vpn_l3[vfi].bound) {
             continue;
@@ -1713,16 +1824,19 @@ int hwbcm_vxlan_wb_get_vpn_l3(hwbcm_vxlan_vpn_l3_wb_t *out, int max)
         }
         count++;
     }
+    vxlan_unlock();
     return count;
 }
 
 void hwbcm_vxlan_warm_reset(void)
 {
+    vxlan_lock();
     memset(s_vp, 0, sizeof(s_vp));
     memset(s_acc_intf, 0, sizeof(s_acc_intf));
     memset(s_vpn_l3, 0, sizeof(s_vpn_l3));
     s_vxlan_inited = 0;
     s_udp_port = HWBCM_VXLAN_UDP_PORT_DEFAULT;
+    vxlan_unlock();
 }
 
 int hwbcm_vxlan_warm_restore(int inited, int udp_port,
@@ -1733,6 +1847,7 @@ int hwbcm_vxlan_warm_restore(int inited, int udp_port,
     int i, hw_port = 0;
     int restored_vps = 0, restored_acc = 0, restored_l3 = 0;
 
+    vxlan_lock();
     hwbcm_vxlan_warm_reset();
 
     /* NEVER call bcm_vxlan_init() during warm boot — SDK bcm_init() already
@@ -1786,5 +1901,6 @@ int hwbcm_vxlan_warm_restore(int inited, int udp_port,
     hwbcm_log(HWBCM_LOG_INFO,
               "hwbcm_vxlan: warm restore inited=%d udp_port=%d vps=%d acc_intfs=%d vpn_l3=%d (zero HW writes)",
               s_vxlan_inited, s_udp_port, restored_vps, restored_acc, restored_l3);
+    vxlan_unlock();
     return BCM_E_NONE;
 }
