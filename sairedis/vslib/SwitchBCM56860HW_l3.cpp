@@ -1928,7 +1928,7 @@ bool SwitchBCM56860HW::neighborTarget(
 
         auto bp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
 
-        if (bp == kv.second.end())
+        if (bp == kv.second.end() || bp->second == nullptr || bp->second->getAttr() == nullptr)
         {
             continue;
         }

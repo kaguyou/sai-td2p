@@ -1467,7 +1467,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     {
                         int32_t vpn = -1;
                         uint32_t cnt = 0;
-                        if (!tr.getI32(vpn) || !tr.getU32(cnt)) return SAI_STATUS_FAILURE;
+                        if (!tr.getI32(vpn) || !tr.getU32(cnt) || cnt > tr.remaining() / 12u) return SAI_STATUS_FAILURE;
                         auto &vec = m_vpnAccessVps[vpn];
                         vec.reserve(cnt);
                         for (uint32_t j = 0; j < cnt; j++)
@@ -1483,7 +1483,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     }
 
                     uint32_t nvps = 0;
-                    if (!tr.getU32(nvps)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nvps) || nvps > tr.remaining() / 28u) return SAI_STATUS_FAILURE;
                     vxlanVps.resize(nvps);
                     for (uint32_t i = 0; i < nvps; i++)
                     {
@@ -1498,7 +1498,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     }
 
                     uint32_t nacc = 0;
-                    if (!tr.getU32(nacc)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nacc) || nacc > tr.remaining() / 12u) return SAI_STATUS_FAILURE;
                     vxlanAccIntfs.resize(nacc);
                     for (uint32_t i = 0; i < nacc; i++)
                     {
@@ -1510,7 +1510,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     }
 
                     uint32_t nl3 = 0;
-                    if (!tr.getU32(nl3)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nl3) || nl3 > tr.remaining() / 14u) return SAI_STATUS_FAILURE;
                     vxlanVpnL3.resize(nl3);
                     for (uint32_t i = 0; i < nl3; i++)
                     {
@@ -1604,7 +1604,8 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     {
                         uint64_t oid = 0, tid = 0, cid = 0;
                         uint32_t nhw = 0;
-                        if (!tr.getU64(oid) || !tr.getU64(tid) || !tr.getU64(cid) || !tr.getU32(nhw))
+                        if (!tr.getU64(oid) || !tr.getU64(tid) || !tr.getU64(cid) || !tr.getU32(nhw) ||
+                            nhw > tr.remaining() / 8u)
                         {
                             return SAI_STATUS_FAILURE;
                         }
@@ -1824,7 +1825,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
             case HWSTATE_TAG_QOS_SNAPS:
                 {
                     uint32_t npgs = 0;
-                    if (!tr.getU32(npgs)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(npgs) || npgs > tr.remaining() / 36u) return SAI_STATUS_FAILURE;
                     qosPgSnaps.resize(npgs);
                     for (uint32_t i = 0; i < npgs; i++)
                     {
@@ -1837,7 +1838,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                         }
                     }
                     uint32_t nqs = 0;
-                    if (!tr.getU32(nqs)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nqs) || nqs > tr.remaining() / 56u) return SAI_STATUS_FAILURE;
                     qosQSnaps.resize(nqs);
                     for (uint32_t i = 0; i < nqs; i++)
                     {
@@ -1859,7 +1860,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
             case HWSTATE_TAG_QOS_QGRP_MIN:
                 {
                     uint32_t ng = 0;
-                    if (!tr.getU32(ng)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(ng) || ng > tr.remaining() / 12u) return SAI_STATUS_FAILURE;
                     qosQgrpSnaps.resize(ng);
                     for (uint32_t i = 0; i < ng; i++)
                     {
@@ -1891,7 +1892,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
             case HWSTATE_TAG_STATS_BASE:
                 {
                     uint32_t nq = 0;
-                    if (!tr.getU32(nq)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nq) || nq > tr.remaining() / 12u) return SAI_STATUS_FAILURE;
                     statsQBase.resize(nq);
                     for (uint32_t i = 0; i < nq; i++)
                     {
@@ -1903,7 +1904,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                         }
                     }
                     uint32_t nx = 0;
-                    if (!tr.getU32(nx)) return SAI_STATUS_FAILURE;
+                    if (!tr.getU32(nx) || nx > tr.remaining() / 10u) return SAI_STATUS_FAILURE;
                     statsXBase.resize(nx);
                     for (uint32_t i = 0; i < nx; i++)
                     {

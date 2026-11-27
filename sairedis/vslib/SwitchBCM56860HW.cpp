@@ -335,6 +335,11 @@ sai_status_t SwitchBCM56860HW::initialize_default_objects(
 
     // switch create attributes with a HW effect (e.g. SRC_MAC_ADDRESS)
 
+    if (attr_count > 0 && attr_list == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
     for (uint32_t i = 0; i < attr_count; i++)
     {
         sai_status_t status = hwSetSwitch(&attr_list[i]);
@@ -471,7 +476,7 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
         for (const auto &bp : bpHashIt->second)
         {
             auto it = bp.second.find(m_type->attridname);
-            if (it == bp.second.end() || it->second == nullptr)
+            if (it == bp.second.end() || it->second == nullptr || it->second->getAttr() == nullptr)
             {
                 continue;
             }
@@ -504,7 +509,7 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
         for (const auto &bp : bpHashIt->second)
         {
             auto it = bp.second.find(m_bridge_id->attridname);
-            if (it == bp.second.end() || it->second == nullptr)
+            if (it == bp.second.end() || it->second == nullptr || it->second->getAttr() == nullptr)
             {
                 // Expected on the default 1Q_ROUTER bridge port (no BRIDGE_ID).
                 SWSS_LOG_NOTICE("not found %s on bridge port: %s", m_bridge_id->attridname, bp.first.c_str());
@@ -540,13 +545,13 @@ sai_status_t SwitchBCM56860HW::refresh_bridge_port_list(
     for (const auto &bp : bridge_port_list_on_bridge_id)
     {
         auto tit = bp.second.find(m_type->attridname);
-        if (tit == bp.second.end() || tit->second == nullptr ||
+        if (tit == bp.second.end() || tit->second == nullptr || tit->second->getAttr() == nullptr ||
             tit->second->getAttr()->value.s32 != SAI_BRIDGE_PORT_TYPE_PORT)
         {
             continue;
         }
         auto pit = bp.second.find(m_port_id->attridname);
-        if (pit == bp.second.end() || pit->second == nullptr)
+        if (pit == bp.second.end() || pit->second == nullptr || pit->second->getAttr() == nullptr)
         {
             continue;
         }
@@ -880,6 +885,11 @@ sai_status_t SwitchBCM56860HW::hwCreatePort(
 
     qosOnPortMapped(port_id);
 
+    if (attr_count > 0 && attr_list == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
     for (uint32_t i = 0; i < attr_count; i++)
     {
         sai_status_t status = hwSetPort(port_id, &attr_list[i]);
@@ -1107,6 +1117,11 @@ sai_status_t SwitchBCM56860HW::hwSetHash(
     {
         /* Not bound to the switch: nothing in hardware uses it. */
         return SAI_STATUS_SUCCESS;
+    }
+
+    if (attr->value.s32list.count > 0 && attr->value.s32list.list == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
     }
 
     uint32_t fields = 0;
@@ -3266,6 +3281,11 @@ sai_status_t SwitchBCM56860HW::get(
         std::vector<sai_attribute_t> other;
         std::vector<uint32_t> otherIdx;
 
+        if (attr_count > 0 && attr_list == nullptr)
+        {
+            return SAI_STATUS_INVALID_PARAMETER;
+        }
+
         for (uint32_t i = 0; i < attr_count; i++)
         {
             if (attr_list[i].id == SAI_ACL_COUNTER_ATTR_PACKETS || attr_list[i].id == SAI_ACL_COUNTER_ATTR_BYTES)
@@ -3302,6 +3322,11 @@ sai_status_t SwitchBCM56860HW::get(
         std::vector<sai_attribute_t> other;
         std::vector<uint32_t> otherIdx;
         bool anyHandled = false;
+
+        if (attr_count > 0 && attr_list == nullptr)
+        {
+            return SAI_STATUS_INVALID_PARAMETER;
+        }
 
         for (uint32_t i = 0; i < attr_count; i++)
         {
@@ -3380,7 +3405,7 @@ bool SwitchBCM56860HW::getStoredAttr(
 
     auto ait = it->second.find(meta->attridname);
 
-    if (ait == it->second.end() || ait->second == nullptr)
+    if (ait == it->second.end() || ait->second == nullptr || ait->second->getAttr() == nullptr)
     {
         return false;
     }
@@ -3501,6 +3526,11 @@ sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
     sai_object_id_t bv = SAI_NULL_OBJECT_ID;
     sai_fdb_flush_entry_type_t type = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
 
+    if (attr_count > 0 && attr_list == nullptr)
+    {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
     for (uint32_t i = 0; i < attr_count; i++)
     {
         switch (attr_list[i].id)
@@ -3556,7 +3586,8 @@ sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
             {
                 auto ty = kv.second.find("SAI_FDB_ENTRY_ATTR_TYPE");
 
-                if (ty != kv.second.end() && ty->second->getAttr()->value.s32 != SAI_FDB_ENTRY_TYPE_DYNAMIC)
+                if (ty != kv.second.end() && ty->second != nullptr && ty->second->getAttr() != nullptr &&
+                        ty->second->getAttr()->value.s32 != SAI_FDB_ENTRY_TYPE_DYNAMIC)
                 {
                     continue;
                 }
@@ -3573,7 +3604,8 @@ sai_status_t SwitchBCM56860HW::hwFlushFdbEntries(
                 {
                     auto ebp = kv.second.find("SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID");
 
-                    if (ebp == kv.second.end() || ebp->second->getAttr()->value.oid != bp)
+                    if (ebp == kv.second.end() || ebp->second == nullptr || ebp->second->getAttr() == nullptr ||
+                            ebp->second->getAttr()->value.oid != bp)
                     {
                         continue;
                     }

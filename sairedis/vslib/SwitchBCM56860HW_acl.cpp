@@ -343,7 +343,7 @@ bool SwitchBCM56860HW::aclStoredAttrs(
 
     for (auto &kv: it->second)
     {
-        if (kv.second)
+        if (kv.second && kv.second->getAttr())
         {
             // shallow copy: list pointers stay owned by the SaiAttrWrap
             attrs.push_back(*kv.second->getAttr());
@@ -630,6 +630,10 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
                     break;
 
                 case SAI_ACL_ENTRY_ATTR_FIELD_IN_PORTS:
+                    if (f.data.objlist.count > 0 && f.data.objlist.list == nullptr)
+                    {
+                        return SAI_STATUS_INVALID_PARAMETER;
+                    }
                     pr.hasInPorts = true;
                     for (uint32_t i = 0; i < f.data.objlist.count; i++)
                     {
@@ -643,6 +647,10 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
                     break;
 
                 case SAI_ACL_ENTRY_ATTR_FIELD_OUT_PORTS:
+                    if (f.data.objlist.count > 0 && f.data.objlist.list == nullptr)
+                    {
+                        return SAI_STATUS_INVALID_PARAMETER;
+                    }
                     pr.hasOutPorts = true;
                     for (uint32_t i = 0; i < f.data.objlist.count; i++)
                     {
@@ -771,6 +779,10 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
                     break;
 
                 case SAI_ACL_ENTRY_ATTR_FIELD_ACL_RANGE_TYPE:
+                    if (f.data.objlist.count > 0 && f.data.objlist.list == nullptr)
+                    {
+                        return SAI_STATUS_INVALID_PARAMETER;
+                    }
                     r.quals |= HWBCM_ACL_Q_RANGE;
                     for (uint32_t i = 0; i < f.data.objlist.count; i++)
                     {
@@ -886,6 +898,11 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
                 case SAI_ACL_ENTRY_ATTR_ACTION_MIRROR_EGRESS:
                     {
                         bool ing = (id == SAI_ACL_ENTRY_ATTR_ACTION_MIRROR_INGRESS);
+
+                        if (act.parameter.objlist.count > 0 && act.parameter.objlist.list == nullptr)
+                        {
+                            return SAI_STATUS_INVALID_PARAMETER;
+                        }
 
                         for (uint32_t i = 0; i < act.parameter.objlist.count; i++)
                         {
@@ -1382,6 +1399,10 @@ sai_status_t SwitchBCM56860HW::hwCreateAclTable(
 
     if (bpAttr != nullptr)
     {
+        if (bpAttr->value.s32list.count > 0 && bpAttr->value.s32list.list == nullptr)
+        {
+            return SAI_STATUS_INVALID_PARAMETER;
+        }
         for (uint32_t i = 0; i < bpAttr->value.s32list.count; i++)
         {
             bps.insert(bpAttr->value.s32list.list[i]);
@@ -2182,6 +2203,11 @@ void SwitchBCM56860HW::hwAclMirrorSessionUpdated(
             sai_attribute_t a;
 
             if (!getStoredAttr(SAI_OBJECT_TYPE_ACL_ENTRY, kv.first, id, a) || !a.value.aclaction.enable)
+            {
+                continue;
+            }
+
+            if (a.value.aclaction.parameter.objlist.list == nullptr)
             {
                 continue;
             }

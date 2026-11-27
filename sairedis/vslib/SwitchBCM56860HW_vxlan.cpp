@@ -791,7 +791,7 @@ sai_status_t SwitchBCM56860HW::vxlanAddAccessPorts(
     {
         auto it = vm.second.find(md->attridname);
 
-        if (it == vm.second.end())
+        if (it == vm.second.end() || it->second == nullptr || it->second->getAttr() == nullptr)
         {
             continue;
         }
