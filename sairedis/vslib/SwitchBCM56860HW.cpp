@@ -1743,18 +1743,116 @@ void SwitchBCM56860HW::process_packet_for_fdb_event(
 
     if (fdbHash.find(sid) != fdbHash.end())
     {
-        SWSS_LOG_DEBUG("fdb %s already known, not re-reported", sid.c_str());
-        return;
+        // Static entries programmed by orchagent come back from the ASIC as ADD
+        // events too: never overwrite them or report a move.
+        sai_attribute_t typeAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, sid, SAI_FDB_ENTRY_ATTR_TYPE, typeAttr) &&
+                typeAttr.value.s32 == SAI_FDB_ENTRY_TYPE_STATIC)
+        {
+            SWSS_LOG_DEBUG("fdb %s is static, not re-reported", sid.c_str());
+            return;
+        }
+
+        sai_object_id_t targetOid = port_oid;
+
+        for (const auto &mkv: m_lagMemberInfo)
+        {
+            if (mkv.second.second == port_oid)
+            {
+                targetOid = mkv.second.first;
+                break;
+            }
+        }
+
+        sai_object_id_t newBp = SAI_NULL_OBJECT_ID;
+
+        for (const auto &bkv: m_objectHash.at(SAI_OBJECT_TYPE_BRIDGE_PORT))
+        {
+            sai_object_id_t bpOid = SAI_NULL_OBJECT_ID;
+            sai_deserialize_object_id(bkv.first, bpOid);
+
+            sai_attribute_t typeA, portA;
+
+            if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_TYPE, typeA) &&
+                typeA.value.s32 == SAI_BRIDGE_PORT_TYPE_PORT &&
+                getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, bpOid, SAI_BRIDGE_PORT_ATTR_PORT_ID, portA) &&
+                portA.value.oid == targetOid)
+            {
+                newBp = bpOid;
+                break;
+            }
+        }
+
+        sai_attribute_t oldBpAttr;
+        bool haveOldBp = getStoredAttr(SAI_OBJECT_TYPE_FDB_ENTRY, sid, SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID, oldBpAttr);
+
+        if (newBp == SAI_NULL_OBJECT_ID || (haveOldBp && oldBpAttr.value.oid == newBp))
+        {
+            SWSS_LOG_DEBUG("fdb %s already known on same bridge port, not re-reported", sid.c_str());
+            return;
+        }
+
+        sai_attribute_t lmAttr;
+
+        if (getStoredAttr(SAI_OBJECT_TYPE_BRIDGE_PORT, newBp, SAI_BRIDGE_PORT_ATTR_FDB_LEARNING_MODE, lmAttr) &&
+                lmAttr.value.s32 != SAI_BRIDGE_PORT_FDB_LEARNING_MODE_HW)
+        {
+            SWSS_LOG_DEBUG("fdb move %s onto non-HW-learning bridge port %s ignored",
+                    sid.c_str(), sai_serialize_object_id(newBp).c_str());
+            return;
+        }
+
+        SWSS_LOG_NOTICE("fdb move %s vid %d -> bcm port %d (%s, bp %s)",
+                sai_serialize_mac(mac).c_str(), vid, bcm,
+                sai_serialize_object_id(port_oid).c_str(),
+                sai_serialize_object_id(newBp).c_str());
+
+        sai_attribute_t bpAttr;
+        bpAttr.id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+        bpAttr.value.oid = newBp;
+        (void)set_internal(SAI_OBJECT_TYPE_FDB_ENTRY, sid, &bpAttr);
+
+        // Refresh m_fdb_info_set entry so future aging/moves match the new port
+        FdbInfo fi;
+        fi.setPortId(targetOid);
+        fi.setVlanId((sai_vlan_id_t)vid);
+        fi.setTimestamp((uint32_t)time(NULL));
+        fi.m_fdbEntry = fdb;
+        fi.m_bridgePortId = newBp;
+
+        auto fit = m_fdb_info_set.find(fi);
+        if (fit != m_fdb_info_set.end())
+        {
+            m_fdb_info_set.erase(fit);
+        }
+        m_fdb_info_set.insert(fi);
+
+        sai_attribute_t ntfAttrs[2];
+        ntfAttrs[0].id = SAI_FDB_ENTRY_ATTR_TYPE;
+        ntfAttrs[0].value.s32 = SAI_FDB_ENTRY_TYPE_DYNAMIC;
+        ntfAttrs[1].id = SAI_FDB_ENTRY_ATTR_BRIDGE_PORT_ID;
+        ntfAttrs[1].value.oid = newBp;
+
+        sai_fdb_event_notification_data_t data;
+        data.event_type = SAI_FDB_EVENT_MOVE;
+        data.fdb_entry = fdb;
+        data.attr_count = 2;
+        data.attr = ntfAttrs;
+
+        send_fdb_event_notification(data);
     }
+    else
+    {
+        SWSS_LOG_NOTICE("fdb learn %s vid %d on bcm port %d (%s)",
+                sai_serialize_mac(mac).c_str(), vid, bcm, sai_serialize_object_id(port_oid).c_str());
 
-    SWSS_LOG_NOTICE("fdb learn %s vid %d on bcm port %d (%s)",
-            sai_serialize_mac(mac).c_str(), vid, bcm, sai_serialize_object_id(port_oid).c_str());
+        // stock vslib learning: bridge port lookup, learning mode check,
+        // m_fdb_info_set, local DB create (DYNAMIC, no HW write) and the
+        // SAI_FDB_EVENT_LEARNED notification
 
-    // stock vslib learning: bridge port lookup, learning mode check,
-    // m_fdb_info_set, local DB create (DYNAMIC, no HW write) and the
-    // SAI_FDB_EVENT_LEARNED notification
-
-    SwitchBCM56850::process_packet_for_fdb_event(port_oid, name, frame, sizeof(frame));
+        SwitchBCM56850::process_packet_for_fdb_event(port_oid, name, frame, sizeof(frame));
+    }
 
     // a neighbor punted to the CPU (A3) may have been waiting for this MAC
     {
