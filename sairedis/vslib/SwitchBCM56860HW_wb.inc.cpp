@@ -1164,6 +1164,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     }
 
     m_lagToTrunk.clear();
+    m_defaultVrId = SAI_NULL_OBJECT_ID;
     m_vrToVrf.clear();
     m_rifToIntf.clear();
     m_rifToVid.clear();
@@ -3082,6 +3083,7 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     m_lagMemberInfo.clear();
     m_hostifToNetif.clear();
 
+    m_defaultVrId = SAI_NULL_OBJECT_ID;
     m_vrToVrf.clear();
     m_rifToIntf.clear();
     m_rifToVid.clear();

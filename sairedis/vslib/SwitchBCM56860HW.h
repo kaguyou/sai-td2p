@@ -394,12 +394,14 @@ namespace saivs
             void v4NeighborIndexRemove(_In_ int vrf, _In_ uint32_t ip4, _In_ const std::string &serialized);
             void v4RouteIndexAdd(_In_ int vrf, _In_ uint32_t ip4, _In_ int len, _In_ int egr);
             void v4RouteIndexRemove(_In_ int vrf, _In_ uint32_t ip4, _In_ int len);
+            sai_object_id_t defaultVirtualRouterId();
             sai_object_id_t bridgePortOfTarget(_In_ sai_object_id_t targetOid);
 
+            sai_object_id_t m_defaultVrId = SAI_NULL_OBJECT_ID; /* cached SWITCH DEFAULT_VIRTUAL_ROUTER_ID */
             std::map<sai_object_id_t, int> m_vrToVrf;      /* virtual router oid -> bcm vrf */
             std::map<sai_object_id_t, int> m_rifToIntf;    /* rif oid -> bcm l3 intf id */
             std::map<sai_object_id_t, int> m_rifToVid;     /* rif oid -> vlan used for the RIF */
-            std::map<sai_object_id_t, int> m_nhToEgr;      /* next hop oid -> bcm egress id */
+            std::unordered_map<sai_object_id_t, int> m_nhToEgr;      /* next hop oid -> bcm egress id */
             std::unordered_map<RifIpKey, std::vector<sai_object_id_t>, RifIpKeyHash> m_nhByRifIp; /* derived: (rif, ip) -> nh oids */
             std::unordered_map<sai_object_id_t, RifIpKey> m_nhKey; /* derived: nh oid -> (rif, ip) */
             std::unordered_map<int, uint32_t> m_egrNhRefCount;       /* derived: egr -> count in m_nhToEgr */
@@ -409,14 +411,14 @@ namespace saivs
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNh; /* nhg member -> nh */
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNhg;/* nhg member -> nhg */
             std::unordered_map<sai_object_id_t, std::set<sai_object_id_t>> m_nhgToMembers; /* derived: nhg -> member oids */
-            std::map<std::string, int> m_neighborEgr;      /* serialized neighbor -> egress id */
+            std::unordered_map<std::string, int> m_neighborEgr;      /* serialized neighbor -> egress id */
             std::unordered_map<VlanMacKey, std::vector<std::string>, VlanMacKeyHash> m_vlanNeighborsByMac; /* derived: (vlanOid, mac) -> neighbor keys */
             std::unordered_map<int, std::vector<std::string>> m_vlanNeighborsByVid; /* derived: vid -> neighbor keys */
             std::unordered_map<std::string, std::pair<int, VlanMacKey>> m_neighborVlanMac; /* derived: neighbor key -> (vid, (vlanOid, mac)) */
             std::unordered_map<uint64_t, std::vector<std::pair<std::string, int>>> m_v4NeighborsByVrfIp; /* derived: (vrf, ip4) -> [(ser, egr)] */
             std::unordered_map<uint64_t, int> m_v4RoutesByVrfLen[33]; /* derived: [len][(vrf, masked_ip4)] -> egr */
             uint64_t m_v4RouteLenMask = 0;                            /* derived: bit len set if m_v4RoutesByVrfLen[len] non-empty */
-            std::map<std::string, int> m_routeEgr;         /* serialized route -> egress/ecmp id */
+            std::unordered_map<std::string, int> m_routeEgr;         /* serialized route -> egress/ecmp id */
             std::unordered_map<int, sai_object_id_t> m_vidToVlanOid;  /* derived: vid -> vlan oid */
             std::unordered_map<sai_object_id_t, int> m_vlanOidToVid;  /* derived: vlan oid -> vid */
             std::unordered_map<sai_object_id_t, sai_object_id_t> m_portToLag; /* derived: port oid -> lag oid */

@@ -747,15 +747,17 @@ void SwitchBCM56860HW::hwCoppOnRoute(
         return;
     }
 
-    sai_attribute_t a;
-
-    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTE_ENTRY, serializedRoute, SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID, a) ||
-            a.value.oid != m_cpu_port_id)
+    // Fast path: once IP2ME CPU egress is known (or egress is already the
+    // known local egress), avoid the m_objectHash lookup on every route add.
+    if (m_coppLocalEgress >= 0 && it->second == m_coppLocalEgress)
     {
         return;
     }
 
-    if (it->second == m_coppLocalEgress)
+    sai_attribute_t a;
+
+    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTE_ENTRY, serializedRoute, SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID, a) ||
+            a.value.oid != m_cpu_port_id)
     {
         return;
     }

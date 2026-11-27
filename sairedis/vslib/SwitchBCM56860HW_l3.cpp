@@ -24,6 +24,7 @@
 #include "meta/sai_serialize.h"
 
 #include <cstring>
+#include <cinttypes>
 #include <set>
 #include <algorithm>
 #include <arpa/inet.h>
@@ -137,15 +138,6 @@ namespace
         return af;
     }
 
-    bool macEqual(
-            _In_ const sai_mac_t a,
-            _In_ const sai_mac_t b)
-    {
-        SWSS_LOG_ENTER();
-
-        return memcmp(a, b, sizeof(sai_mac_t)) == 0;
-    }
-
     uint64_t vrfIp4Key(
             _In_ int vrf,
             _In_ uint32_t ip4)
@@ -233,7 +225,7 @@ namespace
             _In_ sai_object_id_t nhg,
             _In_ const std::unordered_map<sai_object_id_t, std::set<sai_object_id_t>> &nhgToMembers,
             _In_ const std::map<sai_object_id_t, sai_object_id_t> &memberToNh,
-            _In_ const std::map<sai_object_id_t, int> &nhToEgr)
+            _In_ const std::unordered_map<sai_object_id_t, int> &nhToEgr)
     {
         SWSS_LOG_ENTER();
 
@@ -562,6 +554,19 @@ void SwitchBCM56860HW::v4RouteIndexRemove(
     {
         m_v4RouteLenMask &= ~(1ULL << len);
     }
+}
+
+sai_object_id_t SwitchBCM56860HW::defaultVirtualRouterId()
+{
+    if (m_defaultVrId == SAI_NULL_OBJECT_ID)
+    {
+        sai_attribute_t sw;
+        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
+        {
+            m_defaultVrId = sw.value.oid;
+        }
+    }
+    return m_defaultVrId;
 }
 
 // --- VIRTUAL_ROUTER -------------------------------------------------------
@@ -1227,18 +1232,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
 
     if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
     {
-        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
-
-        {
-            sai_attribute_t sw;
-
-            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
-            {
-                defaultVr = sw.value.oid;
-            }
-        }
-
-        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, true, serialized.c_str(), vrf);
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVirtualRouterId(), vrAttr.value.oid, true, serialized.c_str(), vrf);
 
         if (st != SAI_STATUS_SUCCESS)
         {
@@ -1354,7 +1348,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
 
             replacedEgrs.push_back(e);
 
-            SWSS_LOG_NOTICE("neighbor %s: next hop %s egress %d resolved (port %d trunk %d cpu %d)",
+            SWSS_LOG_INFO("neighbor %s: next hop %s egress %d resolved (port %d trunk %d cpu %d)",
                     serialized.c_str(), sai_serialize_object_id(nh).c_str(), e, port, trunk, toCpu ? 1 : 0);
 
             if (egr < 0)
@@ -1426,7 +1420,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
         v4NeighborIndexAdd(vrf, ne.ip_address.addr.ip4, serialized, egr);
     }
 
-    SWSS_LOG_NOTICE("neighbor %s -> egress %d (intf %d vrf %d port %d trunk %d vp 0x%x/ovl %d cpu %d host %d)",
+    SWSS_LOG_INFO("neighbor %s -> egress %d (intf %d vrf %d port %d trunk %d vp 0x%x/ovl %d cpu %d host %d)",
             serialized.c_str(), egr, intf, vrf, port, trunk, vpGport, ovlIntf, toCpu ? 1 : 0, noHostRoute ? 0 : 1);
 
     if (m_hwReady)
@@ -1610,7 +1604,7 @@ sai_status_t SwitchBCM56860HW::hwSetNeighbor(
         neighborVlanIndexUpdateMac(serialized, mac);
     }
 
-    SWSS_LOG_NOTICE("neighbor %s updated (attr %d, %zu egress(es), action %d port %d trunk %d vp 0x%x cpu %d)",
+    SWSS_LOG_INFO("neighbor %s updated (attr %d, %zu egress(es), action %d port %d trunk %d vp 0x%x cpu %d)",
             serialized.c_str(), attr->id, egrs.size(), (int)action, port, trunk, vpGport, toCpu ? 1 : 0);
 
     if (m_hwReady)
@@ -1654,18 +1648,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
 
     if (getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, ne.rif_id, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
     {
-        sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
-
-        {
-            sai_attribute_t sw;
-
-            if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
-            {
-                defaultVr = sw.value.oid;
-            }
-        }
-
-        sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, vrAttr.value.oid, false, serialized.c_str(), vrf);
+        sai_status_t st = resolveVrf(m_vrToVrf, defaultVirtualRouterId(), vrAttr.value.oid, false, serialized.c_str(), vrf);
 
         if (st != SAI_STATUS_SUCCESS)
         {
@@ -1761,7 +1744,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         }
 
         eraseNeighborIndexes();
-        SWSS_LOG_NOTICE("neighbor %s removed, %zu next-hop egress(es) now punt to cpu", serialized.c_str(), nhEgrs.size());
+        SWSS_LOG_INFO("neighbor %s removed, %zu next-hop egress(es) now punt to cpu", serialized.c_str(), nhEgrs.size());
     }
     else if (!otherNeighborUsesEgr)
     {
@@ -1782,7 +1765,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         }
 
         eraseNeighborIndexes();
-        SWSS_LOG_NOTICE("neighbor %s removed, egress %d destroyed", serialized.c_str(), egr);
+        SWSS_LOG_INFO("neighbor %s removed, egress %d destroyed", serialized.c_str(), egr);
     }
     else
     {
@@ -1849,7 +1832,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
         egrNhRefInc(nit->second);
         nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
-        SWSS_LOG_NOTICE("next hop %s -> egress %d (shared with neighbor %s)", snh.c_str(), nit->second, key.c_str());
+        SWSS_LOG_INFO("next hop %s -> egress %d (shared with neighbor %s)", snh.c_str(), nit->second, key.c_str());
 
         if (m_hwReady)
         {
@@ -1888,7 +1871,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     egrNhRefInc(egr);
     nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
-    SWSS_LOG_NOTICE("next hop %s -> egress %d (cpu, neighbor %s unresolved)", snh.c_str(), egr, key.c_str());
+    SWSS_LOG_INFO("next hop %s -> egress %d (cpu, neighbor %s unresolved)", snh.c_str(), egr, key.c_str());
 
     if (m_hwReady)
     {
@@ -1922,7 +1905,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
         m_nhToEgr.erase(it);
         egrNhRefDec(egr);
         nhIndexRemove(nh_id);
-        SWSS_LOG_NOTICE("next hop %s removed, egress %d still in use", sai_serialize_object_id(nh_id).c_str(), egr);
+        SWSS_LOG_INFO("next hop 0x%" PRIx64 " removed, egress %d still in use", nh_id, egr);
         return SAI_STATUS_SUCCESS;
     }
 
@@ -2195,19 +2178,8 @@ sai_status_t SwitchBCM56860HW::hwCreateRoute(
 
     // vrf
 
-    sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
-
-    {
-        sai_attribute_t sw;
-
-        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
-        {
-            defaultVr = sw.value.oid;
-        }
-    }
-
     int vrf = 0;
-    sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, true, serialized.c_str(), vrf);
+    sai_status_t st = resolveVrf(m_vrToVrf, defaultVirtualRouterId(), re.vr_id, true, serialized.c_str(), vrf);
 
     if (st != SAI_STATUS_SUCCESS)
     {
@@ -2428,19 +2400,8 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
     sai_route_entry_t re;
     sai_deserialize_route_entry(serialized, re);
 
-    sai_object_id_t defaultVr = SAI_NULL_OBJECT_ID;
-
-    {
-        sai_attribute_t sw;
-
-        if (getStoredAttr(SAI_OBJECT_TYPE_SWITCH, m_switch_id, SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID, sw))
-        {
-            defaultVr = sw.value.oid;
-        }
-    }
-
     int vrf = 0;
-    sai_status_t st = resolveVrf(m_vrToVrf, defaultVr, re.vr_id, false, serialized.c_str(), vrf);
+    sai_status_t st = resolveVrf(m_vrToVrf, defaultVirtualRouterId(), re.vr_id, false, serialized.c_str(), vrf);
 
     if (st != SAI_STATUS_SUCCESS)
     {
