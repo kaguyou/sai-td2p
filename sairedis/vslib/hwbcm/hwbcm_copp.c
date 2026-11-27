@@ -674,7 +674,7 @@ int hwbcm_copp_policer_create(const hwbcm_copp_policer_cfg_t *cfg, int *policer_
     slot->cfg = *cfg;
     *policer_id = (int)pid;
     pthread_mutex_unlock(&g_copp_lock);
-    CLOGI("policer %d: mode %d %s cir %llu cbs %llu pir %llu pbs %llu%s", (int)pid, cfg->mode,
+    CLOGD("policer %d: mode %d %s cir %llu cbs %llu pir %llu pbs %llu%s", (int)pid, cfg->mode,
           cfg->packets ? "pps" : "Bps",
           (unsigned long long)cfg->cir, (unsigned long long)cfg->cbs,
           (unsigned long long)cfg->pir, (unsigned long long)cfg->pbs,
@@ -711,7 +711,7 @@ int hwbcm_copp_policer_set(int policer_id, const hwbcm_copp_policer_cfg_t *cfg)
     }
     p->cfg = *cfg;
     pthread_mutex_unlock(&g_copp_lock);
-    CLOGI("policer %d updated: cir %llu cbs %llu pir %llu pbs %llu", policer_id,
+    CLOGD("policer %d updated: cir %llu cbs %llu pir %llu pbs %llu", policer_id,
           (unsigned long long)cfg->cir, (unsigned long long)cfg->cbs,
           (unsigned long long)cfg->pir, (unsigned long long)cfg->pbs);
     return 0;
@@ -751,7 +751,7 @@ int hwbcm_copp_policer_destroy(int policer_id)
     }
     memset(p, 0, sizeof(*p));
     pthread_mutex_unlock(&g_copp_lock);
-    CLOGI("policer %d destroyed", policer_id);
+    CLOGD("policer %d destroyed", policer_id);
     return 0;
 }
 
@@ -1076,7 +1076,7 @@ static int slot_build(copp_slot_t *s, const hwbcm_copp_trap_cfg_t *cfg)
         s->stat_id[s->neid] = sid;
         s->neid++;
     }
-    CLOGI("%s: %d entr%s, prio %u, queue %d, policer %d (drop g%d y%d r%d), %s%s",
+    CLOGD("%s: %d entr%s, prio %u, queue %d, policer %d (drop g%d y%d r%d), %s%s",
           trap_name(cfg->trap), s->neid, s->neid == 1 ? "y" : "ies", (unsigned)cfg->priority,
           cfg->queue, cfg->policer_id, cfg->drop_green, cfg->drop_yellow, cfg->drop_red,
           cfg->action == HWBCM_COPP_ACT_TRAP ? "trap" : "copy",
@@ -1196,7 +1196,7 @@ int hwbcm_copp_trap_remove(int handle)
         return BCM_E_NOT_FOUND;
     }
     slot_clear_entries(s, s->cfg.policer_id >= 0);
-    CLOGI("%s: removed (handle %d)", trap_name(s->cfg.trap), handle);
+    CLOGD("%s: removed (handle %d)", trap_name(s->cfg.trap), handle);
     memset(s, 0, sizeof(*s));
     pthread_mutex_unlock(&g_copp_lock);
     return 0;

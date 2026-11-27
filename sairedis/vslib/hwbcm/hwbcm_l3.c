@@ -289,8 +289,8 @@ int hwbcm_l3_intf_create(const uint8_t mac[6], int vid, int vrf, int mtu, int *i
     intf.l3a_mtu = (mtu > 0) ? mtu : HWBCM_L3_DEFAULT_MTU;
 
     rv = bcm_l3_intf_create(U, &intf);
-    hwbcm_l3_mac_str(mac, macs, sizeof(macs));
     if (rv < 0) {
+        hwbcm_l3_mac_str(mac, macs, sizeof(macs));
         hwbcm_log(HWBCM_LOG_ERR, "l3: intf_create(mac=%s vid=%d vrf=%d mtu=%d): %s",
                   macs, vid, vrf, intf.l3a_mtu, bcm_errmsg(rv));
         return rv;
@@ -313,8 +313,11 @@ int hwbcm_l3_intf_create(const uint8_t mac[6], int vid, int vrf, int mtu, int *i
     }
 
     *intf_id = (int)intf.l3a_intf_id;
-    hwbcm_log(HWBCM_LOG_INFO, "l3: intf %d created (mac=%s vid=%d vrf=%d mtu=%d)",
-              *intf_id, macs, vid, vrf, intf.l3a_mtu);
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        hwbcm_l3_mac_str(mac, macs, sizeof(macs));
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: intf %d created (mac=%s vid=%d vrf=%d mtu=%d)",
+                  *intf_id, macs, vid, vrf, intf.l3a_mtu);
+    }
     return 0;
 }
 
@@ -337,7 +340,7 @@ int hwbcm_l3_intf_destroy(int intf_id)
             hwbcm_log(HWBCM_LOG_WARN, "l3: ingress_destroy(%d): %s", intf_id, bcm_errmsg(rv));
         }
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: intf %d destroyed", intf_id);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: intf %d destroyed", intf_id);
     return 0;
 }
 
@@ -363,7 +366,7 @@ int hwbcm_l3_intf_mtu_set(int intf_id, int mtu)
         hwbcm_log(HWBCM_LOG_ERR, "l3: intf %d mtu=%d replace: %s", intf_id, mtu, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: intf %d mtu=%d", intf_id, intf.l3a_mtu);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: intf %d mtu=%d", intf_id, intf.l3a_mtu);
     return 0;
 }
 
@@ -414,19 +417,24 @@ static int hwbcm_l3_egress_do(uint32 flags, int intf_id, const uint8_t *dst_mac,
     id = (flags & BCM_L3_WITH_ID) ? (bcm_if_t)*egr_id : 0;
 
     rv = bcm_l3_egress_create(U, flags, &egr, &id);
-    if (dst_mac) {
-        hwbcm_l3_mac_str(dst_mac, macs, sizeof(macs));
-    }
     if (rv < 0) {
+        if (dst_mac) {
+            hwbcm_l3_mac_str(dst_mac, macs, sizeof(macs));
+        }
         hwbcm_log(HWBCM_LOG_ERR,
                   "l3: egress_create(flags=0x%x intf=%d mac=%s port=%d trunk=%d cpu=%d drop=%d): %s",
                   (unsigned)flags, intf_id, macs, port, trunk_id, to_cpu, drop, bcm_errmsg(rv));
         return rv;
     }
     *egr_id = (int)id;
-    hwbcm_log(HWBCM_LOG_INFO, "l3: egress %d %s (intf=%d mac=%s port=%d trunk=%d cpu=%d drop=%d)",
-              *egr_id, (flags & BCM_L3_REPLACE) ? "replaced" : "created",
-              intf_id, macs, port, trunk_id, to_cpu, drop);
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        if (dst_mac) {
+            hwbcm_l3_mac_str(dst_mac, macs, sizeof(macs));
+        }
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: egress %d %s (intf=%d mac=%s port=%d trunk=%d cpu=%d drop=%d)",
+                  *egr_id, (flags & BCM_L3_REPLACE) ? "replaced" : "created",
+                  intf_id, macs, port, trunk_id, to_cpu, drop);
+    }
     return 0;
 }
 
@@ -493,7 +501,7 @@ int hwbcm_l3_egress_destroy(int egr_id)
         hwbcm_log(HWBCM_LOG_ERR, "l3: egress_destroy(%d): %s", egr_id, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: egress %d destroyed", egr_id);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: egress %d destroyed", egr_id);
     return 0;
 }
 
@@ -561,7 +569,7 @@ int hwbcm_l3_ecmp_create(const int *egr_ids, int n, int *ecmp_id)
         return rv;
     }
     *ecmp_id = id;
-    hwbcm_log(HWBCM_LOG_INFO, "l3: ecmp %d created with %d members", id, n);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: ecmp %d created with %d members", id, n);
     return 0;
 }
 
@@ -573,7 +581,7 @@ int hwbcm_l3_ecmp_set(int ecmp_id, const int *egr_ids, int n)
     if (rv < 0) {
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: ecmp %d now has %d members", ecmp_id, n);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: ecmp %d now has %d members", ecmp_id, n);
     return 0;
 }
 
@@ -591,7 +599,7 @@ int hwbcm_l3_ecmp_destroy(int ecmp_id)
         return rv;
     }
     hwbcm_l3_ecmp_forget(ecmp_id);
-    hwbcm_log(HWBCM_LOG_INFO, "l3: ecmp %d destroyed", ecmp_id);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: ecmp %d destroyed", ecmp_id);
     return 0;
 }
 
@@ -641,12 +649,15 @@ int hwbcm_l3_host_add(int vrf, int af, const uint8_t *addr, int egr_id)
         h.l3a_flags |= BCM_L3_REPLACE;
         rv = bcm_l3_host_add(U, &h);
     }
-    hwbcm_l3_addr_str(af, addr, as, sizeof(as));
     if (rv < 0) {
+        hwbcm_l3_addr_str(af, addr, as, sizeof(as));
         hwbcm_log(HWBCM_LOG_ERR, "l3: host_add(vrf=%d %s -> egr %d): %s", vrf, as, egr_id, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: host vrf=%d %s -> egr %d", vrf, as, egr_id);
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        hwbcm_l3_addr_str(af, addr, as, sizeof(as));
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: host vrf=%d %s -> egr %d", vrf, as, egr_id);
+    }
     return 0;
 }
 
@@ -665,13 +676,16 @@ int hwbcm_l3_host_delete(int vrf, int af, const uint8_t *addr)
     }
 
     rv = bcm_l3_host_delete(U, &h);
-    hwbcm_l3_addr_str(af, addr, as, sizeof(as));
     if (rv < 0) {
+        hwbcm_l3_addr_str(af, addr, as, sizeof(as));
         hwbcm_log(rv == BCM_E_NOT_FOUND ? HWBCM_LOG_WARN : HWBCM_LOG_ERR,
                   "l3: host_delete(vrf=%d %s): %s", vrf, as, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: host vrf=%d %s deleted", vrf, as);
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        hwbcm_l3_addr_str(af, addr, as, sizeof(as));
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: host vrf=%d %s deleted", vrf, as);
+    }
     return 0;
 }
 
@@ -734,14 +748,17 @@ int hwbcm_l3_route_add(int vrf, int af, const uint8_t *prefix, int prefix_len, i
         r.l3a_flags |= BCM_L3_REPLACE;
         rv = bcm_l3_route_add(U, &r);
     }
-    hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
     if (rv < 0) {
+        hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
         hwbcm_log(HWBCM_LOG_ERR, "l3: route_add(vrf=%d %s/%d -> %d%s): %s", vrf, as, prefix_len,
                   egr_id, (r.l3a_flags & BCM_L3_MULTIPATH) ? " ecmp" : "", bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: route vrf=%d %s/%d -> %d%s", vrf, as, prefix_len,
-              egr_id, (r.l3a_flags & BCM_L3_MULTIPATH) ? " ecmp" : "");
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: route vrf=%d %s/%d -> %d%s", vrf, as, prefix_len,
+                  egr_id, (r.l3a_flags & BCM_L3_MULTIPATH) ? " ecmp" : "");
+    }
     return 0;
 }
 
@@ -760,13 +777,16 @@ int hwbcm_l3_route_delete(int vrf, int af, const uint8_t *prefix, int prefix_len
     }
 
     rv = bcm_l3_route_delete(U, &r);
-    hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
     if (rv < 0) {
+        hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
         hwbcm_log(rv == BCM_E_NOT_FOUND ? HWBCM_LOG_WARN : HWBCM_LOG_ERR,
                   "l3: route_delete(vrf=%d %s/%d): %s", vrf, as, prefix_len, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "l3: route vrf=%d %s/%d deleted", vrf, as, prefix_len);
+    if (hwbcm_log_enabled(HWBCM_LOG_DEBUG)) {
+        hwbcm_l3_addr_str(af, prefix, as, sizeof(as));
+        hwbcm_log(HWBCM_LOG_DEBUG, "l3: route vrf=%d %s/%d deleted", vrf, as, prefix_len);
+    }
     return 0;
 }
 
@@ -788,7 +808,7 @@ int hwbcm_l3_vrf_create(int *vrf)
         if (!(s_vrf_used[i / 8] & (uint8_t)(1u << (i % 8)))) {
             s_vrf_used[i / 8] |= (uint8_t)(1u << (i % 8));
             *vrf = i;
-            hwbcm_log(HWBCM_LOG_INFO, "l3: vrf %d allocated", i);
+            hwbcm_log(HWBCM_LOG_DEBUG, "l3: vrf %d allocated", i);
             return 0;
         }
     }
@@ -802,7 +822,7 @@ int hwbcm_l3_vrf_destroy(int vrf)
         return (vrf == 0) ? 0 : BCM_E_PARAM;
     }
     s_vrf_used[vrf / 8] &= (uint8_t)~(1u << (vrf % 8));
-    hwbcm_log(HWBCM_LOG_INFO, "l3: vrf %d released", vrf);
+    hwbcm_log(HWBCM_LOG_DEBUG, "l3: vrf %d released", vrf);
     return 0;
 }
 

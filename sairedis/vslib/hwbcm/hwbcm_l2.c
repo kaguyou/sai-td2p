@@ -74,7 +74,7 @@ static int vlan_stg_forward(int vid, int only_port)
             n++;
         }
     }
-    HWBCM_LOGI("vlan %d: stg %d, stp forward on %d ports", vid, (int)stg, n);
+    HWBCM_LOGD("vlan %d: stg %d, stp forward on %d ports", vid, (int)stg, n);
     return 0;
 }
 
@@ -123,7 +123,7 @@ int hwbcm_vlan_create(int vid)
         HWBCM_LOGE("bcm_vlan_create(%d): %s", vid, bcm_errmsg(rv));
         return rv;
     }
-    HWBCM_LOGI("vlan %d created", vid);
+    HWBCM_LOGD("vlan %d created", vid);
     rv = vlan_stg_forward(vid, -1);
     if (BCM_FAILURE(rv)) {
         HWBCM_LOGE("vlan %d: vlan_stg_forward failed: %s (%d), rolling back", vid, bcm_errmsg(rv), rv);
@@ -155,7 +155,7 @@ int hwbcm_vlan_destroy(int vid)
         HWBCM_LOGE("bcm_vlan_destroy(%d): %s", vid, bcm_errmsg(rv));
         return rv;
     }
-    HWBCM_LOGI("vlan %d destroyed", vid);
+    HWBCM_LOGD("vlan %d destroyed", vid);
     return 0;
 }
 
@@ -182,7 +182,7 @@ int hwbcm_vlan_port_add(int vid, int port, int tagged)
             return rv;
         }
     }
-    HWBCM_LOGI("vlan %d: port %d added %s", vid, port, tagged ? "tagged" : "untagged");
+    HWBCM_LOGD("vlan %d: port %d added %s", vid, port, tagged ? "tagged" : "untagged");
     return 0;
 }
 
@@ -200,7 +200,7 @@ int hwbcm_vlan_port_remove(int vid, int port)
     BCM_PBMP_CLEAR(pbmp);
     BCM_PBMP_PORT_ADD(pbmp, port);
     HWBCM_CHECK("bcm_vlan_port_remove", bcm_vlan_port_remove(HWBCM_UNIT, (bcm_vlan_t)vid, pbmp));
-    HWBCM_LOGI("vlan %d: port %d removed", vid, port);
+    HWBCM_LOGD("vlan %d: port %d removed", vid, port);
     return 0;
 }
 
@@ -344,7 +344,7 @@ int hwbcm_l2_flush_port(int port)
         return BCM_E_PORT;
     }
     HWBCM_CHECK("bcm_l2_addr_delete_by_port", bcm_l2_addr_delete_by_port(HWBCM_UNIT, -1, port, 0));
-    HWBCM_LOGI("l2 flush port %d", port);
+    HWBCM_LOGD("l2 flush port %d", port);
     return 0;
 }
 
@@ -355,7 +355,7 @@ int hwbcm_l2_flush_vlan_port(int vid, int port)
     }
     HWBCM_CHECK("bcm_l2_addr_delete_by_vlan_port",
                 bcm_l2_addr_delete_by_vlan_port(HWBCM_UNIT, (bcm_vlan_t)vid, -1, port, 0));
-    HWBCM_LOGI("l2 flush vlan %d port %d", vid, port);
+    HWBCM_LOGD("l2 flush vlan %d port %d", vid, port);
     return 0;
 }
 
@@ -365,7 +365,7 @@ int hwbcm_l2_flush_vlan(int vid)
         return BCM_E_PARAM;
     }
     HWBCM_CHECK("bcm_l2_addr_delete_by_vlan", bcm_l2_addr_delete_by_vlan(HWBCM_UNIT, (bcm_vlan_t)vid, 0));
-    HWBCM_LOGI("l2 flush vlan %d", vid);
+    HWBCM_LOGD("l2 flush vlan %d", vid);
     return 0;
 }
 
@@ -375,7 +375,7 @@ int hwbcm_l2_flush_trunk(int trunk_id)
         return BCM_E_PARAM;
     }
     HWBCM_CHECK("bcm_l2_addr_delete_by_trunk", bcm_l2_addr_delete_by_trunk(HWBCM_UNIT, (bcm_trunk_t)trunk_id, 0));
-    HWBCM_LOGI("l2 flush trunk %d", trunk_id);
+    HWBCM_LOGD("l2 flush trunk %d", trunk_id);
     return 0;
 }
 
@@ -524,7 +524,7 @@ int hwbcm_trunk_create(int *trunk_id)
     }
 
     *trunk_id = (int)tid;
-    HWBCM_LOGI("trunk %d created", (int)tid);
+    HWBCM_LOGD("trunk %d created", (int)tid);
     return 0;
 }
 
@@ -544,7 +544,7 @@ int hwbcm_trunk_destroy(int trunk_id)
         HWBCM_LOGE("bcm_trunk_destroy(%d): %s", trunk_id, bcm_errmsg(rv));
         return rv;
     }
-    HWBCM_LOGI("trunk %d destroyed", trunk_id);
+    HWBCM_LOGD("trunk %d destroyed", trunk_id);
     return 0;
 }
 
@@ -576,6 +576,6 @@ int hwbcm_trunk_member_set(int trunk_id, const int *ports, int nports)
     info.ipmc_index = BCM_TRUNK_UNSPEC_INDEX;
     HWBCM_CHECK("bcm_trunk_set",
                 bcm_trunk_set(HWBCM_UNIT, (bcm_trunk_t)trunk_id, &info, nports, nports ? members : NULL));
-    HWBCM_LOGI("trunk %d: %d members", trunk_id, nports);
+    HWBCM_LOGD("trunk %d: %d members", trunk_id, nports);
     return 0;
 }

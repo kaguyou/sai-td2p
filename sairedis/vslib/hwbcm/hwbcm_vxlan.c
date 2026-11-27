@@ -344,7 +344,7 @@ static int hwbcm_vxlan_vpn_create_locked(uint32_t vni, int vid, int *vpn_id)
     }
 
     *vpn_id = (int)cfg.vpn;
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x created for vni %u (vlan %d), flood group 0x%x",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vpn 0x%x created for vni %u (vlan %d), flood group 0x%x",
               cfg.vpn, vni, vid, group);
     return BCM_E_NONE;
 }
@@ -429,7 +429,7 @@ static int hwbcm_vxlan_vpn_destroy_locked(int vpn_id)
         }
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x destroyed", vpn_id);
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vpn 0x%x destroyed", vpn_id);
     return BCM_E_NONE;
 }
 
@@ -530,7 +530,7 @@ int hwbcm_vxlan_tunnel_create2(const uint8_t src_ip[4], const uint8_t dst_ip[4],
 
     *tunnel_init_id = (int)init.tunnel_id;
     *tunnel_term_id = (int)term.tunnel_id;
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: tunnel %u.%u.%u.%u -> %u.%u.%u.%u init 0x%x term 0x%x ttl %d dscp %d",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: tunnel %u.%u.%u.%u -> %u.%u.%u.%u init 0x%x term 0x%x ttl %d dscp %d",
               src_ip[0], src_ip[1], src_ip[2], src_ip[3], dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3],
               init.tunnel_id, term.tunnel_id, ttl, dscp);
     return BCM_E_NONE;
@@ -699,7 +699,7 @@ int hwbcm_vxlan_egress_is_stale(int l3_egr_or_ecmp_id, int vxlan_egr_id, int *st
     }
 
     if (*stale) {
-        hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vxlan egress %d is stale w.r.t. source %d", vxlan_egr_id, l3_egr_or_ecmp_id);
+        hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vxlan egress %d is stale w.r.t. source %d", vxlan_egr_id, l3_egr_or_ecmp_id);
     }
     return BCM_E_NONE;
 }
@@ -754,7 +754,7 @@ static int hwbcm_vxlan_egress_from_l3_impl(int l3_egr_or_ecmp_id, int ipmc, int 
     if (port != NULL) {
         *port = (src.flags & BCM_L3_TGID) ? -1 : hwbcm_vxlan_port_of_gport(src.port);
     }
-    hwbcm_log(HWBCM_LOG_INFO,
+    hwbcm_log(HWBCM_LOG_DEBUG,
               "hwbcm_vxlan: vxlan %segress %d cloned from %d (intf %d, mac %02x:%02x:%02x:%02x:%02x:%02x, port 0x%x)",
               ipmc ? "ipmc " : "", id, l3_egr_or_ecmp_id, src.intf, src.mac_addr[0], src.mac_addr[1], src.mac_addr[2],
               src.mac_addr[3], src.mac_addr[4], src.mac_addr[5], src.port);
@@ -804,7 +804,7 @@ int hwbcm_vxlan_port_network_enable(int port, int enable)
     if (BCM_FAILURE(rv)) {
         hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcmPortControlVxlanTunnelbasedVnId(port %d): %s", port, bcm_errmsg(rv));
     }
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: port %d VXLAN termination %s", port, enable ? "enabled" : "disabled");
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: port %d VXLAN termination %s", port, enable ? "enabled" : "disabled");
     return BCM_E_NONE;
 }
 
@@ -863,7 +863,7 @@ static int hwbcm_vxlan_vfi_member_set(int vpn_id, int port_gport, int add)
                   add ? "add" : "delete", vpn_id, port_gport, bcm_errmsg(rv));
         return rv;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: gport 0x%x %s VFI membership of vpn 0x%x",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: gport 0x%x %s VFI membership of vpn 0x%x",
               port_gport, add ? "added to" : "removed from", vpn_id);
     return BCM_E_NONE;
 }
@@ -1026,7 +1026,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
                       "hwbcm_vxlan: bcm_port_vlan_member_set(vp 0x%x, flags 0x%x): %s",
                       vxp.vxlan_port_id, efl, bcm_errmsg(rv));
         } else {
-            hwbcm_log(HWBCM_LOG_INFO,
+            hwbcm_log(HWBCM_LOG_DEBUG,
                       "hwbcm_vxlan: network vp 0x%x egress filter mode 3 (VP_DO_NOT_CHECK) enabled",
                       vxp.vxlan_port_id);
         }
@@ -1087,7 +1087,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
                           uvid, vxp.vxlan_port_id, untagged ? "untagged" : "tagged", bcm_errmsg(rv));
             } else {
                 s_vp[vp].uvid = uvid;
-                hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x joined underlay vlan %d (%s, STP_FORWARD)",
+                hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: network vp 0x%x joined underlay vlan %d (%s, STP_FORWARD)",
                           vxp.vxlan_port_id, uvid, untagged ? "untagged" : "tagged");
 #if HWBCM_VXLAN_VP_EFILTER
                 /* Now that (vp, vlan) exists with SP_TREE=3, turn on the egress
@@ -1103,7 +1103,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
                                   "hwbcm_vxlan: bcm_port_vlan_member_set(vp 0x%x, flags 0x%x): %s",
                                   vxp.vxlan_port_id, efl, bcm_errmsg(rv));
                     } else {
-                        hwbcm_log(HWBCM_LOG_INFO,
+                        hwbcm_log(HWBCM_LOG_DEBUG,
                                   "hwbcm_vxlan: network vp 0x%x egress filter mode %d enabled",
                                   vxp.vxlan_port_id, HWBCM_VXLAN_VP_EFILTER);
                     }
@@ -1125,7 +1125,7 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
 
     hwbcm_vxlan_vp_l3_apply(vpn_id, (int)vxp.vxlan_port_id);
     *vp_id = (int)vxp.vxlan_port_id;
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: network vp 0x%x (vp %d) in vpn 0x%x, port %d, egress %d, init 0x%x term 0x%x",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: network vp 0x%x (vp %d) in vpn 0x%x, port %d, egress %d, init 0x%x term 0x%x",
               vxp.vxlan_port_id, vp, vpn_id, port, l3_egr_id, tunnel_init_id, tunnel_term_id);
     return BCM_E_NONE;
 }
@@ -1296,7 +1296,7 @@ static int hwbcm_vxlan_access_port_add2_locked(int vpn_id, int port, int trunk_i
 
     hwbcm_vxlan_vp_l3_apply(vpn_id, (int)vxp.vxlan_port_id);
     *vp_id = (int)vxp.vxlan_port_id;
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: access vp 0x%x (vp %d) vpn 0x%x port %d trunk %d vlan %d %s",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: access vp 0x%x (vp %d) vpn 0x%x port %d trunk %d vlan %d %s",
               vxp.vxlan_port_id, vp, vpn_id, port, trunk_id, vid, tagged ? "tagged" : "untagged");
     return BCM_E_NONE;
 }
@@ -1368,7 +1368,7 @@ static int hwbcm_vxlan_port_delete_locked(int vpn_id, int vp_id)
         memset(&s_vp[vp], 0, sizeof(s_vp[vp]));
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vp 0x%x deleted (vpn 0x%x)", vp_id, vpn);
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vp 0x%x deleted (vpn 0x%x)", vp_id, vpn);
     return rv2;
 }
 
@@ -1648,7 +1648,7 @@ static int hwbcm_vxlan_vpn_l3_bind_locked(int vpn_id, const uint8_t mac[6], int 
     hwbcm_vxlan_vpn_vps_l3_set(vpn_id, 1);
 
     *ovl_intf_id = (int)intf.l3a_intf_id;
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x L3 bound: overlay intf %d vrf %d", vpn_id, *ovl_intf_id, vrf);
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vpn 0x%x L3 bound: overlay intf %d vrf %d", vpn_id, *ovl_intf_id, vrf);
     return BCM_E_NONE;
 }
 
@@ -1686,7 +1686,7 @@ static int hwbcm_vxlan_vpn_l3_unbind_locked(int vpn_id)
     if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
         hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: vpn 0x%x intf_delete(%d): %s", vpn_id, s_vpn_l3[vfi].ovl_intf, bcm_errmsg(rv));
     }
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: vpn 0x%x L3 unbound (overlay intf %d)", vpn_id, s_vpn_l3[vfi].ovl_intf);
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: vpn 0x%x L3 unbound (overlay intf %d)", vpn_id, s_vpn_l3[vfi].ovl_intf);
     memset(&s_vpn_l3[vfi], 0, sizeof(s_vpn_l3[vfi]));
     return BCM_E_NONE;
 }
@@ -1734,7 +1734,7 @@ static int hwbcm_vxlan_overlay_egress_do(uint32 flags, int egr_id, int ovl_intf_
     if (out_id != NULL) {
         *out_id = (int)id;
     }
-    hwbcm_log(HWBCM_LOG_INFO, "hwbcm_vxlan: overlay egress %d %s (intf %d vp 0x%x %02x:%02x:%02x:%02x:%02x:%02x)",
+    hwbcm_log(HWBCM_LOG_DEBUG, "hwbcm_vxlan: overlay egress %d %s (intf %d vp 0x%x %02x:%02x:%02x:%02x:%02x:%02x)",
               (int)id, (flags & BCM_L3_REPLACE) ? "replaced" : "created", ovl_intf_id, vp_gport,
               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return BCM_E_NONE;

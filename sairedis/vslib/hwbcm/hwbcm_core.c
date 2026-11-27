@@ -101,6 +101,11 @@ void hwbcm_log_level_set(hwbcm_log_level_t level)
     g_log_level = level;
 }
 
+int hwbcm_log_enabled(hwbcm_log_level_t level)
+{
+    return (level <= g_log_level) ? 1 : 0;
+}
+
 void hwbcm_log(hwbcm_log_level_t level, const char *fmt, ...)
 {
     static const char *tag[] = { "ERR", "WARN", "INFO", "DEBUG" };

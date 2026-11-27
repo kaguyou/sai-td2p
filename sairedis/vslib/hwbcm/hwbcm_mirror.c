@@ -213,7 +213,7 @@ int hwbcm_mirror_dest_create(const hwbcm_mirror_dest_cfg_t *cfg, int *dest_gport
 
     *dest_gport = (int)mdest.mirror_dest_id;
 
-    hwbcm_log(HWBCM_LOG_INFO,
+    hwbcm_log(HWBCM_LOG_DEBUG,
               "mirror: created %s dest 0x%x -> %s %d (vlan=%u tc=%d)",
               type_name(cfg->type), (unsigned)*dest_gport,
               cfg->trunk_id >= 0 ? "trunk" : "port",
@@ -248,7 +248,7 @@ int hwbcm_mirror_dest_replace(int dest_gport, const hwbcm_mirror_dest_cfg_t *cfg
         return rv;
     }
 
-    hwbcm_log(HWBCM_LOG_INFO,
+    hwbcm_log(HWBCM_LOG_DEBUG,
               "mirror: replaced %s dest 0x%x -> %s %d (vlan=%u tc=%d)",
               type_name(cfg->type), (unsigned)dest_gport,
               cfg->trunk_id >= 0 ? "trunk" : "port",
@@ -274,7 +274,7 @@ int hwbcm_mirror_dest_destroy(int dest_gport)
         return rv;
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "mirror: destroyed dest 0x%x", (unsigned)dest_gport);
+    hwbcm_log(HWBCM_LOG_DEBUG, "mirror: destroyed dest 0x%x", (unsigned)dest_gport);
     return 0;
 }
 
@@ -293,7 +293,7 @@ int hwbcm_mirror_port_add(int port, uint32_t dir, int dest_gport)
 
     rv = bcm_mirror_port_dest_add(U, (bcm_port_t)port, flags, (bcm_gport_t)dest_gport);
     if (rv == BCM_E_EXISTS) {
-        hwbcm_log(HWBCM_LOG_INFO,
+        hwbcm_log(HWBCM_LOG_DEBUG,
                   "mirror: port %d dir 0x%x already bound to dest 0x%x",
                   port, (unsigned)dir, (unsigned)dest_gport);
         return 0;
@@ -305,7 +305,7 @@ int hwbcm_mirror_port_add(int port, uint32_t dir, int dest_gport)
         return rv;
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "mirror: port %d dir 0x%x += dest 0x%x",
+    hwbcm_log(HWBCM_LOG_DEBUG, "mirror: port %d dir 0x%x += dest 0x%x",
               port, (unsigned)dir, (unsigned)dest_gport);
     return 0;
 }
@@ -333,7 +333,7 @@ int hwbcm_mirror_port_delete(int port, uint32_t dir, int dest_gport)
         return rv;
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "mirror: port %d dir 0x%x -= dest 0x%x",
+    hwbcm_log(HWBCM_LOG_DEBUG, "mirror: port %d dir 0x%x -= dest 0x%x",
               port, (unsigned)dir, (unsigned)dest_gport);
     return 0;
 }
@@ -355,7 +355,7 @@ int hwbcm_mirror_port_delete_all(int port, uint32_t dir)
         return rv;
     }
 
-    hwbcm_log(HWBCM_LOG_INFO, "mirror: port %d dir 0x%x cleared all mirror dests",
+    hwbcm_log(HWBCM_LOG_DEBUG, "mirror: port %d dir 0x%x cleared all mirror dests",
               port, (unsigned)dir);
     return 0;
 }

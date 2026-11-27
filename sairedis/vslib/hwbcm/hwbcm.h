@@ -54,6 +54,7 @@ typedef enum {
 } hwbcm_log_level_t;
 
 void hwbcm_log_level_set(hwbcm_log_level_t level);
+int hwbcm_log_enabled(hwbcm_log_level_t level);
 void hwbcm_log(hwbcm_log_level_t level, const char *fmt, ...);
 
 /*
