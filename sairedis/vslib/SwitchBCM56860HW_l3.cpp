@@ -1772,6 +1772,11 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
         eraseNeighborIndexes();
     }
 
+    if (m_hwReady)
+    {
+        hwVxlanRetryPendingForNeighbor(ne.ip_address, egr);
+    }
+
     return SAI_STATUS_SUCCESS;
 }
 
@@ -2052,6 +2057,11 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
         m_ecmpToNhg[ecmp] = nhg;
 
         SWSS_LOG_NOTICE("next hop group %s -> ecmp %d (%zu members)", sai_serialize_object_id(nhg).c_str(), ecmp, egrs.size());
+
+        if (m_hwReady)
+        {
+            hwVxlanRetryPendingForEcmp(ecmp);
+        }
     }
     else
     {
@@ -2068,6 +2078,11 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHopGroupMember(
         }
 
         SWSS_LOG_NOTICE("next hop group %s ecmp %d now %zu members", sai_serialize_object_id(nhg).c_str(), eit->second, egrs.size());
+
+        if (m_hwReady)
+        {
+            hwVxlanRetryPendingForEcmp(eit->second);
+        }
     }
 
     return SAI_STATUS_SUCCESS;
@@ -2160,6 +2175,11 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHopGroupMember(
             sai_serialize_object_id(nhg).c_str(), eit->second,
             empty ? (size_t)0 : egrs.size(),
             empty ? " (drop)" : "");
+
+    if (m_hwReady)
+    {
+        hwVxlanRetryPendingForEcmp(eit->second);
+    }
 
     return SAI_STATUS_SUCCESS;
 }
@@ -2424,6 +2444,10 @@ sai_status_t SwitchBCM56860HW::hwRemoveRoute(
     if (af == 4)
     {
         v4RouteIndexRemove(vrf, re.destination.addr.ip4, len);
+        if (m_hwReady)
+        {
+            hwVxlanRetryPendingForRoute(re.destination);
+        }
     }
 
     return SAI_STATUS_SUCCESS;

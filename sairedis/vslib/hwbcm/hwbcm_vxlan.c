@@ -818,6 +818,64 @@ static int hwbcm_vxlan_access_port_prepare(int port)
     return BCM_E_NONE;
 }
 
+static int hwbcm_vxlan_trunk_members_prepare(int trunk_id, int is_network)
+{
+    bcm_trunk_member_t members[64];
+    bcm_trunk_info_t tinfo;
+    int n = 0, i, rv;
+
+    bcm_trunk_info_t_init(&tinfo);
+    rv = bcm_trunk_get(U, (bcm_trunk_t)trunk_id, &tinfo, 64, members, &n);
+    if (BCM_FAILURE(rv)) {
+        hwbcm_log(HWBCM_LOG_WARN, "hwbcm_vxlan: bcm_trunk_get(%d) for %s prep: %s",
+                  trunk_id, is_network ? "network" : "access", bcm_errmsg(rv));
+        return rv;
+    }
+    for (i = 0; i < n; i++) {
+        int mp = hwbcm_vxlan_port_of_gport(members[i].gport);
+        if (mp < 0) {
+            continue;
+        }
+        rv = is_network ? hwbcm_vxlan_port_network_enable(mp, 1)
+                        : hwbcm_vxlan_access_port_prepare(mp);
+        if (BCM_FAILURE(rv)) {
+            return rv;
+        }
+    }
+    return BCM_E_NONE;
+}
+
+int hwbcm_vxlan_trunk_member_sync(int trunk_id, int port)
+{
+    bcm_gport_t tgport = 0;
+    int i, need_net = 0, need_acc = 0, rv = BCM_E_NONE;
+
+    if (trunk_id < 0 || port < 0) {
+        return BCM_E_NONE;
+    }
+    BCM_GPORT_TRUNK_SET(tgport, trunk_id);
+
+    vxlan_lock();
+    for (i = 0; i < HWBCM_VXLAN_MAX_VP; i++) {
+        if (!s_vp[i].in_use || s_vp[i].port_gport != (int)tgport) {
+            continue;
+        }
+        if (s_vp[i].is_network) {
+            need_net = 1;
+        } else {
+            need_acc = 1;
+        }
+    }
+    if (need_net) {
+        rv = hwbcm_vxlan_port_network_enable(port, 1);
+    }
+    if (BCM_SUCCESS(rv) && need_acc) {
+        rv = hwbcm_vxlan_access_port_prepare(port);
+    }
+    vxlan_unlock();
+    return rv;
+}
+
 /* ------------------------------------------------------------------------ */
 /* flood groups                                                             */
 /* ------------------------------------------------------------------------ */
@@ -954,6 +1012,10 @@ static int hwbcm_vxlan_network_port_add_impl(int vpn_id, int tunnel_init_id, int
     }
     if (egr.flags & BCM_L3_TGID) {
         BCM_GPORT_TRUNK_SET(gport, egr.trunk);
+        rv = hwbcm_vxlan_trunk_members_prepare((int)egr.trunk, 1);
+        if (BCM_FAILURE(rv)) {
+            return rv;
+        }
     } else {
         port = hwbcm_vxlan_port_of_gport(egr.port);
         if (port < 0) {
@@ -1213,6 +1275,11 @@ static int hwbcm_vxlan_access_port_add2_locked(int vpn_id, int port, int trunk_i
 
     if (trunk_id < 0) {
         rv = hwbcm_vxlan_access_port_prepare(port);
+        if (BCM_FAILURE(rv)) {
+            return rv;
+        }
+    } else {
+        rv = hwbcm_vxlan_trunk_members_prepare(trunk_id, 0);
         if (BCM_FAILURE(rv)) {
             return rv;
         }

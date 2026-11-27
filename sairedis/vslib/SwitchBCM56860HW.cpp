@@ -3066,6 +3066,20 @@ void SwitchBCM56860HW::syncLagMemberPort(
                     sai_serialize_object_id(lag_id).c_str(), bcm, vid, add ? "added" : "removed");
         }
     }
+
+    if (add)
+    {
+        int tid = trunkOf(lag_id);
+        if (tid >= 0)
+        {
+            int vrv = hwbcm_vxlan_trunk_member_sync(tid, bcm);
+            if (vrv < 0)
+            {
+                SWSS_LOG_WARN("lag %s member bcm port %d: hwbcm_vxlan_trunk_member_sync(trunk %d) failed: %d",
+                        sai_serialize_object_id(lag_id).c_str(), bcm, tid, vrv);
+            }
+        }
+    }
 }
 
 sai_status_t SwitchBCM56860HW::hwRemoveLagMember(

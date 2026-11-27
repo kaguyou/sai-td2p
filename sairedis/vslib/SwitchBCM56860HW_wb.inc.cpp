@@ -1183,6 +1183,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     memset(m_vtepSrcIp4, 0, sizeof(m_vtepSrcIp4));
     m_vtepTtl = 64;
     m_vtepDscp = -1;
+    m_vtepUnderlayVrf = 0;
     m_vniToVpn.clear();
     m_vpnAccessVps.clear();
     m_tunnelInit.clear();
@@ -2418,11 +2419,13 @@ void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
     m_bridgeToVpn.clear();
     m_bridgePortRemoteIp.clear();
     m_bridgePortToVp.clear();
+    m_vtepUnderlayVrf = 0;
     for (auto &kv : m_vtepByIp)
     {
         kv.second.tunnels.clear();
         kv.second.bridgePorts.clear();
         kv.second.macs.clear();
+        kv.second.underlayVrf = -1;
     }
 
     // 1. Tunnel maps
@@ -2510,6 +2513,11 @@ void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
                        getStoredAttr(SAI_OBJECT_TYPE_TUNNEL, tid, SAI_TUNNEL_ATTR_ENCAP_DST_IP, dstAttr);
             if (!p2p)
             {
+                sai_attribute_t ulAttr;
+                if (getStoredAttr(SAI_OBJECT_TYPE_TUNNEL, tid, SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE, ulAttr))
+                {
+                    m_vtepUnderlayVrf = vxlanVrfOfUnderlayRif(ulAttr.value.oid);
+                }
                 if (m_vtepTunnel == SAI_NULL_OBJECT_ID)
                 {
                     m_vtepTunnel = tid;
@@ -2550,6 +2558,11 @@ void SwitchBCM56860HW::hwWarmRebuildVxlanFromHash()
             {
                 m_tunnelRemoteIp[tid] = key;
                 vt->second.tunnels.insert(tid);
+                sai_attribute_t ulAttr;
+                if (getStoredAttr(SAI_OBJECT_TYPE_TUNNEL, tid, SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE, ulAttr))
+                {
+                    vt->second.underlayVrf = vxlanVrfOfUnderlayRif(ulAttr.value.oid);
+                }
             }
         }
     }
@@ -3200,6 +3213,7 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     memset(m_vtepSrcIp4, 0, sizeof(m_vtepSrcIp4));
     m_vtepTtl = 64;
     m_vtepDscp = -1;
+    m_vtepUnderlayVrf = 0;
     m_vxlanInited = false;
     m_vxlanStationId = -1;
     m_tunnelMapType.clear();

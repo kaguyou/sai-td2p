@@ -140,7 +140,31 @@ sai_status_t SwitchBCM56860HW::vxlanEnsureInit()
     return SAI_STATUS_SUCCESS;
 }
 
+int SwitchBCM56860HW::vxlanVrfOfUnderlayRif(
+        _In_ sai_object_id_t rifOid)
+{
+    if (rifOid == SAI_NULL_OBJECT_ID)
+    {
+        return 0;
+    }
+
+    sai_attribute_t vrAttr;
+    if (!getStoredAttr(SAI_OBJECT_TYPE_ROUTER_INTERFACE, rifOid, SAI_ROUTER_INTERFACE_ATTR_VIRTUAL_ROUTER_ID, vrAttr))
+    {
+        return 0;
+    }
+
+    auto vrit = m_vrToVrf.find(vrAttr.value.oid);
+    if (vrit != m_vrToVrf.end())
+    {
+        return vrit->second;
+    }
+
+    return 0;
+}
+
 int SwitchBCM56860HW::vxlanResolveUnderlayEgress(
+        _In_ int vrf,
         _In_ const uint8_t ip4[4])
 {
     SWSS_LOG_ENTER();
@@ -149,33 +173,20 @@ int SwitchBCM56860HW::vxlanResolveUnderlayEgress(
 
     memcpy(&ip, ip4, 4); // network byte order, same as sai_ip4_t
 
-    // Collect active VRFs (always include default VRF 0; small set).
-    std::vector<int> vrfs;
-    vrfs.push_back(0);
-    for (const auto &kv: m_vrToVrf)
-    {
-        if (kv.second != 0)
-        {
-            vrfs.push_back(kv.second);
-        }
-    }
-
-    // 1. directly connected neighbor (O(1) exact match via m_v4NeighborsByVrfIp)
-    for (int vrf: vrfs)
+    // 1. directly connected neighbor in the tunnel's underlay VRF (O(1))
     {
         uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(ip);
         auto it = m_v4NeighborsByVrfIp.find(key);
         if (it != m_v4NeighborsByVrfIp.end() && !it->second.empty())
         {
             int egr = it->second.front().second;
-            SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u is a direct neighbor, egress %d",
-                    ip4[0], ip4[1], ip4[2], ip4[3], egr);
+            SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u (vrf %d) is a direct neighbor, egress %d",
+                    ip4[0], ip4[1], ip4[2], ip4[3], vrf, egr);
             return egr;
         }
     }
 
-    // 2. longest prefix match via m_v4RoutesByVrfLen (O(1): at most 33 lookups,
-    //    skipping empty prefix lengths using m_v4RouteLenMask)
+    // 2. longest prefix match in the tunnel's underlay VRF (O(1): at most 33 lookups)
     for (int len = 32; len >= 0; len--)
     {
         if (!(m_v4RouteLenMask & (1ULL << len)))
@@ -187,21 +198,18 @@ int SwitchBCM56860HW::vxlanResolveUnderlayEgress(
         uint32_t masked = ip & mask;
         const auto &tbl = m_v4RoutesByVrfLen[len];
 
-        for (int vrf: vrfs)
+        uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(masked);
+        auto it = tbl.find(key);
+        if (it != tbl.end())
         {
-            uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(vrf)) << 32) | static_cast<uint64_t>(masked);
-            auto it = tbl.find(key);
-            if (it != tbl.end())
-            {
-                SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u reached via route (/%d), egress/ecmp %d",
-                        ip4[0], ip4[1], ip4[2], ip4[3], len, it->second);
-                return it->second;
-            }
+            SWSS_LOG_INFO("remote VTEP %u.%u.%u.%u (vrf %d) reached via route (/%d), egress/ecmp %d",
+                    ip4[0], ip4[1], ip4[2], ip4[3], vrf, len, it->second);
+            return it->second;
         }
     }
 
-    SWSS_LOG_NOTICE("no neighbor or route toward remote VTEP %u.%u.%u.%u yet",
-            ip4[0], ip4[1], ip4[2], ip4[3]);
+    SWSS_LOG_NOTICE("no neighbor or route toward remote VTEP %u.%u.%u.%u in vrf %d yet",
+            ip4[0], ip4[1], ip4[2], ip4[3], vrf);
 
     return -1;
 }
@@ -312,7 +320,8 @@ bool SwitchBCM56860HW::vxlanTryBringUpVtep(
 
     if (vtep.egr <= 0)
     {
-        int l3 = vxlanResolveUnderlayEgress(vtep.ip4);
+        int uvrf = (vtep.underlayVrf >= 0) ? vtep.underlayVrf : m_vtepUnderlayVrf;
+        int l3 = vxlanResolveUnderlayEgress(uvrf, vtep.ip4);
 
         if (l3 < 0)
         {
@@ -625,13 +634,17 @@ void SwitchBCM56860HW::vxlanCheckVtepUnderlay(
 
     // Already up: the underlay may have changed (A3 rewrites a shared
     // egress in place when a neighbor disappears/returns, or a better
-    // route appeared). Rebuild the network VP when the clone is stale.
-    int l3 = vxlanResolveUnderlayEgress(vtep.ip4);
+    // route appeared, or the underlay route/neighbor/ECMP was removed).
+    int uvrf = (vtep.underlayVrf >= 0) ? vtep.underlayVrf : m_vtepUnderlayVrf;
+    int l3 = vxlanResolveUnderlayEgress(uvrf, vtep.ip4);
     int stale = 0;
 
     if (l3 < 0)
     {
-        return; // nothing better known; keep what we have
+        SWSS_LOG_NOTICE("remote VTEP %s: underlay path lost in vrf %d, tearing down network VP",
+                vtep.ip.c_str(), uvrf);
+        vxlanTearDownVtepVp(vtep);
+        return;
     }
 
     // Compare contents, not ids: A3 may hand out a different egress/ecmp id
@@ -768,6 +781,32 @@ sai_status_t SwitchBCM56860HW::hwVxlanRetryPendingForNextHop(
 
         if (!vtep.vpReady || vtep.srcEgr == egr ||
             (vtep.srcEgr >= 0 && vxlanEcmpContainsEgress(vtep.srcEgr, egr)))
+        {
+            vxlanCheckVtepUnderlay(vtep);
+        }
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t SwitchBCM56860HW::hwVxlanRetryPendingForEcmp(
+        _In_ int ecmpId)
+{
+    if (!m_hwReady || m_vtepByIp.empty())
+    {
+        return SAI_STATUS_SUCCESS;
+    }
+
+    for (auto &kv: m_vtepByIp)
+    {
+        VxlanRemoteVtep &vtep = kv.second;
+
+        if (vtep.bridgePorts.empty())
+        {
+            continue;
+        }
+
+        if (!vtep.vpReady || vtep.srcEgr == ecmpId)
         {
             vxlanCheckVtepUnderlay(vtep);
         }
@@ -1107,6 +1146,7 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnel(
 
     auto *peer = findAttr(attr_count, attr_list, SAI_TUNNEL_ATTR_PEER_MODE);
     auto *dst = findAttr(attr_count, attr_list, SAI_TUNNEL_ATTR_ENCAP_DST_IP);
+    auto *underlayIf = findAttr(attr_count, attr_list, SAI_TUNNEL_ATTR_UNDERLAY_INTERFACE);
 
     bool p2p = (peer != nullptr && peer->value.s32 == SAI_TUNNEL_PEER_MODE_P2P && dst != nullptr);
 
@@ -1123,9 +1163,11 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnel(
 
         m_vtepTtl = ttl;
         m_vtepDscp = dscp;
+        m_vtepUnderlayVrf = (underlayIf != nullptr) ? vxlanVrfOfUnderlayRif(underlayIf->value.oid) : 0;
 
-        SWSS_LOG_NOTICE("local VTEP tunnel %s: src %u.%u.%u.%u ttl %d dscp %d",
-                sai_serialize_object_id(tunnel_id).c_str(), src4[0], src4[1], src4[2], src4[3], ttl, dscp);
+        SWSS_LOG_NOTICE("local VTEP tunnel %s: src %u.%u.%u.%u ttl %d dscp %d underlayVrf %d",
+                sai_serialize_object_id(tunnel_id).c_str(), src4[0], src4[1], src4[2], src4[3],
+                ttl, dscp, m_vtepUnderlayVrf);
 
         return SAI_STATUS_SUCCESS;
     }
@@ -1156,6 +1198,11 @@ sai_status_t SwitchBCM56860HW::hwCreateTunnel(
     {
         vtep.ip = key;
         memcpy(vtep.ip4, dst4, 4);
+    }
+
+    if (underlayIf != nullptr)
+    {
+        vtep.underlayVrf = vxlanVrfOfUnderlayRif(underlayIf->value.oid);
     }
 
     if (vtep.tunnelInit < 0)

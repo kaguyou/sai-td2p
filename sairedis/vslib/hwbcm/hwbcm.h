@@ -592,6 +592,7 @@ int hwbcm_vxlan_station_delete(int station_id);
 /* Enable/disable VXLAN termination on an underlay (network) port
  * (bcmPortControlVxlanEnable). Called automatically by network_port_add. */
 int hwbcm_vxlan_port_network_enable(int port, int enable);
+int hwbcm_vxlan_trunk_member_sync(int trunk_id, int port);
 
 /* Flush all L2 entries of a VPN (remote MACs) — used before VPN destroy. */
 int hwbcm_vxlan_l2_flush_vpn(int vpn_id);

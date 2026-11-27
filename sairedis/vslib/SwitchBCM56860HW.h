@@ -471,6 +471,7 @@ namespace saivs
             sai_status_t hwVxlanRetryPendingForNeighbor(_In_ const sai_ip_address_t &ip, _In_ int egr);
             sai_status_t hwVxlanRetryPendingForRoute(_In_ const sai_ip_prefix_t &pfx);
             sai_status_t hwVxlanRetryPendingForNextHop(_In_ int egr);
+            sai_status_t hwVxlanRetryPendingForEcmp(_In_ int ecmpId);
 
             /* Hook for A2's L2 learn/age callback. MACs learned on a VNI-mapped
              * VLAN come from the SDK as VFI events: vid = VPN id (> 4095) and
@@ -503,6 +504,7 @@ namespace saivs
                 bool vpReady = false;                      /* true once vp holds a live network VP */
                 int vpVpn = -1;                            /* VPN the VP was created in */
                 int port = -1;                             /* underlay bcm port (-1 = trunk) */
+                int underlayVrf = -1;                      /* derived: underlay VRF (-1 = use m_vtepUnderlayVrf) */
                 std::set<sai_object_id_t> tunnels;         /* P2P tunnel oids (normally one) */
                 std::set<sai_object_id_t> bridgePorts;     /* tunnel bridge port oids */
                 std::set<int> floodVpns;                   /* VPNs whose flood group has the VP */
@@ -527,6 +529,7 @@ namespace saivs
             uint8_t m_vtepSrcIp4[4] = {0, 0, 0, 0};
             int m_vtepTtl = 64;
             int m_vtepDscp = -1;                                        /* -1 = copy inner */
+            int m_vtepUnderlayVrf = 0;                                  /* derived: underlay RIF's bcm VRF */
             bool m_vxlanInited = false;
             int m_vxlanStationId = -1;
 
@@ -541,8 +544,9 @@ namespace saivs
             sai_status_t vxlanEnsureInit();
             bool vxlanIp4Of(_In_ const sai_ip_address_t &ip, _Out_ uint8_t out[4]) const;
             bool vxlanEcmpContainsEgress(_In_ int ecmpId, _In_ int egr) const;
+            int vxlanVrfOfUnderlayRif(_In_ sai_object_id_t rifOid);
             void vxlanCheckVtepUnderlay(_Inout_ VxlanRemoteVtep &vtep);
-            int vxlanResolveUnderlayEgress(_In_ const uint8_t ip4[4]);
+            int vxlanResolveUnderlayEgress(_In_ int vrf, _In_ const uint8_t ip4[4]);
             bool vxlanTryBringUpVtep(_Inout_ VxlanRemoteVtep &vtep);
             void vxlanTearDownVtepVp(_Inout_ VxlanRemoteVtep &vtep);
             void vxlanNotifyTunnelOper(_In_ const VxlanRemoteVtep &vtep, _In_ bool up);
