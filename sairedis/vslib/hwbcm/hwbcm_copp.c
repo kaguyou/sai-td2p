@@ -1005,20 +1005,27 @@ static int entry_build(const hwbcm_copp_trap_cfg_t *cfg, const copp_rule_t *r, i
             sid = -1;
         }
         if (sid < 0) {
-            CLOGW("per-entry stats unavailable (%s), CoPP counters disabled", bcm_errmsg(rv));
-            g_have_stats = 0;
+            CLOGW("per-entry stats unavailable (%s)%s",
+                  bcm_errmsg(rv),
+                  rv == BCM_E_UNAVAIL ? ", CoPP counters disabled" : " for this entry");
+            if (rv == BCM_E_UNAVAIL) {
+                g_have_stats = 0;
+            }
         }
     }
     rv = bcm_field_entry_install(HWBCM_UNIT, eid);
     if (BCM_FAILURE(rv) && sid >= 0) {
+        int stat_rv = rv;
         /* counters are a nice-to-have; the meter is not */
         CLOGW("%s rule %d: install with counters failed (%s), retrying without",
-              trap_name(cfg->trap), ridx, bcm_errmsg(rv));
+              trap_name(cfg->trap), ridx, bcm_errmsg(stat_rv));
         (void)bcm_field_entry_stat_detach(HWBCM_UNIT, eid, sid);
         (void)bcm_field_stat_destroy(HWBCM_UNIT, sid);
         sid = -1;
-        g_have_stats = 0;
         rv = bcm_field_entry_install(HWBCM_UNIT, eid);
+        if (BCM_SUCCESS(rv) && stat_rv == BCM_E_UNAVAIL) {
+            g_have_stats = 0;
+        }
     }
     ECHK("entry_install", rv);
     *eid_out = eid;

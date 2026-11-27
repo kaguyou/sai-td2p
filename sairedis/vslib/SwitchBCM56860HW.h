@@ -121,6 +121,8 @@ namespace saivs
             sai_status_t hwCreateHostif(_In_ sai_object_id_t hostif_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwRemoveHostif(_In_ sai_object_id_t hostif_id);
             sai_status_t hwCreateHostifTrap(_In_ sai_object_id_t trap_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
+            static int hwTrapReasonOf(_In_ int32_t saiTrapType);
+            sai_status_t hwReconcileTrapReason(_In_ int reason, _In_ sai_object_id_t excludeTrapId);
 
             sai_status_t hwCreateVlan(_In_ sai_object_id_t vlan_id, _In_ uint32_t attr_count, _In_ const sai_attribute_t *attr_list);
             sai_status_t hwRemoveVlan(_In_ sai_object_id_t vlan_id);

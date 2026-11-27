@@ -295,17 +295,29 @@ int hwbcm_knet_netif_destroy(int netif_id);
 int hwbcm_knet_cpu_netif_create(const char *name, const uint8_t mac[6], int *netif_id);
 
 /* Trap-to-CPU policy for well-known protocols (ARP, LLDP, LACP, BGP/IP2ME ...).
- * reason: one of HWBCM_TRAP_*; action: 0 drop, 1 copy to cpu, 2 trap (cpu only). */
-#define HWBCM_TRAP_ARP      1
-#define HWBCM_TRAP_LLDP     2
-#define HWBCM_TRAP_LACP     3
-#define HWBCM_TRAP_IP2ME    4
-#define HWBCM_TRAP_DHCP     5
-#define HWBCM_TRAP_BGP      6
-#define HWBCM_TRAP_TTL_ERR  7
+ * reason: one of HWBCM_TRAP_*; action: 0 drop, 1 copy to cpu, 2 trap (cpu only),
+ * 3 forward/default (disable CPU steering and drop). */
+#define HWBCM_TRAP_ACTION_DROP    0
+#define HWBCM_TRAP_ACTION_COPY    1
+#define HWBCM_TRAP_ACTION_TRAP    2
+#define HWBCM_TRAP_ACTION_FORWARD 3
+
+#define HWBCM_TRAP_ARP        1   /* legacy combined ARP/ND (kept for .hwstate compat) */
+#define HWBCM_TRAP_LLDP       2
+#define HWBCM_TRAP_LACP       3
+#define HWBCM_TRAP_IP2ME      4
+#define HWBCM_TRAP_DHCP       5
+#define HWBCM_TRAP_BGP        6
+#define HWBCM_TRAP_TTL_ERR    7
 #define HWBCM_TRAP_NEIGH_MISS 8
-#define HWBCM_TRAP_UDLD     9
-#define HWBCM_TRAP_STP      10
+#define HWBCM_TRAP_UDLD       9
+#define HWBCM_TRAP_STP        10
+#define HWBCM_TRAP_ARP_REQ    11
+#define HWBCM_TRAP_ARP_RESP   12
+#define HWBCM_TRAP_IPV6_ND    13
+#define HWBCM_TRAP_PVRST      14
+#define HWBCM_TRAP_L3_MTU_ERR 15
+#define HWBCM_TRAP_MAX        15
 int hwbcm_trap_set(int reason, int action, int priority_queue);
 
 /* Run a diag-shell command (debug aid; output goes to the SDK console/log). */
@@ -460,7 +472,7 @@ typedef struct {
     int ip2me_station_id;
     int ip2me_vfi_station_id;
     int ip2me_wanted;
-    int trap_l2cache_idx[HWBCM_TRAP_STP + 1];
+    int trap_l2cache_idx[HWBCM_TRAP_MAX + 1];
 } hwbcm_core_wb_state_t;
 
 void hwbcm_core_wb_get(hwbcm_core_wb_state_t *out);

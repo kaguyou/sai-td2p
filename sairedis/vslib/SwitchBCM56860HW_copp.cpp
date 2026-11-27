@@ -17,8 +17,8 @@
  * creates the group, then the policer, then sets the group's POLICER, then
  * creates the traps) does not matter. Only the HW handles are kept here.
  *
- * Errors never fail the SAI call (orchagent aborts on hostif/policer
- * failures and the trap steering still works without CoPP); they are logged.
+ * Hardware programming errors are logged and propagated to the caller;
+ * unsupported trap types with no TD2+ CoPP classifier remain bookkeeping-only.
  */
 
 #include "SwitchBCM56860HW.h"
@@ -227,9 +227,15 @@ static void coppToC(
 }
 
 int SwitchBCM56860HW::coppBcmPolicer(
-        _In_ sai_object_id_t policer_id)
+        _In_ sai_object_id_t policer_id,
+        _Out_opt_ int *rvOut)
 {
     SWSS_LOG_ENTER();
+
+    if (rvOut != nullptr)
+    {
+        *rvOut = 0;
+    }
 
     auto it = m_coppPolicer.find(policer_id);
 
@@ -242,6 +248,10 @@ int SwitchBCM56860HW::coppBcmPolicer(
 
     if (!coppReadPolicer(policer_id, p))
     {
+        if (rvOut != nullptr)
+        {
+            *rvOut = HWBCM_E_UNAVAIL;
+        }
         return -1;
     }
 
@@ -258,6 +268,10 @@ int SwitchBCM56860HW::coppBcmPolicer(
         SWSS_LOG_ERROR("policer %s: hwbcm_copp_policer_create failed: %d",
                 sai_serialize_object_id(policer_id).c_str(), rv);
 
+        if (rvOut != nullptr)
+        {
+            *rvOut = rv;
+        }
         return -1;
     }
 
@@ -379,8 +393,9 @@ sai_status_t SwitchBCM56860HW::coppApplyTrap(
     if (policer != SAI_NULL_OBJECT_ID)
     {
         CoppPolicerParams p;
+        int prv = 0;
 
-        int pid = coppBcmPolicer(policer);
+        int pid = coppBcmPolicer(policer, &prv);
 
         if (pid >= 0 && coppReadPolicer(policer, p))
         {
@@ -391,8 +406,9 @@ sai_status_t SwitchBCM56860HW::coppApplyTrap(
         }
         else
         {
-            SWSS_LOG_ERROR("trap %s: policer %s unusable, trap is NOT rate limited",
-                    sid.c_str(), sai_serialize_object_id(policer).c_str());
+            SWSS_LOG_ERROR("trap %s: policer %s failed to program (rv=%d), refusing unpoliced trap",
+                    sid.c_str(), sai_serialize_object_id(policer).c_str(), prv);
+            return (prv < 0) ? bcmRvToSai(prv) : SAI_STATUS_NOT_SUPPORTED;
         }
     }
 
@@ -497,8 +513,9 @@ sai_status_t SwitchBCM56860HW::hwCreatePolicer(
 
     if (!coppReadPolicer(policer_id, p))
     {
-        SWSS_LOG_WARN("policer %s: cannot be programmed on TD2+ (kept in software only)",
+        SWSS_LOG_ERROR("policer %s: unsupported meter type or mode on TD2+",
                 sai_serialize_object_id(policer_id).c_str());
+        return SAI_STATUS_NOT_SUPPORTED;
     }
 
     (void)attr_count;
@@ -723,10 +740,17 @@ sai_status_t SwitchBCM56860HW::hwCoppOnTrapRemove(
 {
     SWSS_LOG_ENTER();
 
-    // The CPU steering itself is left as is: copporch moves a trap between
-    // groups by remove + create, and hwbcm_trap_set has no "back to default
-    // forwarding" action.
     coppForgetTrap(trap_id);
+
+    sai_attribute_t type;
+    if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, trap_id, SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE, type))
+    {
+        int reason = hwTrapReasonOf(type.value.s32);
+        if (reason >= 0)
+        {
+            return hwReconcileTrapReason(reason, trap_id);
+        }
+    }
 
     return SAI_STATUS_SUCCESS;
 }

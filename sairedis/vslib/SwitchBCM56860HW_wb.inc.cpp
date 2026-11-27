@@ -490,7 +490,7 @@ sai_status_t SwitchBCM56860HW::hwStateSave(
         w.putI32(cs.ip2me_station_id);
         w.putI32(cs.ip2me_vfi_station_id);
         w.putI32(cs.ip2me_wanted);
-        uint32_t ntraps = static_cast<uint32_t>(HWBCM_TRAP_STP + 1);
+        uint32_t ntraps = static_cast<uint32_t>(HWBCM_TRAP_MAX + 1);
         w.putU32(ntraps);
         for (uint32_t i = 0; i < ntraps; i++)
         {
@@ -1265,7 +1265,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                 {
                     hwbcm_core_wb_state_t cs;
                     memset(&cs, 0, sizeof(cs));
-                    for (int i = 0; i <= HWBCM_TRAP_STP; i++) cs.trap_l2cache_idx[i] = -1;
+                    for (int i = 0; i <= HWBCM_TRAP_MAX; i++) cs.trap_l2cache_idx[i] = -1;
                     int32_t macValid = 0, ip2me = -1, vfi = -1, wanted = 0;
                     uint32_t ntraps = 0;
                     if (!tr.getBytes(cs.switch_mac, 6) || !tr.getI32(macValid) ||
@@ -1282,7 +1282,7 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
                     {
                         int32_t idx = -1;
                         if (!tr.getI32(idx)) return SAI_STATUS_FAILURE;
-                        if (i <= static_cast<uint32_t>(HWBCM_TRAP_STP))
+                        if (i <= static_cast<uint32_t>(HWBCM_TRAP_MAX))
                         {
                             cs.trap_l2cache_idx[i] = idx;
                         }

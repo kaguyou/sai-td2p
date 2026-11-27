@@ -462,7 +462,7 @@ static int riot_cpu_egress_vlan0_fix(void)
 }
 
 /* l2 cache (L2 user entry) index per trap reason, -1 = none */
-static int g_trap_l2cache_idx[HWBCM_TRAP_STP + 1];
+static int g_trap_l2cache_idx[HWBCM_TRAP_MAX + 1];
 
 static int port_valid(int port)
 {
@@ -1981,7 +1981,7 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
         g_sgmii_applied_at[i] = 0;
     }
     pthread_mutex_unlock(&g_link_lock);
-    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+    for (i = 0; i <= HWBCM_TRAP_MAX; i++) {
         g_trap_l2cache_idx[i] = -1;
     }
     pthread_mutex_lock(&g_knet_lock);
@@ -2554,7 +2554,7 @@ static void hwbcm_core_state_reset(void)
     g_ip2me_station_id = -1;
     g_ip2me_vfi_station_id = -1;
     g_ip2me_wanted = 0;
-    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+    for (i = 0; i <= HWBCM_TRAP_MAX; i++) {
         g_trap_l2cache_idx[i] = -1;
     }
     g_hash_fields[0] = HWBCM_HASH_F_DEFAULT;
@@ -2800,7 +2800,7 @@ void hwbcm_core_wb_get(hwbcm_core_wb_state_t *out)
     out->ip2me_station_id = g_ip2me_station_id;
     out->ip2me_vfi_station_id = g_ip2me_vfi_station_id;
     out->ip2me_wanted = g_ip2me_wanted;
-    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+    for (i = 0; i <= HWBCM_TRAP_MAX; i++) {
         out->trap_l2cache_idx[i] = g_trap_l2cache_idx[i];
     }
 }
@@ -2817,7 +2817,7 @@ void hwbcm_core_wb_restore(const hwbcm_core_wb_state_t *in)
     g_ip2me_station_id = in->ip2me_station_id;
     g_ip2me_vfi_station_id = in->ip2me_vfi_station_id;
     g_ip2me_wanted = in->ip2me_wanted ? 1 : 0;
-    for (i = 0; i <= HWBCM_TRAP_STP; i++) {
+    for (i = 0; i <= HWBCM_TRAP_MAX; i++) {
         g_trap_l2cache_idx[i] = in->trap_l2cache_idx[i];
     }
     HWBCM_LOGI("wb core: restored mac_valid=%d ip2me_id=%d vfi_id=%d wanted=%d",
@@ -3818,13 +3818,18 @@ static int trap_l2cache_set(int reason, const uint8_t mac[6], int action, int is
         g_trap_l2cache_idx[reason] = -1;
     }
 
+    if (action == HWBCM_TRAP_ACTION_FORWARD) {
+        HWBCM_LOGI("trap %d: l2 cache cleared (forward/default)", reason);
+        return 0;
+    }
+
     bcm_l2_cache_addr_t_init(&a);
     memcpy(a.mac, mac, 6);
     memset(a.mac_mask, 0xff, 6);
     a.vlan = 0;
     a.vlan_mask = 0; /* any VLAN */
     a.prio = -1;
-    if (action == 0) {
+    if (action == HWBCM_TRAP_ACTION_DROP) {
         a.flags = BCM_L2_CACHE_DISCARD;
     } else {
         a.flags = BCM_L2_CACHE_CPU | BCM_L2_CACHE_DISCARD;
@@ -3859,20 +3864,21 @@ static int trap_switch_control(const char *what, bcm_switch_control_t ctl, int v
 
 int hwbcm_trap_set(int reason, int action, int priority_queue)
 {
-    static const uint8_t mac_lldp[6] = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e };
-    static const uint8_t mac_lacp[6] = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x02 };
-    static const uint8_t mac_stp[6]  = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
-    static const uint8_t mac_udld[6] = { 0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc };
+    static const uint8_t mac_lldp[6]  = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e };
+    static const uint8_t mac_lacp[6]  = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x02 };
+    static const uint8_t mac_stp[6]   = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
+    static const uint8_t mac_pvrst[6] = { 0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcd };
+    static const uint8_t mac_udld[6]  = { 0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcc };
     int to_cpu, drop;
 
     if (!g_inited) {
         return BCM_E_INIT;
     }
-    if (action < 0 || action > 2) {
+    if (action < HWBCM_TRAP_ACTION_DROP || action > HWBCM_TRAP_ACTION_FORWARD) {
         return BCM_E_PARAM;
     }
-    to_cpu = (action >= 1) ? 1 : 0;   /* copy or trap */
-    drop = (action != 1) ? 1 : 0;     /* drop, or trap = cpu only */
+    to_cpu = (action == HWBCM_TRAP_ACTION_COPY || action == HWBCM_TRAP_ACTION_TRAP) ? 1 : 0;
+    drop   = (action == HWBCM_TRAP_ACTION_DROP || action == HWBCM_TRAP_ACTION_TRAP) ? 1 : 0;
     if (priority_queue >= 0) {
         HWBCM_LOGD("trap %d: priority queue %d not mapped (CPU cos mapping left at SDK default)",
                    reason, priority_queue);
@@ -3885,6 +3891,19 @@ int hwbcm_trap_set(int reason, int action, int priority_queue)
         HWBCM_CHECK("ArpRequestDrop", trap_switch_control("ArpRequestDrop", bcmSwitchArpRequestDrop, drop));
         HWBCM_CHECK("ArpReplyDrop", trap_switch_control("ArpReplyDrop", bcmSwitchArpReplyDrop, drop));
         HWBCM_CHECK("NdPktToCpu", trap_switch_control("NdPktToCpu", bcmSwitchNdPktToCpu, to_cpu));
+        HWBCM_CHECK("NdPktDrop", trap_switch_control("NdPktDrop", bcmSwitchNdPktDrop, drop));
+        break;
+    case HWBCM_TRAP_ARP_REQ:
+        HWBCM_CHECK("ArpRequestToCpu", trap_switch_control("ArpRequestToCpu", bcmSwitchArpRequestToCpu, to_cpu));
+        HWBCM_CHECK("ArpRequestDrop", trap_switch_control("ArpRequestDrop", bcmSwitchArpRequestDrop, drop));
+        break;
+    case HWBCM_TRAP_ARP_RESP:
+        HWBCM_CHECK("ArpReplyToCpu", trap_switch_control("ArpReplyToCpu", bcmSwitchArpReplyToCpu, to_cpu));
+        HWBCM_CHECK("ArpReplyDrop", trap_switch_control("ArpReplyDrop", bcmSwitchArpReplyDrop, drop));
+        break;
+    case HWBCM_TRAP_IPV6_ND:
+        HWBCM_CHECK("NdPktToCpu", trap_switch_control("NdPktToCpu", bcmSwitchNdPktToCpu, to_cpu));
+        HWBCM_CHECK("NdPktDrop", trap_switch_control("NdPktDrop", bcmSwitchNdPktDrop, drop));
         break;
     case HWBCM_TRAP_LLDP:
         return trap_l2cache_set(reason, mac_lldp, action, 0);
@@ -3892,6 +3911,8 @@ int hwbcm_trap_set(int reason, int action, int priority_queue)
         return trap_l2cache_set(reason, mac_lacp, action, 0);
     case HWBCM_TRAP_STP:
         return trap_l2cache_set(reason, mac_stp, action, 1);
+    case HWBCM_TRAP_PVRST:
+        return trap_l2cache_set(reason, mac_pvrst, action, 1);
     case HWBCM_TRAP_UDLD:
         return trap_l2cache_set(reason, mac_udld, action, 0);
     case HWBCM_TRAP_IP2ME:
@@ -3912,6 +3933,9 @@ int hwbcm_trap_set(int reason, int action, int priority_queue)
     case HWBCM_TRAP_NEIGH_MISS:
         HWBCM_CHECK("UnknownL3DestToCpu", trap_switch_control("UnknownL3DestToCpu", bcmSwitchUnknownL3DestToCpu, to_cpu));
         HWBCM_CHECK("L3SlowpathToCpu", trap_switch_control("L3SlowpathToCpu", bcmSwitchL3SlowpathToCpu, to_cpu));
+        break;
+    case HWBCM_TRAP_L3_MTU_ERR:
+        HWBCM_CHECK("L3MtuFailToCpu", trap_switch_control("L3MtuFailToCpu", bcmSwitchL3MtuFailToCpu, to_cpu));
         break;
     default:
         HWBCM_LOGW("trap %d: unknown reason", reason);

@@ -2215,6 +2215,165 @@ sai_status_t SwitchBCM56860HW::hwRemoveHostif(
     return SAI_STATUS_SUCCESS;
 }
 
+int SwitchBCM56860HW::hwTrapReasonOf(
+        _In_ int32_t saiTrapType)
+{
+    switch (saiTrapType)
+    {
+        case SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST:
+            return HWBCM_TRAP_ARP_REQ;
+
+        case SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE:
+            return HWBCM_TRAP_ARP_RESP;
+
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_DISCOVERY:
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_SOLICITATION:
+        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_ADVERTISEMENT:
+            return HWBCM_TRAP_IPV6_ND;
+
+        case SAI_HOSTIF_TRAP_TYPE_LLDP:
+            return HWBCM_TRAP_LLDP;
+
+        case SAI_HOSTIF_TRAP_TYPE_LACP:
+            return HWBCM_TRAP_LACP;
+
+        case SAI_HOSTIF_TRAP_TYPE_IP2ME:
+        case SAI_HOSTIF_TRAP_TYPE_SSH:
+        case SAI_HOSTIF_TRAP_TYPE_SNMP:
+            return HWBCM_TRAP_IP2ME;
+
+        case SAI_HOSTIF_TRAP_TYPE_DHCP:
+        case SAI_HOSTIF_TRAP_TYPE_DHCPV6:
+        case SAI_HOSTIF_TRAP_TYPE_DHCP_L2:
+        case SAI_HOSTIF_TRAP_TYPE_DHCPV6_L2:
+            return HWBCM_TRAP_DHCP;
+
+        case SAI_HOSTIF_TRAP_TYPE_BGP:
+        case SAI_HOSTIF_TRAP_TYPE_BGPV6:
+            return HWBCM_TRAP_BGP;
+
+        case SAI_HOSTIF_TRAP_TYPE_TTL_ERROR:
+            return HWBCM_TRAP_TTL_ERR;
+
+        case SAI_HOSTIF_TRAP_TYPE_L3_MTU_ERROR:
+            return HWBCM_TRAP_L3_MTU_ERR;
+
+        case SAI_HOSTIF_TRAP_TYPE_NEIGHBOR_MISS:
+            return HWBCM_TRAP_NEIGH_MISS;
+
+        case SAI_HOSTIF_TRAP_TYPE_UDLD:
+            return HWBCM_TRAP_UDLD;
+
+        case SAI_HOSTIF_TRAP_TYPE_STP:
+            return HWBCM_TRAP_STP;
+
+        case SAI_HOSTIF_TRAP_TYPE_PVRST:
+            return HWBCM_TRAP_PVRST;
+
+        default:
+            return -1;
+    }
+}
+
+static int hwTrapGroupOf(int reason)
+{
+    /* IP2ME and BGP share g_ip2me_wanted (MY_STATION entry). */
+    return (reason == HWBCM_TRAP_BGP) ? HWBCM_TRAP_IP2ME : reason;
+}
+
+static int hwTrapActionFromSai(int32_t saiAction)
+{
+    switch (saiAction)
+    {
+        case SAI_PACKET_ACTION_DROP:
+        case SAI_PACKET_ACTION_DENY:
+            return HWBCM_TRAP_ACTION_DROP;
+
+        case SAI_PACKET_ACTION_COPY:
+        case SAI_PACKET_ACTION_LOG:
+            return HWBCM_TRAP_ACTION_COPY;
+
+        case SAI_PACKET_ACTION_TRAP:
+            return HWBCM_TRAP_ACTION_TRAP;
+
+        case SAI_PACKET_ACTION_FORWARD:
+        case SAI_PACKET_ACTION_TRANSIT:
+        default:
+            return HWBCM_TRAP_ACTION_FORWARD;
+    }
+}
+
+sai_status_t SwitchBCM56860HW::hwReconcileTrapReason(
+        _In_ int reason,
+        _In_ sai_object_id_t excludeTrapId)
+{
+    SWSS_LOG_ENTER();
+
+    const int targetGroup = hwTrapGroupOf(reason);
+    int bestAction = HWBCM_TRAP_ACTION_FORWARD;
+    int bestRank = 0; /* 0=FORWARD, 1=DROP, 2=COPY, 3=TRAP */
+    int bestQueue = 0;
+
+    auto oit = m_objectHash.find(SAI_OBJECT_TYPE_HOSTIF_TRAP);
+    if (oit != m_objectHash.end())
+    {
+        for (const auto &kv : oit->second)
+        {
+            sai_object_id_t oid = SAI_NULL_OBJECT_ID;
+            sai_deserialize_object_id(kv.first, oid);
+            if (oid == excludeTrapId)
+            {
+                continue;
+            }
+
+            sai_attribute_t t;
+            if (!getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, oid, SAI_HOSTIF_TRAP_ATTR_TRAP_TYPE, t))
+            {
+                continue;
+            }
+
+            int r = hwTrapReasonOf(t.value.s32);
+            if (r < 0 || hwTrapGroupOf(r) != targetGroup)
+            {
+                continue;
+            }
+
+            int act = HWBCM_TRAP_ACTION_TRAP;
+            sai_attribute_t pa;
+            if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, oid, SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION, pa))
+            {
+                act = hwTrapActionFromSai(pa.value.s32);
+            }
+
+            int rank = (act == HWBCM_TRAP_ACTION_TRAP) ? 3
+                     : (act == HWBCM_TRAP_ACTION_COPY) ? 2
+                     : (act == HWBCM_TRAP_ACTION_DROP) ? 1 : 0;
+            if (rank > bestRank)
+            {
+                bestRank = rank;
+                bestAction = act;
+                bestQueue = 0;
+                sai_attribute_t tg, q;
+                if (getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP, oid, SAI_HOSTIF_TRAP_ATTR_TRAP_GROUP, tg) &&
+                    tg.value.oid != SAI_NULL_OBJECT_ID &&
+                    getStoredAttr(SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP, tg.value.oid, SAI_HOSTIF_TRAP_GROUP_ATTR_QUEUE, q))
+                {
+                    bestQueue = (int)q.value.u32;
+                }
+            }
+        }
+    }
+
+    int rv = hwbcm_trap_set(reason, bestAction, bestQueue);
+    if (rv < 0)
+    {
+        SWSS_LOG_ERROR("hwbcm_trap_set(%d, %d, %d) reconcile failed: %d", reason, bestAction, bestQueue, rv);
+        return bcmRvToSai(rv);
+    }
+
+    return SAI_STATUS_SUCCESS;
+}
+
 sai_status_t SwitchBCM56860HW::hwCreateHostifTrap(
         _In_ sai_object_id_t trap_id,
         _In_ uint32_t attr_count,
@@ -2229,65 +2388,7 @@ sai_status_t SwitchBCM56860HW::hwCreateHostifTrap(
         return SAI_STATUS_SUCCESS;
     }
 
-    int reason = -1;
-
-    switch (type->value.s32)
-    {
-        case SAI_HOSTIF_TRAP_TYPE_ARP_REQUEST:
-        case SAI_HOSTIF_TRAP_TYPE_ARP_RESPONSE:
-        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_DISCOVERY:
-        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_SOLICITATION:
-        case SAI_HOSTIF_TRAP_TYPE_IPV6_NEIGHBOR_ADVERTISEMENT:
-            reason = HWBCM_TRAP_ARP;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_LLDP:
-            reason = HWBCM_TRAP_LLDP;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_LACP:
-            reason = HWBCM_TRAP_LACP;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_IP2ME:
-        case SAI_HOSTIF_TRAP_TYPE_SSH:
-        case SAI_HOSTIF_TRAP_TYPE_SNMP:
-            reason = HWBCM_TRAP_IP2ME;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_DHCP:
-        case SAI_HOSTIF_TRAP_TYPE_DHCPV6:
-        case SAI_HOSTIF_TRAP_TYPE_DHCP_L2:
-        case SAI_HOSTIF_TRAP_TYPE_DHCPV6_L2:
-            reason = HWBCM_TRAP_DHCP;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_BGP:
-        case SAI_HOSTIF_TRAP_TYPE_BGPV6:
-            reason = HWBCM_TRAP_BGP;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_TTL_ERROR:
-            reason = HWBCM_TRAP_TTL_ERR;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_L3_MTU_ERROR:
-        case SAI_HOSTIF_TRAP_TYPE_NEIGHBOR_MISS:
-            reason = HWBCM_TRAP_NEIGH_MISS;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_UDLD:
-            reason = HWBCM_TRAP_UDLD;
-            break;
-
-        case SAI_HOSTIF_TRAP_TYPE_STP:
-        case SAI_HOSTIF_TRAP_TYPE_PVRST:
-            reason = HWBCM_TRAP_STP;
-            break;
-
-        default:
-            break;
-    }
+    int reason = hwTrapReasonOf(type->value.s32);
 
     if (reason < 0)
     {
@@ -2297,37 +2398,26 @@ sai_status_t SwitchBCM56860HW::hwCreateHostifTrap(
         return SAI_STATUS_SUCCESS;
     }
 
-    int action = 2; // trap
+    int action = HWBCM_TRAP_ACTION_TRAP;
 
     auto *pa = findAttr(attr_count, attr_list, SAI_HOSTIF_TRAP_ATTR_PACKET_ACTION);
 
     if (pa != NULL)
     {
-        switch (pa->value.s32)
-        {
-            case SAI_PACKET_ACTION_DROP:
-            case SAI_PACKET_ACTION_DENY:
-                action = 0;
-                break;
+        action = hwTrapActionFromSai(pa->value.s32);
+    }
 
-            case SAI_PACKET_ACTION_COPY:
-            case SAI_PACKET_ACTION_LOG:
-                action = 1;
-                break;
+    if (action == HWBCM_TRAP_ACTION_FORWARD)
+    {
+        /* Disable HW CPU steering unless another active sibling trap shares
+         * the same hardware control (e.g. IP2ME/BGP or IPv6 ND/NS/NA). */
+        return hwReconcileTrapReason(reason, trap_id);
+    }
 
-            case SAI_PACKET_ACTION_TRAP:
-                action = 2;
-                break;
-
-            case SAI_PACKET_ACTION_FORWARD:
-            case SAI_PACKET_ACTION_TRANSIT:
-            default:
-
-                SWSS_LOG_NOTICE("hostif trap %s packet action %d: nothing to program",
-                        sai_serialize_object_id(trap_id).c_str(), pa->value.s32);
-
-                return SAI_STATUS_SUCCESS;
-        }
+    if (hwTrapGroupOf(reason) == HWBCM_TRAP_IP2ME && action == HWBCM_TRAP_ACTION_DROP)
+    {
+        /* Do not disable shared MY_STATION if another IP2ME/BGP trap wants CPU. */
+        return hwReconcileTrapReason(reason, SAI_NULL_OBJECT_ID);
     }
 
     int queue = 0;
@@ -2348,9 +2438,9 @@ sai_status_t SwitchBCM56860HW::hwCreateHostifTrap(
 
     if (rv < 0)
     {
-        // trap policy is not critical for the data path: keep orchagent going
-        SWSS_LOG_WARN("hwbcm_trap_set(%d, %d, %d) for trap %s failed: %d (ignored)",
+        SWSS_LOG_ERROR("hwbcm_trap_set(%d, %d, %d) for trap %s failed: %d",
                 reason, action, queue, sai_serialize_object_id(trap_id).c_str(), rv);
+        return bcmRvToSai(rv);
     }
 
     return SAI_STATUS_SUCCESS;
