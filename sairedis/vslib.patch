@@ -234,7 +234,7 @@ index e86d30b..c6f7dc5 100644
      auto meta = getMeta();
  
 diff --git a/vslib/VirtualSwitchSaiInterface.cpp b/vslib/VirtualSwitchSaiInterface.cpp
-index a9baf70..df0da99 100644
+index a9baf70..4dc207f 100644
 --- a/vslib/VirtualSwitchSaiInterface.cpp
 +++ b/vslib/VirtualSwitchSaiInterface.cpp
 @@ -15,6 +15,7 @@
@@ -257,6 +257,36 @@ index a9baf70..df0da99 100644
          case SAI_VS_SWITCH_TYPE_VPP:
  
  #ifdef USE_VPP
+@@ -1140,7 +1146,19 @@ sai_status_t VirtualSwitchSaiInterface::clearStats(
+      * discard them, in that way.
+      */
+ 
+-    uint64_t counters[VS_MAX_COUNTERS];
++    if (number_of_counters == 0)
++    {
++        return SAI_STATUS_SUCCESS;
++    }
++
++    if (counter_ids == nullptr || number_of_counters > 4096)
++    {
++        SWSS_LOG_ERROR("invalid clearStats args: counter_ids=%p number_of_counters=%u",
++                counter_ids, number_of_counters);
++        return SAI_STATUS_INVALID_PARAMETER;
++    }
++
++    std::vector<uint64_t> counters(number_of_counters, 0);
+ 
+     return getStatsExt(
+             object_type,
+@@ -1148,7 +1166,7 @@ sai_status_t VirtualSwitchSaiInterface::clearStats(
+             number_of_counters,
+             counter_ids,
+             SAI_STATS_MODE_READ_AND_CLEAR,
+-            counters);
++            counters.data());
+ }
+ 
+ sai_status_t VirtualSwitchSaiInterface::bulkGetStats(
 diff --git a/vslib/VirtualSwitchSaiInterfaceFdb.cpp b/vslib/VirtualSwitchSaiInterfaceFdb.cpp
 index 4d13784..ad51e32 100644
 --- a/vslib/VirtualSwitchSaiInterfaceFdb.cpp
