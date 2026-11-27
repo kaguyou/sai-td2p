@@ -88,7 +88,8 @@ typedef char copp_e_not_found_matches[(BCM_E_NOT_FOUND == HWBCM_COPP_E_NOT_FOUND
 
 enum {
     DMAC_ANY = 0,
-    DMAC_FIXED,         /* rule.dmac */
+    DMAC_FIXED,         /* rule.dmac (exact match) */
+    DMAC_MASKED,        /* rule.dmac / rule.dmac_mask */
     DMAC_BCAST,         /* ff:ff:ff:ff:ff:ff */
     DMAC_SWITCH,        /* switch MAC (hwbcm_switch_mac_get), any if unknown */
 };
@@ -97,6 +98,7 @@ typedef struct {
     uint16_t ethertype;     /* 0 = any */
     int dmac_kind;
     uint8_t dmac[6];
+    uint8_t dmac_mask[6];
     int ip_proto;           /* -1 = any */
     int l4_dst;             /* -1 = any */
     int l4_src;             /* -1 = any */
@@ -146,6 +148,57 @@ static void rule_dmac(copp_rule_t *r, uint8_t a, uint8_t b, uint8_t c, uint8_t d
     r->dmac[3] = d; r->dmac[4] = e; r->dmac[5] = f;
 }
 
+static void rule_dmac_mask(copp_rule_t *r,
+                           uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t e, uint8_t f,
+                           uint8_t ma, uint8_t mb, uint8_t mc, uint8_t md, uint8_t me, uint8_t mf)
+{
+    r->dmac_kind = DMAC_MASKED;
+    r->dmac[0] = a; r->dmac[1] = b; r->dmac[2] = c;
+    r->dmac[3] = d; r->dmac[4] = e; r->dmac[5] = f;
+    r->dmac_mask[0] = ma; r->dmac_mask[1] = mb; r->dmac_mask[2] = mc;
+    r->dmac_mask[3] = md; r->dmac_mask[4] = me; r->dmac_mask[5] = mf;
+}
+
+static void rule_l4_dmac(copp_rule_t *rules, int *n, uint16_t eth, int proto, int dst, int src,
+                         uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t e, uint8_t f)
+{
+    copp_rule_t *r = rule_add(rules, n);
+
+    if (r == NULL) {
+        return;
+    }
+    r->ethertype = eth;
+    r->ip_proto = proto;
+    r->l4_dst = dst;
+    r->l4_src = src;
+    rule_dmac(r, a, b, c, d, e, f);
+}
+
+static void rule_proto_dmac(copp_rule_t *rules, int *n, uint16_t eth, int proto,
+                            uint8_t a, uint8_t b, uint8_t c, uint8_t d, uint8_t e, uint8_t f)
+{
+    copp_rule_t *r = rule_add(rules, n);
+
+    if (r == NULL) {
+        return;
+    }
+    r->ethertype = eth;
+    r->ip_proto = proto;
+    rule_dmac(r, a, b, c, d, e, f);
+}
+
+static void rule_proto_tome(copp_rule_t *rules, int *n, uint16_t eth, int proto)
+{
+    copp_rule_t *r = rule_add(rules, n);
+
+    if (r == NULL) {
+        return;
+    }
+    r->ethertype = eth;
+    r->ip_proto = proto;
+    r->to_me = 1;
+}
+
 static void rule_l4(copp_rule_t *rules, int *n, uint16_t eth, int proto, int dst, int src, int to_me)
 {
     copp_rule_t *r = rule_add(rules, n);
@@ -170,17 +223,6 @@ static void rule_icmp6(copp_rule_t *rules, int *n, int type)
     r->ethertype = ETH_IP6;
     r->ip_proto = 58;
     r->icmp_type = type;
-}
-
-static void rule_proto(copp_rule_t *rules, int *n, uint16_t eth, int proto)
-{
-    copp_rule_t *r = rule_add(rules, n);
-
-    if (r == NULL) {
-        return;
-    }
-    r->ethertype = eth;
-    r->ip_proto = proto;
 }
 
 /*
@@ -254,10 +296,12 @@ static int copp_rules_for(int trap, copp_rule_t *rules, int *steer)
         rule_l4(rules, &n, ETH_IP4, 17, 68, -1, 0);
         break;
     case HWBCM_COPP_TRAP_DHCPV6:
-        /* DhcpPktToCpu is the IPv4 control; copy v6 ourselves (one CPU copy
-         * per packet either way) */
-        rule_l4(rules, &n, ETH_IP6, 17, 547, -1, 0);
-        rule_l4(rules, &n, ETH_IP6, 17, 546, -1, 0);
+        /* Multicast client/relay (ff02::1:2 / ff05::1:3 -> UDP 547) plus
+         * unicast to_me (547/546) so transit DHCPv6 is never intercepted. */
+        rule_l4_dmac(rules, &n, ETH_IP6, 17, 547, -1, 0x33, 0x33, 0x00, 0x01, 0x00, 0x02);
+        rule_l4_dmac(rules, &n, ETH_IP6, 17, 547, -1, 0x33, 0x33, 0x00, 0x01, 0x00, 0x03);
+        rule_l4(rules, &n, ETH_IP6, 17, 547, -1, 1);
+        rule_l4(rules, &n, ETH_IP6, 17, 546, -1, 1);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_BGP:
@@ -299,27 +343,42 @@ static int copp_rules_for(int trap, copp_rule_t *rules, int *steer)
         r->sub = SUB_TTL;
         break;
     case HWBCM_COPP_TRAP_OSPF:
-        rule_proto(rules, &n, ETH_IP4, 89);
+        /* 224.0.0.5 / 224.0.0.6 multicast + unicast to_me; leave transit OSPF alone */
+        rule_proto_dmac(rules, &n, ETH_IP4, 89, 0x01, 0x00, 0x5e, 0x00, 0x00, 0x05);
+        rule_proto_dmac(rules, &n, ETH_IP4, 89, 0x01, 0x00, 0x5e, 0x00, 0x00, 0x06);
+        rule_proto_tome(rules, &n, ETH_IP4, 89);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_OSPFV6:
-        rule_proto(rules, &n, ETH_IP6, 89);
+        /* ff02::5 / ff02::6 multicast + unicast to_me */
+        rule_proto_dmac(rules, &n, ETH_IP6, 89, 0x33, 0x33, 0x00, 0x00, 0x00, 0x05);
+        rule_proto_dmac(rules, &n, ETH_IP6, 89, 0x33, 0x33, 0x00, 0x00, 0x00, 0x06);
+        rule_proto_tome(rules, &n, ETH_IP6, 89);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_VRRP:
-        rule_proto(rules, &n, ETH_IP4, 112);
+        /* 224.0.0.18 multicast only */
+        rule_proto_dmac(rules, &n, ETH_IP4, 112, 0x01, 0x00, 0x5e, 0x00, 0x00, 0x12);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_VRRPV6:
-        rule_proto(rules, &n, ETH_IP6, 112);
+        /* ff02::12 multicast only */
+        rule_proto_dmac(rules, &n, ETH_IP6, 112, 0x33, 0x33, 0x00, 0x00, 0x00, 0x12);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_PIM:
-        rule_proto(rules, &n, ETH_IP4, 103);
+        /* 224.0.0.13 multicast + unicast to_me */
+        rule_proto_dmac(rules, &n, ETH_IP4, 103, 0x01, 0x00, 0x5e, 0x00, 0x00, 0x0d);
+        rule_proto_tome(rules, &n, ETH_IP4, 103);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_IGMP:
-        rule_proto(rules, &n, ETH_IP4, 2);
+        /* IPv4 multicast destination MAC 01:00:5e:00:00:00/25 */
+        r = rule_add(rules, &n);
+        r->ethertype = ETH_IP4;
+        r->ip_proto = 2;
+        rule_dmac_mask(r, 0x01, 0x00, 0x5e, 0x00, 0x00, 0x00,
+                       0xff, 0xff, 0xff, 0x80, 0x00, 0x00);
         *steer = 1;
         break;
     case HWBCM_COPP_TRAP_BFD:
@@ -800,6 +859,9 @@ static int entry_qualify(bcm_field_entry_t eid, const hwbcm_copp_trap_cfg_t *cfg
         memset(mask, 0xff, sizeof(mask));
         if (r->dmac_kind == DMAC_FIXED) {
             memcpy(mac, r->dmac, sizeof(mac));
+        } else if (r->dmac_kind == DMAC_MASKED) {
+            memcpy(mac, r->dmac, sizeof(mac));
+            memcpy(mask, r->dmac_mask, sizeof(mask));
         } else if (r->dmac_kind == DMAC_BCAST) {
             memset(mac, 0xff, sizeof(mac));
         } else {
@@ -916,7 +978,7 @@ static int entry_build(const hwbcm_copp_trap_cfg_t *cfg, const copp_rule_t *r, i
     if (BCM_FAILURE(rv)) {
         goto fail;
     }
-    rv = entry_actions(eid, cfg, steer, ridx, r->to_me);
+    rv = entry_actions(eid, cfg, steer && !r->to_me, ridx, r->to_me);
     if (BCM_FAILURE(rv)) {
         goto fail;
     }
@@ -976,13 +1038,20 @@ static int slot_build(copp_slot_t *s, const hwbcm_copp_trap_cfg_t *cfg)
     int steer = 0;
     int n, i, rv;
 
+    int any_non_tome = 0;
+
     s->neid = 0;
     n = copp_rules_for(cfg->trap, rules, &steer);
     if (n <= 0) {
         CLOGW("trap kind %d has no classifier", cfg->trap);
         return BCM_E_UNAVAIL;
     }
-    if (rules_need_to_me(rules, n) && (!g_have_to_me || g_local_egr < 0)) {
+    for (i = 0; i < n; i++) {
+        if (!rules[i].to_me) {
+            any_non_tome = 1;
+        }
+    }
+    if (!any_non_tome && rules_need_to_me(rules, n) && (!g_have_to_me || g_local_egr < 0)) {
         CLOGI("%s: waiting for the ip2me egress (%s), pending", trap_name(cfg->trap),
               g_have_to_me ? "no ip2me route yet" : "DstL3Egress not in qset");
         return 0;
@@ -991,6 +1060,9 @@ static int slot_build(copp_slot_t *s, const hwbcm_copp_trap_cfg_t *cfg)
         bcm_field_entry_t eid = 0;
         int sid = -1;
 
+        if (rules[i].to_me && (!g_have_to_me || g_local_egr < 0)) {
+            continue;
+        }
         rv = entry_build(cfg, &rules[i], steer, i, &eid, &sid);
         if (BCM_FAILURE(rv)) {
             /* roll back what this build installed */
@@ -1254,26 +1326,6 @@ int hwbcm_copp_local_egress_set(int egr_id)
     CLOGI("ip2me egress %d -> %d", g_local_egr, egr_id);
     g_local_egr = egr_id;
     if (!g_group_valid) {
-        pthread_mutex_unlock(&g_copp_lock);
-        return 0;
-    }
-    if (egr_id < 0) {
-        int i;
-
-        /* forget the to-me entries, keep the slots pending */
-        for (i = 0; i < COPP_MAX_TRAPS; i++) {
-            copp_rule_t rules[COPP_MAX_RULES];
-            int steer = 0;
-            int n;
-
-            if (!g_slot[i].used) {
-                continue;
-            }
-            n = copp_rules_for(g_slot[i].cfg.trap, rules, &steer);
-            if (rules_need_to_me(rules, n)) {
-                slot_clear_entries(&g_slot[i], g_slot[i].cfg.policer_id >= 0);
-            }
-        }
         pthread_mutex_unlock(&g_copp_lock);
         return 0;
     }

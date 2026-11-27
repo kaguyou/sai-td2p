@@ -174,6 +174,7 @@ namespace
 
         switch (t)
         {
+            case SAI_ACL_IP_TYPE_ANY:         return HWBCM_ACL_IPT_ANY;
             case SAI_ACL_IP_TYPE_IP:          return HWBCM_ACL_IPT_IP;
             case SAI_ACL_IP_TYPE_NON_IP:      return HWBCM_ACL_IPT_NON_IP;
             case SAI_ACL_IP_TYPE_IPV4ANY:     return HWBCM_ACL_IPT_IPV4;
@@ -183,7 +184,7 @@ namespace
             case SAI_ACL_IP_TYPE_ARP:         return HWBCM_ACL_IPT_ARP;
             case SAI_ACL_IP_TYPE_ARP_REQUEST: return HWBCM_ACL_IPT_ARP_REQ;
             case SAI_ACL_IP_TYPE_ARP_REPLY:   return HWBCM_ACL_IPT_ARP_REPLY;
-            default:                          return HWBCM_ACL_IPT_ANY;
+            default:                          return -1;
         }
     }
 
@@ -741,6 +742,12 @@ sai_status_t SwitchBCM56860HW::aclProgramEntry(
                 case SAI_ACL_ENTRY_ATTR_FIELD_ACL_IP_TYPE:
                     {
                         int t = ipTypeOf(f.data.s32);
+
+                        if (t < 0)
+                        {
+                            SWSS_LOG_ERROR("ACL entry %s: IP_TYPE %d unsupported", sid.c_str(), f.data.s32);
+                            return SAI_STATUS_NOT_SUPPORTED;
+                        }
 
                         if (t != HWBCM_ACL_IPT_ANY)
                         {
