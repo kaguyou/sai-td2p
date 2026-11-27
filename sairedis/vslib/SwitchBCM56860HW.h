@@ -26,6 +26,8 @@
 #include "SwitchBCM56850.h"
 
 #include <map>
+#include <unordered_map>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -325,10 +327,43 @@ namespace saivs
             std::map<sai_object_id_t, std::pair<sai_object_id_t, sai_object_id_t>> m_lagMemberInfo; /* member oid -> (lag, port) */
 
             // L3 state (A3)
+            struct RifIpKey
+            {
+                sai_object_id_t rif = SAI_NULL_OBJECT_ID;
+                uint8_t af = 0;         /* 4 or 6 */
+                uint8_t addr[16] = {};  /* network byte order, zero-padded for IPv4 */
+
+                bool operator==(const RifIpKey &o) const noexcept
+                {
+                    return rif == o.rif && af == o.af && memcmp(addr, o.addr, 16) == 0;
+                }
+            };
+
+            struct RifIpKeyHash
+            {
+                size_t operator()(const RifIpKey &k) const noexcept
+                {
+                    uint64_t a = 0, b = 0;
+                    memcpy(&a, k.addr, 8);
+                    memcpy(&b, k.addr + 8, 8);
+                    size_t h = std::hash<uint64_t>{}(static_cast<uint64_t>(k.rif));
+                    h ^= std::hash<uint64_t>{}(a) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                    h ^= std::hash<uint64_t>{}(b) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                    h ^= static_cast<size_t>(k.af) * 0x9e3779b9ULL;
+                    return h;
+                }
+            };
+
+            static RifIpKey makeRifIpKey(_In_ sai_object_id_t rif, _In_ const sai_ip_address_t &ip);
+            void nhIndexAdd(_In_ sai_object_id_t nh_id, _In_ sai_object_id_t rif, _In_ const sai_ip_address_t &ip);
+            void nhIndexRemove(_In_ sai_object_id_t nh_id);
+
             std::map<sai_object_id_t, int> m_vrToVrf;      /* virtual router oid -> bcm vrf */
             std::map<sai_object_id_t, int> m_rifToIntf;    /* rif oid -> bcm l3 intf id */
             std::map<sai_object_id_t, int> m_rifToVid;     /* rif oid -> vlan used for the RIF */
             std::map<sai_object_id_t, int> m_nhToEgr;      /* next hop oid -> bcm egress id */
+            std::unordered_map<RifIpKey, std::vector<sai_object_id_t>, RifIpKeyHash> m_nhByRifIp; /* derived: (rif, ip) -> nh oids */
+            std::unordered_map<sai_object_id_t, RifIpKey> m_nhKey; /* derived: nh oid -> (rif, ip) */
             std::map<sai_object_id_t, int> m_nhgToEcmp;    /* next hop group oid -> bcm ecmp id */
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNh; /* nhg member -> nh */
             std::map<sai_object_id_t, sai_object_id_t> m_nhgMemberToNhg;/* nhg member -> nhg */

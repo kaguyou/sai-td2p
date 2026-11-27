@@ -1168,6 +1168,8 @@ sai_status_t SwitchBCM56860HW::hwStateLoad(
     m_rifToIntf.clear();
     m_rifToVid.clear();
     m_nhToEgr.clear();
+    m_nhByRifIp.clear();
+    m_nhKey.clear();
     m_nhgToEcmp.clear();
     m_neighborEgr.clear();
     m_routeEgr.clear();
@@ -2088,6 +2090,19 @@ void SwitchBCM56860HW::hwWarmRebuildLagAndL3FromHash()
         }
     }
 
+    // Derived (rif, ip) -> NEXT_HOP index from m_nhToEgr + m_objectHash (zero HW writes)
+    m_nhByRifIp.clear();
+    m_nhKey.clear();
+    for (const auto &kv : m_nhToEgr)
+    {
+        sai_attribute_t nhRif, nhIp;
+        if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
+            getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp))
+        {
+            nhIndexAdd(kv.first, nhRif.value.oid, nhIp.value.ipaddr);
+        }
+    }
+
     // NHG members from m_objectHash (zero HW writes)
     m_nhgMemberToNh.clear();
     m_nhgMemberToNhg.clear();
@@ -2945,6 +2960,8 @@ void SwitchBCM56860HW::hwTeardownForColdFallback()
     m_rifToIntf.clear();
     m_rifToVid.clear();
     m_nhToEgr.clear();
+    m_nhByRifIp.clear();
+    m_nhKey.clear();
     m_nhgToEcmp.clear();
     m_nhgMemberToNh.clear();
     m_nhgMemberToNhg.clear();

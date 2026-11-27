@@ -286,6 +286,62 @@ namespace
     }
 }
 
+// --- Derived (rif, ip) -> NEXT_HOP index ---------------------------------
+
+SwitchBCM56860HW::RifIpKey SwitchBCM56860HW::makeRifIpKey(
+        _In_ sai_object_id_t rif,
+        _In_ const sai_ip_address_t &ip)
+{
+    RifIpKey k;
+    k.rif = rif;
+    if (ip.addr_family == SAI_IP_ADDR_FAMILY_IPV6)
+    {
+        k.af = 6;
+        memcpy(k.addr, ip.addr.ip6, 16);
+    }
+    else
+    {
+        k.af = 4;
+        memcpy(k.addr, &ip.addr.ip4, 4);
+    }
+    return k;
+}
+
+void SwitchBCM56860HW::nhIndexAdd(
+        _In_ sai_object_id_t nh_id,
+        _In_ sai_object_id_t rif,
+        _In_ const sai_ip_address_t &ip)
+{
+    RifIpKey k = makeRifIpKey(rif, ip);
+    auto &vec = m_nhByRifIp[k];
+    if (std::find(vec.begin(), vec.end(), nh_id) == vec.end())
+    {
+        vec.push_back(nh_id);
+    }
+    m_nhKey[nh_id] = k;
+}
+
+void SwitchBCM56860HW::nhIndexRemove(
+        _In_ sai_object_id_t nh_id)
+{
+    auto kit = m_nhKey.find(nh_id);
+    if (kit == m_nhKey.end())
+    {
+        return;
+    }
+    auto bit = m_nhByRifIp.find(kit->second);
+    if (bit != m_nhByRifIp.end())
+    {
+        auto &vec = bit->second;
+        vec.erase(std::remove(vec.begin(), vec.end(), nh_id), vec.end());
+        if (vec.empty())
+        {
+            m_nhByRifIp.erase(bit);
+        }
+    }
+    m_nhKey.erase(kit);
+}
+
 // --- VIRTUAL_ROUTER -------------------------------------------------------
 
 sai_status_t SwitchBCM56860HW::hwCreateVirtualRouter(
@@ -987,27 +1043,19 @@ sai_status_t SwitchBCM56860HW::hwCreateNeighbor(
     int egr = -1;
     std::vector<sai_object_id_t> matchingNh;
 
-    for (auto &kv: m_nhToEgr)
     {
-        sai_attribute_t nhRif, nhIp;
+        auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
 
-        if (!getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) ||
-            !getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp))
+        if (nhIt != m_nhByRifIp.end())
         {
-            continue;
+            for (auto nh: nhIt->second)
+            {
+                if (m_nhToEgr.find(nh) != m_nhToEgr.end())
+                {
+                    matchingNh.push_back(nh);
+                }
+            }
         }
-
-        if (nhRif.value.oid != ne.rif_id)
-        {
-            continue;
-        }
-
-        if (sai_serialize_ip_address(nhIp.value.ipaddr) != sai_serialize_ip_address(ne.ip_address))
-        {
-            continue;
-        }
-
-        matchingNh.push_back(kv.first);
     }
 
     std::vector<int> replacedEgrs;
@@ -1262,18 +1310,21 @@ sai_status_t SwitchBCM56860HW::hwSetNeighbor(
 
     std::set<int> egrs;
     egrs.insert(it->second);
-    std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-    for (auto &kv: m_nhToEgr)
     {
-        sai_attribute_t nhRif, nhIp;
+        auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
 
-        if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
-            getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
-            nhRif.value.oid == ne.rif_id &&
-            sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+        if (nhIt != m_nhByRifIp.end())
         {
-            egrs.insert(kv.second);
+            for (auto nh: nhIt->second)
+            {
+                auto eit = m_nhToEgr.find(nh);
+
+                if (eit != m_nhToEgr.end())
+                {
+                    egrs.insert(eit->second);
+                }
+            }
         }
     }
 
@@ -1400,24 +1451,21 @@ sai_status_t SwitchBCM56860HW::hwRemoveNeighbor(
     // Collect every NEXT_HOP egress matching (rif, ip) so multiple next hops
     // sharing this neighbor are all reverted to CPU punt on remove.
     std::set<int> nhEgrs;
-    std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-    for (auto &kv: m_nhToEgr)
     {
-        if (kv.second == egr)
-        {
-            nhEgrs.insert(kv.second);
-            continue;
-        }
+        auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
 
-        sai_attribute_t nhRif, nhIp;
-
-        if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
-            getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, kv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
-            nhRif.value.oid == ne.rif_id &&
-            sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+        if (nhIt != m_nhByRifIp.end())
         {
-            nhEgrs.insert(kv.second);
+            for (auto nh: nhIt->second)
+            {
+                auto eit = m_nhToEgr.find(nh);
+
+                if (eit != m_nhToEgr.end())
+                {
+                    nhEgrs.insert(eit->second);
+                }
+            }
         }
     }
 
@@ -1552,6 +1600,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     if (nit != m_neighborEgr.end())
     {
         m_nhToEgr[nh_id] = nit->second;
+        nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
         SWSS_LOG_NOTICE("next hop %s -> egress %d (shared with neighbor %s)", snh.c_str(), nit->second, key.c_str());
 
@@ -1589,6 +1638,7 @@ sai_status_t SwitchBCM56860HW::hwCreateNextHop(
     }
 
     m_nhToEgr[nh_id] = egr;
+    nhIndexAdd(nh_id, rifAttr->value.oid, ipAttr->value.ipaddr);
 
     SWSS_LOG_NOTICE("next hop %s -> egress %d (cpu, neighbor %s unresolved)", snh.c_str(), egr, key.c_str());
 
@@ -1631,6 +1681,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
     if (stillUsed)
     {
         m_nhToEgr.erase(it);
+        nhIndexRemove(nh_id);
         SWSS_LOG_NOTICE("next hop %s removed, egress %d still in use", sai_serialize_object_id(nh_id).c_str(), egr);
         return SAI_STATUS_SUCCESS;
     }
@@ -1644,6 +1695,7 @@ sai_status_t SwitchBCM56860HW::hwRemoveNextHop(
     }
 
     m_nhToEgr.erase(it);
+    nhIndexRemove(nh_id);
 
     return SAI_STATUS_SUCCESS;
 }
@@ -2205,18 +2257,21 @@ void SwitchBCM56860HW::hwRefreshNeighborsOnLearn(
 
         std::set<int> egrs;
         egrs.insert(kv.second);
-        std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-        for (auto &nkv: m_nhToEgr)
         {
-            sai_attribute_t nhRif, nhIp;
+            auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
 
-            if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
-                getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
-                nhRif.value.oid == ne.rif_id &&
-                sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+            if (nhIt != m_nhByRifIp.end())
             {
-                egrs.insert(nkv.second);
+                for (auto nh: nhIt->second)
+                {
+                    auto eit = m_nhToEgr.find(nh);
+
+                    if (eit != m_nhToEgr.end())
+                    {
+                        egrs.insert(eit->second);
+                    }
+                }
             }
         }
 
@@ -2303,18 +2358,21 @@ void SwitchBCM56860HW::hwPuntNeighborsOnAge(
 
         std::set<int> egrs;
         egrs.insert(kv.second);
-        std::string neIpStr = sai_serialize_ip_address(ne.ip_address);
 
-        for (auto &nkv: m_nhToEgr)
         {
-            sai_attribute_t nhRif, nhIp;
+            auto nhIt = m_nhByRifIp.find(makeRifIpKey(ne.rif_id, ne.ip_address));
 
-            if (getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID, nhRif) &&
-                getStoredAttr(SAI_OBJECT_TYPE_NEXT_HOP, nkv.first, SAI_NEXT_HOP_ATTR_IP, nhIp) &&
-                nhRif.value.oid == ne.rif_id &&
-                sai_serialize_ip_address(nhIp.value.ipaddr) == neIpStr)
+            if (nhIt != m_nhByRifIp.end())
             {
-                egrs.insert(nkv.second);
+                for (auto nh: nhIt->second)
+                {
+                    auto eit = m_nhToEgr.find(nh);
+
+                    if (eit != m_nhToEgr.end())
+                    {
+                        egrs.insert(eit->second);
+                    }
+                }
             }
         }
 
