@@ -8,6 +8,7 @@
 #endif
 
 #include <string.h>
+#include <pthread.h>
 
 #include <sal/core/libc.h>
 #include <soc/drv.h>
@@ -374,18 +375,24 @@ int hwbcm_l2_age_set(int seconds)
 /* L2 learn / age events                                                    */
 /* ------------------------------------------------------------------------ */
 
+static pthread_mutex_t g_l2_cb_lock = PTHREAD_MUTEX_INITIALIZER;
 static hwbcm_l2_cb_t g_l2_cb = NULL;
 static void *g_l2_cookie = NULL;
 static int g_l2_cb_registered = 0;
 
 static void hwbcm_l2_addr_handler(int unit, bcm_l2_addr_t *l2addr, int operation, void *userdata)
 {
-    hwbcm_l2_cb_t cb = g_l2_cb;
+    hwbcm_l2_cb_t cb;
+    void *cookie;
     uint8_t mac[6];
     int add, port;
 
     (void)unit;
     (void)userdata;
+    pthread_mutex_lock(&g_l2_cb_lock);
+    cb = g_l2_cb;
+    cookie = g_l2_cookie;
+    pthread_mutex_unlock(&g_l2_cb_lock);
     if (cb == NULL || l2addr == NULL) {
         return;
     }
@@ -408,23 +415,32 @@ static void hwbcm_l2_addr_handler(int unit, bcm_l2_addr_t *l2addr, int operation
     } else {
         port = l2addr->port;
     }
-    cb(mac, (int)l2addr->vid, port, add, g_l2_cookie);
+    cb(mac, (int)l2addr->vid, port, add, cookie);
 }
 
 int hwbcm_l2_callback_register(hwbcm_l2_cb_t cb, void *cookie)
 {
-    int rv;
+    int rv, need_reg;
 
+    pthread_mutex_lock(&g_l2_cb_lock);
     g_l2_cookie = cookie;
     g_l2_cb = cb;
-    if (!g_l2_cb_registered) {
+    need_reg = !g_l2_cb_registered;
+    pthread_mutex_unlock(&g_l2_cb_lock);
+
+    if (need_reg) {
         rv = bcm_l2_addr_register(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
         if (BCM_FAILURE(rv)) {
             HWBCM_LOGE("bcm_l2_addr_register: %s", bcm_errmsg(rv));
+            pthread_mutex_lock(&g_l2_cb_lock);
             g_l2_cb = NULL;
+            g_l2_cookie = NULL;
+            pthread_mutex_unlock(&g_l2_cb_lock);
             return rv;
         }
+        pthread_mutex_lock(&g_l2_cb_lock);
         g_l2_cb_registered = 1;
+        pthread_mutex_unlock(&g_l2_cb_lock);
         HWBCM_LOGI("l2 learn callback registered");
     }
     return 0;
@@ -432,14 +448,18 @@ int hwbcm_l2_callback_register(hwbcm_l2_cb_t cb, void *cookie)
 
 void hwbcm_l2_warm_reset(void)
 {
-    if (g_l2_cb_registered) {
-        if (SOC_UNIT_VALID(HWBCM_UNIT)) {
-            (void)bcm_l2_addr_unregister(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
-        }
-        g_l2_cb_registered = 0;
-    }
+    int was_reg;
+
+    pthread_mutex_lock(&g_l2_cb_lock);
+    was_reg = g_l2_cb_registered;
+    g_l2_cb_registered = 0;
     g_l2_cb = NULL;
     g_l2_cookie = NULL;
+    pthread_mutex_unlock(&g_l2_cb_lock);
+
+    if (was_reg && SOC_UNIT_VALID(HWBCM_UNIT)) {
+        (void)bcm_l2_addr_unregister(HWBCM_UNIT, hwbcm_l2_addr_handler, NULL);
+    }
 }
 
 int hwbcm_trunk_member_count_get(int trunk_id)

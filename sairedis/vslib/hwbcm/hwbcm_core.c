@@ -89,7 +89,12 @@ enum {
 /* ------------------------------------------------------------------------ */
 
 static hwbcm_log_level_t g_log_level = HWBCM_LOG_INFO;
-static int g_stderr_unbuffered = 0;
+static pthread_once_t g_stderr_once = PTHREAD_ONCE_INIT;
+
+static void stderr_unbuf_once(void)
+{
+    setvbuf(stderr, NULL, _IONBF, 0);
+}
 
 void hwbcm_log_level_set(hwbcm_log_level_t level)
 {
@@ -121,10 +126,7 @@ void hwbcm_log(hwbcm_log_level_t level, const char *fmt, ...)
     /* No openlog(): it would change the syslog ident of the whole host
      * process (syncd). Tag the message instead. Always write both sinks;
      * stderr is made unbuffered once so early lines are not lost. */
-    if (!g_stderr_unbuffered) {
-        setvbuf(stderr, NULL, _IONBF, 0);
-        g_stderr_unbuffered = 1;
-    }
+    pthread_once(&g_stderr_once, stderr_unbuf_once);
     syslog(prio[idx], "hwbcm: %s", buf);
     fprintf(stderr, "hwbcm[%s]: %s\n", tag[idx], buf);
     fflush(stderr);
@@ -234,6 +236,14 @@ static char g_scache_path[512];
 static int g_fp_count = 0;
 static int g_fp_logical[HWBCM_PORT_TBL];
 static int g_fp_phys[HWBCM_PORT_TBL];
+
+/* Leaf lock guarding g_desired_speed[], g_sgmii_applied*, g_link_cb/cookie
+ * shared between the SDK bcmLINK thread and SAI API threads. Never held
+ * across any bcm_* call or user callback. */
+static pthread_mutex_t g_link_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Guards g_knet[] across knet netif create/destroy/recover and pvid updates.
+ * Lock order when nested with g_lock: g_lock -> g_knet_lock. */
+static pthread_mutex_t g_knet_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* per-port desired speed (0 = never set) for the 1G SerDes work-around */
 static int g_desired_speed[HWBCM_PORT_TBL];
@@ -482,49 +492,81 @@ static void hwbcm_linkscan_handler(int unit, bcm_port_t port, bcm_port_info_t *i
         }
         if (speed > 0 && speed <= 1000) {
             long now = mono_seconds();
-            long since = g_sgmii_applied_at[port] ? now - g_sgmii_applied_at[port] : -1;
+            long since = -1;
+            int already = 0;
+            int rate_limited = 0;
+            int do_apply = 0;
+            int desired = 0;
 
+            pthread_mutex_lock(&g_link_lock);
+            since = g_sgmii_applied_at[port] ? now - g_sgmii_applied_at[port] : -1;
             if (g_sgmii_applied[port]) {
-                HWBCM_LOGI("port %d: link up at %d Mbps, SGMII already applied, skipping",
-                           port, speed);
+                already = 1;
             } else if (since >= 0 && since < HWBCM_SGMII_RATE_LIMIT_SEC) {
-                HWBCM_LOGW("port %d: link up at %d Mbps, SGMII re-apply rate limited (%lds ago), skipping",
-                           port, speed, since);
+                rate_limited = 1;
             } else {
-                int rv = bcm_port_interface_set(unit, port, BCM_PORT_IF_SGMII);
+                do_apply = 1;
                 g_sgmii_applied[port] = 1;
                 g_sgmii_applied_at[port] = now;
+                desired = g_desired_speed[port];
+            }
+            pthread_mutex_unlock(&g_link_lock);
+
+            if (already) {
+                HWBCM_LOGI("port %d: link up at %d Mbps, SGMII already applied, skipping",
+                           port, speed);
+            } else if (rate_limited) {
+                HWBCM_LOGW("port %d: link up at %d Mbps, SGMII re-apply rate limited (%lds ago), skipping",
+                           port, speed, since);
+            } else if (do_apply) {
+                int rv = bcm_port_interface_set(unit, port, BCM_PORT_IF_SGMII);
                 if (BCM_FAILURE(rv)) {
                     HWBCM_LOGW("port %d: link up at %d Mbps, SGMII re-apply failed: %s",
                                port, speed, bcm_errmsg(rv));
                 } else {
                     HWBCM_LOGI("port %d: link up at %d Mbps, SGMII re-applied (desired %d)",
-                               port, speed, g_desired_speed[port]);
+                               port, speed, desired);
                 }
             }
         } else if (speed > 1000) {
             /* Linked above 1G: a later 1G episode must re-apply again. */
+            pthread_mutex_lock(&g_link_lock);
             g_sgmii_applied[port] = 0;
+            pthread_mutex_unlock(&g_link_lock);
         }
     } else {
         /* Link down: our own re-apply bounces the link; do not forget the
          * episode for that. Any other down ends the episode. */
+        int own_bounce = 0;
+        int ended = 0;
+        long since = 0;
+
+        pthread_mutex_lock(&g_link_lock);
         if (g_sgmii_applied[port]) {
-            long since = mono_seconds() - g_sgmii_applied_at[port];
+            since = mono_seconds() - g_sgmii_applied_at[port];
             if (since >= 0 && since <= HWBCM_SGMII_OWN_BOUNCE_SEC) {
-                HWBCM_LOGD("port %d: link down %lds after SGMII re-apply (own bounce), keeping flag",
-                           port, since);
+                own_bounce = 1;
             } else {
-                HWBCM_LOGD("port %d: link down, SGMII episode ended", port);
                 g_sgmii_applied[port] = 0;
+                ended = 1;
             }
+        }
+        pthread_mutex_unlock(&g_link_lock);
+
+        if (own_bounce) {
+            HWBCM_LOGD("port %d: link down %lds after SGMII re-apply (own bounce), keeping flag",
+                       port, since);
+        } else if (ended) {
+            HWBCM_LOGD("port %d: link down, SGMII episode ended", port);
         }
     }
 
     HWBCM_LOGD("link: port %d %s (speed %d)", port, up ? "up" : "down", info->speed);
 
+    pthread_mutex_lock(&g_link_lock);
     cb = g_link_cb;
     cookie = g_link_cookie;
+    pthread_mutex_unlock(&g_link_lock);
     if (cb != NULL) {
         cb(port, up, cookie);
     }
@@ -532,8 +574,10 @@ static void hwbcm_linkscan_handler(int unit, bcm_port_t port, bcm_port_info_t *i
 
 int hwbcm_link_callback_register(hwbcm_link_cb_t cb, void *cookie)
 {
+    pthread_mutex_lock(&g_link_lock);
     g_link_cookie = cookie;
     g_link_cb = cb;
+    pthread_mutex_unlock(&g_link_lock);
     return 0;
 }
 
@@ -1854,8 +1898,10 @@ static void hwbcm_sgmii_warm_probe(int unit)
         }
         if (BCM_SUCCESS(bcm_port_interface_get(unit, port, &intf)) &&
             intf == BCM_PORT_IF_SGMII) {
+            pthread_mutex_lock(&g_link_lock);
             g_sgmii_applied[port] = 1;
             g_sgmii_applied_at[port] = ts;
+            pthread_mutex_unlock(&g_link_lock);
             nmarked++;
             HWBCM_LOGI("wb sgmii: port %d already UP at %d Mbps (SGMII), marked applied",
                        port, speed);
@@ -1923,15 +1969,19 @@ int hwbcm_init_ex(const char *config_bcm, int warm_boot, const char *scache_file
     }
 #endif
 
+    pthread_mutex_lock(&g_link_lock);
     for (i = 0; i < HWBCM_PORT_TBL; i++) {
         g_desired_speed[i] = 0;
         g_sgmii_applied[i] = 0;
         g_sgmii_applied_at[i] = 0;
     }
+    pthread_mutex_unlock(&g_link_lock);
     for (i = 0; i <= HWBCM_TRAP_STP; i++) {
         g_trap_l2cache_idx[i] = -1;
     }
+    pthread_mutex_lock(&g_knet_lock);
     memset(g_knet, 0, sizeof(g_knet));
+    pthread_mutex_unlock(&g_knet_lock);
     g_warm_boot = 0;
 
     if (config_bcm == NULL || config_bcm[0] == '\0') {
@@ -2486,10 +2536,14 @@ static void hwbcm_core_state_reset(void)
 {
     int i;
 
+    pthread_mutex_lock(&g_knet_lock);
     memset(g_knet, 0, sizeof(g_knet));
+    pthread_mutex_unlock(&g_knet_lock);
+    pthread_mutex_lock(&g_link_lock);
     memset(g_desired_speed, 0, sizeof(g_desired_speed));
     memset(g_sgmii_applied, 0, sizeof(g_sgmii_applied));
     memset(g_sgmii_applied_at, 0, sizeof(g_sgmii_applied_at));
+    pthread_mutex_unlock(&g_link_lock);
     memset(g_switch_mac, 0, sizeof(g_switch_mac));
     g_switch_mac_valid = 0;
     g_ip2me_station_id = -1;
@@ -2545,8 +2599,10 @@ int hwbcm_warm_deinit_ex(int for_kexec)
     /* Unregister software callbacks without disabling hardware linkscan or
      * tearing down KNET netifs/filters. */
     (void)bcm_linkscan_unregister(unit, hwbcm_linkscan_handler);
+    pthread_mutex_lock(&g_link_lock);
     g_link_cb = NULL;
     g_link_cookie = NULL;
+    pthread_mutex_unlock(&g_link_lock);
     hwbcm_l2_warm_reset();
     hwbcm_l3_warm_reset();
     hwbcm_vxlan_warm_reset();
@@ -2681,12 +2737,15 @@ int hwbcm_deinit(void)
 
     (void)bcm_linkscan_unregister(unit, hwbcm_linkscan_handler);
     (void)bcm_linkscan_enable_set(unit, 0);
+    pthread_mutex_lock(&g_link_lock);
     g_link_cb = NULL;
     g_link_cookie = NULL;
+    pthread_mutex_unlock(&g_link_lock);
     hwbcm_l2_warm_reset();
     hwbcm_l3_warm_reset();
     hwbcm_vxlan_warm_reset();
 
+    pthread_mutex_lock(&g_knet_lock);
     for (i = 0; i < HWBCM_KNET_MAX; i++) {
         if (g_knet[i].netif_id != 0) {
             knet_filter_destroy_quiet(&g_knet[i].pvid_filter_id);
@@ -2696,6 +2755,7 @@ int hwbcm_deinit(void)
             memset(&g_knet[i], 0, sizeof(g_knet[i]));
         }
     }
+    pthread_mutex_unlock(&g_knet_lock);
 
     if (bcm_rx_active(unit)) {
         (void)bcm_rx_stop(unit, NULL);
@@ -2762,7 +2822,9 @@ void hwbcm_core_wb_restore(const hwbcm_core_wb_state_t *in)
 void hwbcm_port_desired_speed_restore(int port, int speed_mbps)
 {
     if (port_valid(port) && speed_mbps > 0) {
+        pthread_mutex_lock(&g_link_lock);
         g_desired_speed[port] = speed_mbps;
+        pthread_mutex_unlock(&g_link_lock);
     }
 }
 
@@ -2905,7 +2967,9 @@ int hwbcm_port_speed_set(int port, int speed_mbps, int autoneg)
         if (BCM_SUCCESS(bcm_port_autoneg_get(unit, port, &an)) && an &&
             BCM_SUCCESS(bcm_port_link_status_get(unit, port, &link)) &&
             link == BCM_PORT_LINK_STATUS_UP) {
+            pthread_mutex_lock(&g_link_lock);
             g_desired_speed[port] = speed_mbps;
+            pthread_mutex_unlock(&g_link_lock);
             HWBCM_LOGI("port %d: speed %d Mbps autoneg 1 already active, link up, not reprogrammed",
                        port, speed_mbps);
             return 0;
@@ -2955,8 +3019,10 @@ int hwbcm_port_speed_set(int port, int speed_mbps, int autoneg)
         }
     }
 
+    pthread_mutex_lock(&g_link_lock);
     g_desired_speed[port] = speed_mbps;
     g_sgmii_applied[port] = 0; /* explicit reconfig starts a new episode */
+    pthread_mutex_unlock(&g_link_lock);
     HWBCM_LOGI("port %d: speed %d Mbps autoneg %d", port, speed_mbps, autoneg ? 1 : 0);
     return 0;
 }
@@ -3062,6 +3128,7 @@ int hwbcm_port_pvid_set(int port, int vid)
     HWBCM_LOGD("port %d: pvid %d", port, vid);
 
     /* Rebuild the tag-stripping KNET filter of any netif bound to this port. */
+    pthread_mutex_lock(&g_knet_lock);
     {
         int i;
         for (i = 0; i < HWBCM_KNET_MAX; i++) {
@@ -3078,6 +3145,7 @@ int hwbcm_port_pvid_set(int port, int vid)
             }
         }
     }
+    pthread_mutex_unlock(&g_knet_lock);
     return 0;
 }
 
@@ -3431,8 +3499,10 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     if (!port_valid(port) || name == NULL || mac == NULL || netif_id == NULL) {
         return BCM_E_PARAM;
     }
+    pthread_mutex_lock(&g_knet_lock);
     slot = knet_slot_alloc();
     if (slot == NULL) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("knet: no free netif slot");
         return BCM_E_RESOURCE;
     }
@@ -3447,6 +3517,7 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     netif.name[BCM_KNET_NETIF_NAME_MAX - 1] = '\0';
     rv = bcm_knet_netif_create(unit, &netif);
     if (BCM_FAILURE(rv)) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("bcm_knet_netif_create(%s, port %d): %s", name, port, bcm_errmsg(rv));
         return rv;
     }
@@ -3469,6 +3540,7 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     if (BCM_FAILURE(rv)) {
         (void)bcm_knet_netif_destroy(unit, netif.id);
         memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&g_knet_lock);
         return rv;
     }
     if (hwbcm_riot_enabled()) {
@@ -3489,8 +3561,10 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     if (BCM_FAILURE(rv)) {
         HWBCM_LOGE("bcm_knet_filter_create(port %d -> netif %d): %s", port, netif.id, bcm_errmsg(rv));
         knet_filter_destroy_quiet(&slot->pvid_filter_id);
+        knet_filter_destroy_quiet(&slot->vfi_filter_id);
         (void)bcm_knet_netif_destroy(unit, netif.id);
         memset(slot, 0, sizeof(*slot));
+        pthread_mutex_unlock(&g_knet_lock);
         return rv;
     }
     slot->filter_id = filter.id;
@@ -3498,6 +3572,7 @@ int hwbcm_knet_netif_create(int port, const char *name, const uint8_t mac[6], in
     *netif_id = netif.id;
     HWBCM_LOGI("knet: netif %d (%s) port %d filters %d (pvid %d strip) / %d (any)",
                netif.id, netif.name, port, slot->pvid_filter_id, slot->pvid, filter.id);
+    pthread_mutex_unlock(&g_knet_lock);
     return 0;
 }
 
@@ -3515,8 +3590,10 @@ int hwbcm_knet_cpu_netif_create(const char *name, const uint8_t mac[6], int *net
     if (name == NULL || mac == NULL || netif_id == NULL) {
         return BCM_E_PARAM;
     }
+    pthread_mutex_lock(&g_knet_lock);
     slot = knet_slot_alloc();
     if (slot == NULL) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("knet: no free netif slot");
         return BCM_E_RESOURCE;
     }
@@ -3528,6 +3605,7 @@ int hwbcm_knet_cpu_netif_create(const char *name, const uint8_t mac[6], int *net
     netif.name[BCM_KNET_NETIF_NAME_MAX - 1] = '\0';
     rv = bcm_knet_netif_create(unit, &netif);
     if (BCM_FAILURE(rv)) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("bcm_knet_netif_create(cpu %s): %s", name, bcm_errmsg(rv));
         return rv;
     }
@@ -3551,6 +3629,7 @@ int hwbcm_knet_cpu_netif_create(const char *name, const uint8_t mac[6], int *net
     slot->port = -1;
     slot->filter_id = filter.id;
     *netif_id = netif.id;
+    pthread_mutex_unlock(&g_knet_lock);
     HWBCM_LOGI("knet: cpu netif %d (%s) filter %d", netif.id, netif.name, filter.id);
     return 0;
 }
@@ -3567,6 +3646,7 @@ int hwbcm_knet_netif_destroy(int netif_id)
     if (netif_id <= 0) {
         return BCM_E_PARAM;
     }
+    pthread_mutex_lock(&g_knet_lock);
     slot = knet_slot_find(netif_id);
     if (slot != NULL) {
         knet_filter_destroy_quiet(&slot->pvid_filter_id);
@@ -3575,12 +3655,14 @@ int hwbcm_knet_netif_destroy(int netif_id)
     }
     rv = bcm_knet_netif_destroy(unit, netif_id);
     if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("bcm_knet_netif_destroy(%d): %s", netif_id, bcm_errmsg(rv));
         return rv;
     }
     if (slot != NULL) {
         memset(slot, 0, sizeof(*slot));
     }
+    pthread_mutex_unlock(&g_knet_lock);
     HWBCM_LOGI("knet: netif %d destroyed", netif_id);
     return 0;
 }
@@ -3664,10 +3746,12 @@ int hwbcm_knet_warm_recover(hwbcm_knet_info_t *out, int max)
         return BCM_E_INIT;
     }
     memset(&ctx, 0, sizeof(ctx));
+    pthread_mutex_lock(&g_knet_lock);
     memset(g_knet, 0, sizeof(g_knet));
 
     rv = bcm_knet_netif_traverse(HWBCM_UNIT, knet_wb_netif_cb, &ctx);
     if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
+        pthread_mutex_unlock(&g_knet_lock);
         HWBCM_LOGE("wb knet: bcm_knet_netif_traverse failed: %s (%d)", bcm_errmsg(rv), rv);
         return rv;
     }
@@ -3675,6 +3759,7 @@ int hwbcm_knet_warm_recover(hwbcm_knet_info_t *out, int max)
     if (BCM_FAILURE(rv) && rv != BCM_E_NOT_FOUND) {
         HWBCM_LOGW("wb knet: bcm_knet_filter_traverse failed: %s (%d)", bcm_errmsg(rv), rv);
     }
+    pthread_mutex_unlock(&g_knet_lock);
 
     if (out != NULL && max > 0) {
         ncopy = ctx.count < max ? ctx.count : max;

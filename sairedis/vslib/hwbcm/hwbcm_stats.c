@@ -178,8 +178,13 @@ int hwbcm_stats_init(void)
 
 int hwbcm_stats_bst_enabled(void)
 {
+    int on;
+
     (void)hwbcm_stats_init();
-    return g_bst_on;
+    pthread_mutex_lock(&g_lock);
+    on = g_bst_on;
+    pthread_mutex_unlock(&g_lock);
+    return on;
 }
 
 uint32_t hwbcm_stats_cell_bytes(void)
@@ -314,15 +319,16 @@ int hwbcm_queue_stat_multi_get(int port, int queue, int is_mc, int n,
 
     cpu = (port == CMIC_PORT(U));
     mc = cpu ? 1 : (is_mc ? 1 : 0);
+
+    pthread_mutex_lock(&g_lock);
     maxq = cpu ? g_num_cpu_cos : g_num_cos;
     if (queue < 0 || queue >= maxq) {
+        pthread_mutex_unlock(&g_lock);
         for (i = 0; i < n; i++) {
             out[i] = 0;
         }
         return 0;
     }
-
-    pthread_mutex_lock(&g_lock);
     for (i = 0; i < n && rv == 0; i++) {
         out[i] = 0;
         switch (ids[i]) {
