@@ -2952,6 +2952,7 @@ sai_status_t SwitchBCM56860HW::create(
     }
 
     sai_status_t hw = SAI_STATUS_SUCCESS;
+    bool hwCreated = false;
 
     switch (object_type)
     {
@@ -2982,7 +2983,11 @@ sai_status_t SwitchBCM56860HW::create(
         case SAI_OBJECT_TYPE_HOSTIF:          hw = hwCreateHostif(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_HOSTIF_TRAP:
             hw = hwCreateHostifTrap(oid, attr_count, attr_list);
-            if (hw == SAI_STATUS_SUCCESS) hw = hwCoppOnTrapCreate(oid);
+            if (hw == SAI_STATUS_SUCCESS)
+            {
+                hwCreated = true;
+                hw = hwCoppOnTrapCreate(oid);
+            }
             break;
         case SAI_OBJECT_TYPE_HOSTIF_TRAP_GROUP: hw = hwCreateHostifTrapGroup(oid, attr_count, attr_list); break;
         case SAI_OBJECT_TYPE_POLICER:         hw = hwCreatePolicer(oid, attr_count, attr_list); break;
@@ -3040,6 +3045,7 @@ sai_status_t SwitchBCM56860HW::create(
         (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
          object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE))
     {
+        hwCreated = true;
         hw = hwAclBindOnCreate(object_type, oid, attr_count, attr_list);
     }
 
@@ -3049,6 +3055,35 @@ sai_status_t SwitchBCM56860HW::create(
                 sai_serialize_object_type(object_type).c_str(),
                 serializedObjectId.c_str(),
                 sai_serialize_status(hw).c_str());
+
+        if (hwCreated)
+        {
+            sai_status_t hwRb = SAI_STATUS_SUCCESS;
+
+            if (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
+                object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE)
+            {
+                hwAclObjectRemoved(oid);
+            }
+
+            switch (object_type)
+            {
+                case SAI_OBJECT_TYPE_PORT:             hwRb = hwRemovePort(oid); break;
+                case SAI_OBJECT_TYPE_LAG:              hwRb = hwRemoveLag(oid); break;
+                case SAI_OBJECT_TYPE_VLAN:             hwRb = hwRemoveVlan(oid); break;
+                case SAI_OBJECT_TYPE_ROUTER_INTERFACE: hwRb = hwRemoveRouterInterface(oid); break;
+                case SAI_OBJECT_TYPE_HOSTIF_TRAP:      hwRb = hwCoppOnTrapRemove(oid); break;
+                default: break;
+            }
+
+            if (hwRb != SAI_STATUS_SUCCESS)
+            {
+                SWSS_LOG_ERROR("rollback hwRemove of %s %s failed: %s",
+                        sai_serialize_object_type(object_type).c_str(),
+                        serializedObjectId.c_str(),
+                        sai_serialize_status(hwRb).c_str());
+            }
+        }
 
         sai_status_t rb = SwitchBCM56850::remove(object_type, serializedObjectId);
 
@@ -3083,12 +3118,6 @@ sai_status_t SwitchBCM56860HW::remove(
         }
 
         sai_status_t hw = SAI_STATUS_SUCCESS;
-
-        if (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
-            object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE)
-        {
-            hwAclObjectRemoved(oid);   // drops its bindings, reprograms affected tables
-        }
 
         switch (object_type)
         {
@@ -3151,6 +3180,12 @@ sai_status_t SwitchBCM56860HW::remove(
                     sai_serialize_status(hw).c_str());
 
             return hw;
+        }
+
+        if (object_type == SAI_OBJECT_TYPE_PORT || object_type == SAI_OBJECT_TYPE_LAG ||
+            object_type == SAI_OBJECT_TYPE_VLAN || object_type == SAI_OBJECT_TYPE_ROUTER_INTERFACE)
+        {
+            hwAclObjectRemoved(oid);   // drops its bindings, reprograms affected tables
         }
     }
 
